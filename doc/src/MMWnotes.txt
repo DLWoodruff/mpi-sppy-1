@@ -1,0 +1,70 @@
+Design notes by DLW for Mak, Morton, and Wood (MMW)
+Feb 2021
+
+
+Background:
+
+There are better things that have been done, e.g., by Guzin B. and
+David M, but I think MMW is good place to start because it simple,
+easily understood, and gives us a benchmark for testing other methods.
+
+I want to produce a general interface in mpi-sppy and test it on a
+realistic Unit Commitment problem. Maybe produce a conference paper
+that looks at confidence intervals as a function of sample sizes (like
+the paper we did with Dominic Yang). For such a thing, we might just
+use Monte Carlo scenarios again. Aside: saying "confidence intervals
+as a function of sample sizes" is way under specified because
+confidence intervals have both a location and a size and because there
+are two sample sizes. But let's worry about a paper later.
+
+High level view of an interface:
+
+We need something that can take a scenario set (really an iterable
+that gives scenario name suitable for scenario_creator calls, perhaps
+along with a count) and return solutions and bounds. We also need
+something that can take the same type of iterable and also a solution
+(or nonant values); this thing needs to return the mean and variance
+of objective function values for nonants fixed at the solution values.
+
+The second thing looks a lot like xhat code. The first thing looks a lot
+like most of our drivers.
+
+Suggestions (i.e., stray thoughts):
+
+0. For the first thing, I think we need an object class that can wrap
+spin_the_wheel along with the dictionaries and classes that it relies
+on.
+
+1.For the second thing, I think we just need a class that looks kind
+of like an xhatter (and maybe derives from xhat_base?)
+
+2. For the whole thing, we need a class called MMW.
+
+
+=======================================================================
+
+@article{MAK199947,
+title = {Monte Carlo bounding techniques for determining solution quality in stochastic programs},
+journal = {Operations Research Letters},
+volume = {24},
+number = {1},
+pages = {47-56},
+year = {1999},
+issn = {0167-6377},
+doi = {https://doi.org/10.1016/S0167-6377(98)00054-6},
+url = {https://www.sciencedirect.com/science/article/pii/S0167637798000546},
+author = {Wai-Kei Mak and David P. Morton and R.Kevin Wood},
+keywords = {Programming, Stochastic, Monte Carlo approximations, Statistics, Sampling, Confidence intervals, Variance reduction},
+abstract = {A stochastic program SP with solution value z∗ can be approximately solved by sampling n realizations of the program's stochastic parameters, and by solving the resulting “approximating problem” for (x∗n,z∗n). We show that, in expectation, z∗n is a lower bound on z∗ and that this bound monotonically improves as n increases. The first result is used to construct confidence intervals on the optimality gap for any candidate solution x̂ to SP, e.g., x̂=x∗n. A sampling procedure based on common random numbers ensures nonnegative gap estimates and provides significant variance reduction over naive sampling on four test problems.}
+}
+
+
+@INPROCEEDINGS{8440563,
+  author={B. {Rachunok} and A. {Staid} and J. {Watson} and D. L. {Woodruff} and D. {Yang}},
+  booktitle={2018 IEEE International Conference on Probabilistic Methods Applied to Power Systems (PMAPS)}, 
+  title={Stochastic Unit Commitment Performance Considering Monte Carlo Wind Power Scenarios}, 
+  year={2018},
+  volume={},
+  number={},
+  pages={1-6},
+  doi={10.1109/PMAPS.2018.8440563}}
