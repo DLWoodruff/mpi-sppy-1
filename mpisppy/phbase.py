@@ -517,7 +517,7 @@ class PHBase(mpisppy.spbase.SPBase):
                 if persistent_solver is not None:
                     persistent_solver.update_var(vardata)
 
-    def _fix_nonants(self, cache):
+    def _fix_nonants(self, cache, verbose=False):
         """ Fix the Vars subject to non-anticipativity at given values.
             Loop over the scenarios to restore, but loop over subproblems
             to alert persistent solvers.
@@ -549,6 +549,8 @@ class PHBase(mpisppy.spbase.SPBase):
                 for i in range(nlens[ndn]): 
                     this_vardata = node.nonant_vardata_list[i]
                     this_vardata._value = cache[ndn][i]
+                    if verbose:
+                        print(f"Fixing {this_vardata.name} to {cache[ndn][i]}")
                     this_vardata.fix()
                     if persistent_solver is not None:
                         persistent_solver.update_var(this_vardata)

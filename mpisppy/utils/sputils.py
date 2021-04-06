@@ -454,12 +454,11 @@ def nonant_cache_from_ef(ef):
         nonant_cache (1-d numpy array): a special structure for nonant values
     TDB: xxxxxx multi-stage
     """
-    print(f"len(ref_vars), {len(ef.ef.ref_vars)}")
-    nonant_cache = {"ROOT": np.zeros(len(ef.ef.ref_vars), dtype='d')}
-    for (ndn,i), xvar in ef.ef.ref_vars.items():  
+    nonant_cache = {"ROOT": np.zeros(len(ef.ref_vars), dtype='d')}
+    for (ndn,i), xvar in ef.ref_vars.items():  
         if ndn != "ROOT":
             raise RuntimeError("only two-stage is supported by nonant_cache_from_ef")
-        nonant_cache[i] = pyo.value(xvar)
+        nonant_cache["ROOT"][i] = pyo.value(xvar)
         print("barfoo", i, pyo.value(xvar))
     return nonant_cache
 
