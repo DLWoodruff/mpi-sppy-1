@@ -52,7 +52,6 @@ class Xhat_Eval(mpisppy.phbase.PHBase):
 if __name__ == "__main__":
     #==============================
     # hardwired by dlw for debugging (this main is like MMW, but strange)
-    # IMPORTANT: the farmer in test always has the same scenarios...
     import mpisppy.tests.examples.farmer as refmodel
     import mpisppy.utils.amalgomator as ama
 
