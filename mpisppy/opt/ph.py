@@ -50,7 +50,7 @@ class PH(mpisppy.phbase.PHBase):
         """
         verbose = self.PHoptions['verbose']
         self.PH_Prep()
-        # Why is subproblem_creation() not called in PH_Prep?
+        # Why is subproblem_creation() not called in PH_Prep? Answer: xhat_eval.
         self.subproblem_creation(verbose)
 
         if (verbose):
