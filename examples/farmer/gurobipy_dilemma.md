@@ -11,5 +11,7 @@ The callout functions in `farmer_yyyy_agnostic.py` will behave diffrently. Inste
 
 The diffrence between the callout functions:
     - `attach_Ws_and_prox(Ag, sname, scenario)` will retrieve the current coefficients from the objective function
+    - `attach_PH_to_obj()` - call _copy_Ws_xbars_rho_from_host() ??
     - `_copy_Ws_xbars_rho_from_host(scenario)` will call the function that calculates the necessary coefficients for the objective function
+
     
