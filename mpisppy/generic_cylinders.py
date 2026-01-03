@@ -568,6 +568,9 @@ def _do_EF(module, cfg, scenario_creator, scenario_creator_kwargs, scenario_deno
         # We probably could just assign the dictionary in one line...
         for option_key,option_value in solver_options.items():
             solver.options[option_key] = option_value
+    # deal with the directly available command line option
+    if vanilla._hasit(cfg, "EF_mipgap"):
+        solver.options["mipgap"] = cfg.EF_mipgap
 
     solver_log_dir = cfg.get("solver_log_dir","")
     solve_kw_args = dict()
