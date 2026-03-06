@@ -40,15 +40,18 @@ mpiexec -np 6 python -m mpi4py mpisppy/generic_cylinders.py \
 
 ### Additional for `--admm` (deterministic)
 
-- `consensus_vars_creator(num_scens, ...)` → returns `consensus_vars` dict
+- `consensus_vars_creator(num_scens, all_scenario_names, **scenario_creator_kwargs)` → returns `consensus_vars` dict
   - Keys: subproblem names (= scenario names)
   - Values: list of consensus variable name strings
+  - `all_scenario_names` is passed explicitly (not part of `scenario_creator_kwargs`)
+  - Remaining kwargs come from `kw_creator(cfg)` output via `**scenario_creator_kwargs`
 
 ### Additional for `--stoch-admm`
 
-- `consensus_vars_creator(admm_subproblem_names, stoch_scenario_name, **kwargs)` → `consensus_vars` dict
+- `consensus_vars_creator(admm_subproblem_names, stoch_scenario_name, **scenario_creator_kwargs)` → `consensus_vars` dict
   - Keys: ADMM subproblem names
   - Values: list of `(var_name, stage)` tuples
+  - Remaining kwargs come from `kw_creator(cfg)` output via `**scenario_creator_kwargs`
 - `admm_subproblem_names_creator(num_admm_subproblems)` → list of subproblem name strings
 - `stoch_scenario_names_creator(num_stoch_scens)` → list of stochastic scenario name strings
 - `admm_stoch_subproblem_scenario_names_creator(admm_subproblem_names, stoch_scenario_names)` → list of composite names
@@ -85,7 +88,7 @@ def setup_admm(module, cfg, n_cylinders):
     all_scenario_names = module.scenario_names_creator(cfg.num_scens)
     scenario_creator_kwargs = module.kw_creator(cfg)
     consensus_vars = module.consensus_vars_creator(
-        cfg.num_scens, **scenario_creator_kwargs  # or subset of kwargs
+        cfg.num_scens, all_scenario_names, **scenario_creator_kwargs
     )
 
     admm = AdmmWrapper(
@@ -173,6 +176,14 @@ if cfg.admm or cfg.stoch_admm:
             setup_stoch_admm(module, cfg, n_cylinders)
     # Skip normal scenario_creator setup; go straight to do_decomp
 ```
+
+## Scope
+
+This design targets **models that already conform to the `generic_cylinders` module
+interface** — i.e., they provide `scenario_creator`, `scenario_names_creator`,
+`kw_creator(cfg)`, `inparser_adder(cfg)`, and `scenario_denouement`.
+
+Models with highly customized ADMM setups will continue to use bespoke drivers.
 
 ## Constraints and Limitations
 
