@@ -1,0 +1,546 @@
+Flexible Rank Assignments for Cylinders
+=========================================
+
+Status: Design Document (Draft)
+Date: 2026-03-16
+Branch: ``flexible_rank_assignments``
+
+Motivation
+----------
+
+Currently, ``WheelSpinner`` enforces that every cylinder (hub and all
+spokes) receives the same number of MPI ranks and the same scenario
+distribution.  This is wasteful when different cylinders have different
+computational requirements.  For example:
+
+- The PH hub solves every subproblem at every iteration and benefits
+  from many ranks.
+- A Lagrangian spoke also solves subproblems but may converge with
+  fewer iterations, so it could use fewer ranks (each handling more
+  scenarios).
+- An xhat shuffle spoke is lightweight and may need only one or two
+  ranks.
+
+Allowing different rank counts per cylinder would let users allocate
+MPI resources more efficiently, potentially reducing total wall-clock
+time for the same number of processors.
+
+User Interface
+--------------
+
+The user would specify a **target ratio** for each spoke relative to the
+hub.  The hub always serves as the reference (ratio 1.0).  Example::
+
+    mpiexec -np 14 python -m mpi4py mpisppy/generic_cylinders.py \
+        --module-name farmer --num-scens 100 \
+        --solver-name gurobi --default-rho 1 --max-iterations 50 \
+        --lagrangian --lagrangian-rank-ratio 0.5 \
+        --xhatshuffle --xhatshuffle-rank-ratio 0.25
+
+With 14 total ranks and ratios hub:1.0, lagrangian:0.5, xhat:0.25,
+the system would allocate ranks proportionally: 8 for the hub, 4 for the
+Lagrangian spoke, 2 for the xhat spoke.
+
+Open questions on the interface:
+
+- Should the ratio be per-spoke-type in ``Config``, or specified in the
+  spoke dict as a numeric field?
+- Should there be a ``--spoke-ranks`` option that takes explicit counts
+  instead of ratios?  Ratios are more portable across different total
+  rank counts, but explicit counts give precise control.
+- What happens when the ratios don't divide evenly into the total rank
+  count?  Options: (a) round and warn, (b) error, (c) adjust ratios
+  to fit.
+
+
+Current Architecture
+--------------------
+
+This section describes the pieces that would need to change.
+
+Rank Partitioning (``spin_the_wheel.py``)
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+``WheelSpinner`` requires ``n_proc % n_spcomms == 0`` and creates two
+communicators via ``MPI_Comm_split``::
+
+    strata_comm  = fullcomm.Split(color=global_rank // n_spcomms)
+    cylinder_comm = fullcomm.Split(color=global_rank % n_spcomms)
+
+``strata_comm`` groups rank *i* from each cylinder together (the
+inter-cylinder communication channel).  ``cylinder_comm`` groups all
+ranks within one cylinder (the intra-cylinder channel).
+
+With equal rank counts, there is a clean 1-to-1 correspondence:
+``strata_comm`` rank 0 is always the hub, rank 1 is always spoke 1, etc.
+
+Scenario Distribution (``spbase.py``)
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+``_calculate_scenario_ranks()`` distributes scenarios across
+``self.n_proc`` ranks (the cylinder's rank count) using contiguous
+blocks.  All cylinders currently have the same ``n_proc``, so rank *i*
+in every cylinder gets the same scenarios.
+
+Buffer System (``spwindow.py``, ``spcommunicator.py``)
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Each rank creates an MPI RMA window with per-field buffers.  Buffer
+sizes for "local" fields (``NONANT``, ``DUALS``, ``BEST_XHAT``,
+``RECENT_XHATS``, ``CROSS_SCENARIO_COST``) are proportional to the
+rank's local scenario count.  Buffer sizes for "global" fields
+(``NONANT_LOWER_BOUNDS``, ``NONANT_UPPER_BOUNDS``) are proportional to
+the total nonant count and are the same on every rank.
+
+On receive, ``_validate_recv_field()`` checks that the remote buffer
+size matches the local expectation.  This check assumes both sides have
+the same local scenario count.
+
+Communication Patterns
+^^^^^^^^^^^^^^^^^^^^^^
+
+All inter-cylinder communication uses one-sided MPI (RMA) through
+``SPWindow``.  The communication graph is:
+
+**Hub sends to spokes:**
+  - ``NONANT`` (local-sized): current nonant values for PH iterates
+  - ``DUALS`` (local-sized): W values (dual weights)
+  - ``SHUTDOWN``, ``BEST_OBJECTIVE_BOUNDS`` (scalars on rank 0 only)
+
+**Spokes send to hub:**
+  - ``OBJECTIVE_INNER_BOUND``, ``OBJECTIVE_OUTER_BOUND`` (scalars)
+  - ``BEST_XHAT`` (local-sized): best feasible solution found
+  - ``RECENT_XHATS`` (local-sized, circular buffer)
+
+**Spoke-to-spoke (via RMA windows, not point-to-point):**
+  - FWPH spoke reads ``BEST_XHAT`` and ``RECENT_XHATS`` from an
+    InnerBoundSpoke
+  - ReducedCostsSpoke sends ``NONANT_LOWER_BOUNDS`` and
+    ``NONANT_UPPER_BOUNDS`` (global-sized, already works)
+  - CrossScenarioCutSpoke reads ``NONANT`` and
+    ``CROSS_SCENARIO_COST`` from a source
+
+The local-sized fields are the ones affected by unequal rank counts.
+
+
+Design: Multi-Rank Mapping
+--------------------------
+
+The core idea is that when a rank in one cylinder needs data from
+another cylinder with a different rank count, it reads from multiple
+remote ranks and assembles the result (or reads from one remote rank
+and extracts a subset).
+
+Overlap Maps
+^^^^^^^^^^^^
+
+At startup, each rank computes a static mapping for each peer cylinder:
+which remote ranks have scenarios that overlap with its own local
+scenarios, and at what offsets within those remote buffers.
+
+The existing ``scen_names_to_ranks(n_proc)`` function already computes
+scenario-to-rank mappings.  We would call it once per cylinder's rank
+count to get each cylinder's distribution, then compute pairwise
+overlaps.
+
+For example, with a 4-rank hub and a 2-rank spoke, both handling 10
+scenarios:
+
+========  ==================  ==================
+          Hub (4 ranks)       Spoke (2 ranks)
+========  ==================  ==================
+Rank 0    scen0, scen1        scen0--scen4
+Rank 1    scen2, scen3        scen5--scen9
+Rank 2    scen4, scen5
+Rank 3    scen6--scen9
+========  ==================  ==================
+
+Hub rank 0 needs to read from spoke rank 0 (which has scen0--scen4),
+extracting only the portion for scen0--scen1.  Hub rank 2 also reads
+from spoke rank 0, extracting scen4--scen5.
+
+The overlap map for hub rank 0 reading from the spoke would be::
+
+    [(spoke_rank=0, remote_offset=0, local_offset=0, count=2)]
+
+For hub rank 2::
+
+    [(spoke_rank=0, remote_offset=4, local_offset=0, count=2)]
+
+For hub rank 3::
+
+    [(spoke_rank=1, remote_offset=0, local_offset=0, count=4)]
+
+These maps are computed once at startup and reused for every
+communication call.  The data structure could be::
+
+    @dataclass
+    class OverlapSegment:
+        remote_rank: int       # rank in peer cylinder
+        remote_offset: int     # nonant offset within remote buffer
+        local_offset: int      # nonant offset within local buffer
+        count: int             # number of nonants in this segment
+
+    # Per (peer_cylinder, field): list of OverlapSegments
+    overlap_map: dict[int, list[OverlapSegment]]
+
+Note: offsets are in nonant units (not scenario units) because
+different scenarios could have different numbers of nonants in
+multi-stage problems (though for two-stage problems they are uniform).
+
+
+Window Topology Options
+^^^^^^^^^^^^^^^^^^^^^^^
+
+**Option A: Single global window on MPI_COMM_WORLD**
+
+Every rank publishes its buffers in one shared window.  Readers address
+remote ranks by their global rank.  The ``strata_buffer_layouts``
+(currently exchanged via ``strata_comm.allgather``) would instead be
+exchanged on ``MPI_COMM_WORLD`` or a dedicated intercommunicator.
+
+Pros:
+
+- Simple conceptually: any rank can read from any other rank.
+- No need for multiple communicator splits.
+- A single ``MPI_Win_create`` call.
+
+Cons:
+
+- The window is large (sum of all ranks' buffers across all cylinders).
+- ``MPI_Win_lock`` granularity is per-window; concurrent accesses to
+  different cylinders' data may contend.
+- All ranks must participate in window creation even if they never
+  communicate with most other ranks.
+
+**Option B: Per-cylinder-pair intercommunicators with separate windows**
+
+For each pair of cylinders that need to communicate, create an
+``MPI_Intercomm`` and a window on it.  For example, hub-lagrangian and
+hub-xhat would each get their own window.
+
+Pros:
+
+- Smaller windows, less contention.
+- Clean separation of concerns.
+
+Cons:
+
+- Number of windows grows with the number of communicating pairs.
+  With spoke-to-spoke communication, this could be O(n^2) in the
+  worst case (though in practice most spokes only talk to the hub
+  plus at most one other spoke).
+- More complex setup code.
+- MPI intercomm semantics can be tricky.
+
+**Option C: Keep strata_comm but make it asymmetric**
+
+Create ``strata_comm`` groupings where ranks from different-sized
+cylinders are grouped together.  Ranks without a counterpart in a
+smaller cylinder would be grouped with the "nearest" rank in that
+cylinder.
+
+For example, with 4 hub ranks and 2 spoke ranks, strata groups would
+be::
+
+    strata 0: hub_rank_0, spoke_rank_0
+    strata 1: hub_rank_1, spoke_rank_0  (spoke_rank_0 appears twice)
+    strata 2: hub_rank_2, spoke_rank_1
+    strata 3: hub_rank_3, spoke_rank_1  (spoke_rank_1 appears twice)
+
+Pros:
+
+- Closest to the current architecture; least code change.
+- Each strata_comm still has one rank per cylinder.
+
+Cons:
+
+- A spoke rank appears in multiple strata comms, which may cause
+  issues with MPI (a rank can only be in one communicator of a given
+  color).
+- Actually, this doesn't work with ``MPI_Comm_split`` because a rank
+  can only appear once per split.  Would need to use
+  ``MPI_Comm_create_group`` or manual point-to-point addressing
+  instead.
+
+**Option D: Replace strata_comm with direct RMA addressing**
+
+Abandon ``strata_comm`` entirely.  Use ``MPI_COMM_WORLD`` for the
+window, and have each rank directly address remote ranks by their
+global rank.  The overlap maps provide the addressing information.
+
+This is essentially Option A but with the explicit framing that
+``strata_comm`` is removed rather than modified.
+
+Pros:
+
+- Clean break from the current 1-to-1 assumption.
+- Most flexible: any rank can read from any other rank.
+- Single window creation.
+
+Cons:
+
+- Requires rewriting ``SPCommunicator`` and ``SPWindow`` to work
+  without ``strata_comm``.
+- The buffer layout exchange (currently ``strata_comm.allgather``)
+  would need to use a different mechanism (e.g., ``fullcomm.allgather``
+  followed by filtering).
+
+**Recommendation:** Option D is the cleanest long-term solution.
+Option A is equivalent but Option D better describes the intent.  The
+window is on ``fullcomm`` (or a subset), and each rank knows which
+global ranks to read from via the overlap maps.
+
+
+Multi-Source Read Assembly
+^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+The current ``get_receive_buffer()`` reads one contiguous buffer from
+one remote rank.  With multi-rank mapping, it would need to:
+
+1. For each segment in the overlap map, issue an ``MPI_Get`` for that
+   segment from the appropriate remote rank.
+2. Place each segment at the correct offset in the local receive
+   buffer.
+3. Return the assembled buffer.
+
+Schematically::
+
+    def get_receive_buffer_multi(self, field, peer_cylinder):
+        local_buf = np.empty(self.local_field_length(field))
+        for seg in self.overlap_map[peer_cylinder]:
+            remote_buf = self.window.get(
+                rank=seg.remote_rank,
+                field=field,
+                offset=seg.remote_offset,
+                count=seg.count,
+            )
+            local_buf[seg.local_offset : seg.local_offset + seg.count] = remote_buf
+        return local_buf
+
+This requires ``SPWindow.get()`` to support partial reads (offset +
+count within a field), which is straightforward with ``MPI_Get``
+displacement parameters.
+
+For the common case where both cylinders have the same rank count,
+the overlap map has exactly one segment per peer rank and the offsets
+are identity — so the behavior degenerates to the current code.
+
+
+Write-ID Coherence
+^^^^^^^^^^^^^^^^^^
+
+The current system uses a ``write_id`` integer appended to each buffer.
+When a sender writes new data, it increments ``write_id``.  The
+receiver checks whether the ``write_id`` has changed since the last
+read to determine if the data is "new."
+
+With multi-source reads, a receiver reads from multiple remote ranks
+in the same cylinder.  These ranks may not have updated their buffers
+at exactly the same time (the system is asynchronous).  This raises
+the question: should we require all ranks in a cylinder to have the
+same ``write_id`` before accepting the data?
+
+**Option 1: Require coherence (strict)**
+
+All source ranks for a given field must have the same ``write_id``.
+If they don't, retry later.  This ensures the assembled buffer
+represents a single consistent iteration.
+
+Implementation: read all ``write_id`` values first (cheap: one int
+per segment), check they match, then read the data.
+
+Pros: data consistency guaranteed.
+Cons: may cause stalls if one rank in a spoke is slow; partially
+defeats the purpose of async communication.
+
+**Option 2: Accept partial staleness (relaxed)**
+
+Accept data from each source rank independently.  The assembled
+buffer may mix data from different iterations of the source cylinder.
+The receiver tracks ``write_id`` per source rank.
+
+Pros: no stalls, preserves async character.
+Cons: the assembled nonant vector may be inconsistent (some scenarios
+from iteration k, others from iteration k+1).  For PH, this is
+likely acceptable because the algorithm is already tolerant of
+async updates (APH is designed for this).
+
+**Option 3: Cylinder-wide iteration counter (synchronized)**
+
+Each cylinder maintains a shared iteration counter (via
+``cylinder_comm.Allreduce`` after each update).  Receivers check
+this counter instead of per-rank write-IDs.
+
+Pros: clean coherence semantics.
+Cons: adds synchronization within the cylinder, which is exactly
+what the async design tries to avoid.  Only acceptable for
+synchronous algorithms (PH, not APH).
+
+**Recommendation:** Option 2 (relaxed) for the initial implementation.
+The existing system already tolerates async lag between hub and spokes
+— a spoke may read hub data from iteration k while the hub is already
+on iteration k+2.  Mixing data from iteration k and k+1 within a
+single spoke's buffer is a similar level of staleness.  Option 1 could
+be offered as a configuration flag for users who need strict coherence.
+
+
+Impact on Existing Components
+------------------------------
+
+``spin_the_wheel.py``
+^^^^^^^^^^^^^^^^^^^^^
+
+- Remove the ``n_proc % n_spcomms == 0`` check.
+- Replace the uniform ``MPI_Comm_split`` with a rank assignment
+  algorithm that respects per-cylinder rank counts.
+- The ``cylinder_comm`` creation still uses ``MPI_Comm_split`` (all
+  ranks in the same cylinder get the same color).
+- The ``strata_comm`` is either removed (Option D) or replaced with
+  a global window communicator.
+- The ``communicator_list[strata_rank]`` indexing must change because
+  ``strata_rank`` no longer has a fixed meaning.  Each rank needs to
+  know its cylinder index directly.
+
+``spbase.py``
+^^^^^^^^^^^^^
+
+- ``_calculate_scenario_ranks()`` already works with any ``n_proc``.
+  No change needed; each cylinder just calls it with its own rank
+  count.
+
+``spwindow.py``
+^^^^^^^^^^^^^^^
+
+- ``FieldLengths`` stays the same (it's per-rank, based on local
+  scenarios).
+- ``SPWindow`` must support partial ``get()`` calls (offset + count).
+- The buffer layout exchange must use a communicator that spans all
+  cylinders (not just ``strata_comm``).
+- Buffer validation must account for asymmetric sizes: a receiver's
+  expected size may differ from the sender's buffer size, and that's
+  OK as long as the requested segment fits within the sender's buffer.
+
+``spcommunicator.py``
+^^^^^^^^^^^^^^^^^^^^^
+
+- ``register_receive_fields()`` must build overlap maps instead of
+  assuming 1-to-1 rank correspondence.
+- ``get_receive_buffer()`` must support multi-source assembly.
+- ``put_send_buffer()`` is unchanged (each rank writes its own data).
+- ``_validate_recv_field()`` must be relaxed or replaced with
+  segment-level validation (check that each requested segment fits
+  within the remote buffer, not that the total sizes match).
+- The ``synchronize`` parameter in ``get_receive_buffer()`` uses
+  ``cylinder_comm.Barrier()`` and ``Allreduce`` — this still works
+  within a cylinder but the cross-cylinder sync semantics change.
+
+``hub.py`` and ``spoke.py``
+^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+- ``send_nonants()``, ``update_nonants()``, and similar methods
+  currently iterate over local scenarios and pack/unpack linearly.
+  The packing is unchanged (each rank packs its own data).  The
+  unpacking on the receiver side must use the overlap map to
+  correctly place data from multi-source reads.
+- Bound communication (scalars) is unaffected.
+
+``cfg_vanilla.py`` and ``config.py``
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+- Add per-spoke rank ratio configuration.
+- ``shared_options()`` may need to carry the rank ratio information
+  so that ``SPCommunicator`` can compute overlap maps at init time.
+
+``generic_cylinders.py``
+^^^^^^^^^^^^^^^^^^^^^^^^
+
+- After computing rank ratios, pass them to ``WheelSpinner`` via the
+  hub/spoke dicts.
+- Default ratio is 1.0 for all cylinders (backward compatible).
+
+
+Phased Implementation Plan
+---------------------------
+
+**Phase 1: Infrastructure**
+
+- Implement the overlap map computation (given per-cylinder rank
+  counts and scenario lists, produce ``OverlapSegment`` lists).
+- Add partial-read support to ``SPWindow.get()``.
+- Add rank ratio fields to spoke dicts and ``WheelSpinner``.
+- Modify rank partitioning in ``WheelSpinner`` to support unequal
+  cylinder sizes.
+- Unit tests for overlap maps with various rank count combinations.
+
+**Phase 2: Communication layer**
+
+- Replace ``strata_comm``-based buffer layout exchange with
+  ``fullcomm``-based exchange.
+- Implement multi-source ``get_receive_buffer()`` using overlap maps.
+- Relax ``_validate_recv_field()`` to check per-segment instead of
+  total.
+- Test with simple cases: hub with 4 ranks, Lagrangian spoke with 2
+  ranks.
+
+**Phase 3: Integration and testing**
+
+- Wire up the rank ratio CLI options.
+- Auto-disable for cylinders that cannot support asymmetric ranks
+  (if any).
+- Test all spoke types with various ratios.
+- Performance benchmarks: does 8+4+2 outperform 5+5+5 for a given
+  problem?
+
+**Phase 4: Spoke-to-spoke communication**
+
+- Extend multi-source reads for spoke-to-spoke fields (FWPH reading
+  ``BEST_XHAT`` from an InnerBoundSpoke with different rank count).
+- Test FWPH + xhatshuffle with unequal ranks.
+
+**Phase 5: APH support**
+
+- Verify that APH (asynchronous PH) works correctly with the relaxed
+  write-ID coherence model.
+- Consider adding optional strict coherence (Option 1) as a flag.
+
+
+Backward Compatibility
+-----------------------
+
+When all rank ratios are 1.0 (the default), the system must behave
+identically to the current implementation.  The overlap maps degenerate
+to single-segment identity mappings, and multi-source reads become
+single-source reads.  This should be verified by running the full
+existing test suite with the new code and default ratios.
+
+
+Open Questions
+--------------
+
+1. Should the minimum rank count for any cylinder be 1?  Some spoke
+   types may require at least 2 ranks for internal collective
+   operations.
+
+2. How should ``all_scenario_names`` be handled?  Currently it is the
+   same list for all cylinders.  With different rank counts, each
+   cylinder still handles all scenarios — just distributed differently.
+   But should we also support cylinders that handle a *subset* of
+   scenarios?  (That would be a much larger change and is out of scope
+   for this design.)
+
+3. What is the interaction with proper bundles?  Bundles change the
+   scenario structure, so rank ratios would apply to the bundled
+   scenario count, not the original count.
+
+4. For the FWPH spoke-to-spoke case, the FWPH spoke reads
+   ``RECENT_XHATS`` which is a circular buffer of multiple xhat
+   solutions.  Each entry is local-sized.  The multi-source read
+   would need to be applied to each entry in the circular buffer.
+   Is this feasible, or should FWPH be restricted to equal rank
+   counts?
+
+5. Memory overhead: with Option D (global window on fullcomm), the
+   window includes buffers from all ranks in all cylinders.  For
+   large problems with many ranks, this could be significant.  Should
+   we provide a way to limit which ranks participate in the window?
