@@ -341,48 +341,85 @@ at exactly the same time (the system is asynchronous).  This raises
 the question: should we require all ranks in a cylinder to have the
 same ``write_id`` before accepting the data?
 
-**Option 1: Require coherence (strict)**
+The answer depends on the field.  Some fields carry coupled data that
+must come from the same iteration to be mathematically valid, while
+others are independent candidates that tolerate staleness.
 
-All source ranks for a given field must have the same ``write_id``.
-If they don't, retry later.  This ensures the assembled buffer
-represents a single consistent iteration.
+Per-field coherence requirements
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Implementation: read all ``write_id`` values first (cheap: one int
-per segment), check they match, then read the data.
+**Fields requiring strict coherence:**
 
-Pros: data consistency guaranteed.
-Cons: may cause stalls if one rank in a spoke is slow; partially
-defeats the purpose of async communication.
+- ``NONANT`` (xbar values from the hub) and ``DUALS`` (W values from
+  the hub) are coupled: they define the Lagrangian subproblem at a
+  specific PH iteration.  If a spoke assembles xbar from iteration k
+  for some scenarios and iteration k+1 for others, the dual function
+  is evaluated at an inconsistent dual point and the resulting bound
+  is invalid.
 
-**Option 2: Accept partial staleness (relaxed)**
+  In practice this is manageable because the hub is synchronous PH:
+  all hub ranks complete the same iteration before writing their
+  buffers, so their ``write_id`` values naturally agree after each
+  PH iteration.  The receiver just needs to verify they match before
+  accepting the assembled data.
 
-Accept data from each source rank independently.  The assembled
-buffer may mix data from different iterations of the source cylinder.
-The receiver tracks ``write_id`` per source rank.
+**Fields tolerating staleness (relaxed coherence):**
 
-Pros: no stalls, preserves async character.
-Cons: the assembled nonant vector may be inconsistent (some scenarios
-from iteration k, others from iteration k+1).  For PH, this is
-likely acceptable because the algorithm is already tolerant of
-async updates (APH is designed for this).
+- ``BEST_XHAT`` — a feasible solution candidate.  Even if assembled
+  from slightly different spoke iterations, it is still a valid
+  candidate; the receiver evaluates it fresh.
+- ``RECENT_XHATS`` — candidate points for FWPH column generation.
+  Same reasoning as ``BEST_XHAT``.
+- ``NONANT_LOWER_BOUNDS``, ``NONANT_UPPER_BOUNDS`` — bound tightening
+  is monotonic, so staleness only means slightly looser bounds.
+  These fields are already global-sized and unaffected by rank
+  asymmetry.
+- Scalar bounds (``OBJECTIVE_INNER_BOUND``, ``OBJECTIVE_OUTER_BOUND``)
+  — already fine.
 
-**Option 3: Cylinder-wide iteration counter (synchronized)**
+Coherence options
+~~~~~~~~~~~~~~~~~
+
+**Option 1: Per-field strict check**
+
+For fields that require coherence (``NONANT``, ``DUALS``): read all
+``write_id`` values first (cheap: one int per segment), check they
+match, then read the data.  If they don't match, retry later.
+
+For fields that tolerate staleness (``BEST_XHAT``, etc.): accept data
+from each source rank independently.  Track ``write_id`` per source
+rank.
+
+Pros: correct semantics for each field type.  No unnecessary stalls
+for fields that don't need coherence.
+
+Cons: two code paths for multi-source reads (strict and relaxed).
+
+**Option 2: Cylinder-wide iteration counter (synchronized)**
 
 Each cylinder maintains a shared iteration counter (via
 ``cylinder_comm.Allreduce`` after each update).  Receivers check
-this counter instead of per-rank write-IDs.
+this counter for fields requiring coherence.
 
 Pros: clean coherence semantics.
 Cons: adds synchronization within the cylinder, which is exactly
 what the async design tries to avoid.  Only acceptable for
 synchronous algorithms (PH, not APH).
 
-**Recommendation:** Option 2 (relaxed) for the initial implementation.
-The existing system already tolerates async lag between hub and spokes
-— a spoke may read hub data from iteration k while the hub is already
-on iteration k+2.  Mixing data from iteration k and k+1 within a
-single spoke's buffer is a similar level of staleness.  Option 1 could
-be offered as a configuration flag for users who need strict coherence.
+**Option 3: Accept staleness everywhere (fully relaxed)**
+
+Accept data from each source rank independently for all fields.
+
+Pros: simplest implementation, no stalls.
+Cons: Lagrangian bounds may be invalid when assembled from mixed
+iterations.
+
+**Recommendation:** Option 1 (per-field strict check).  The hub is
+synchronous PH, so its ranks naturally have matching ``write_id``
+values after each iteration — the strict check is almost free (just
+verify, rarely retry).  For spoke-to-hub fields like ``BEST_XHAT``,
+use the relaxed path.  This gives correct Lagrangian bounds without
+sacrificing async performance where it isn't needed.
 
 
 Impact on Existing Components
