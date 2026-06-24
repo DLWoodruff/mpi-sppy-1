@@ -229,31 +229,51 @@ default, a flat scalar, or an explicit per-variable mapping.
 
 ## 8. Public API (PyPSA)
 
+The API exposes the **three phases** (§13.6) as methods on the existing
+`OptimizationAccessor`. The write/read phases are **dependency-free** (no
+mpi-sppy needed); only the inline `solve_stochastic` runs the driver.
+
 ```python
+# Phase 1 — write the problem for mpi-sppy (1 rank, PyPSA env)
+manifest = n.optimize.write_stochastic_problem(
+    directory,
+    clean=True,                  # clear stale scenario files in `directory` first (§13.6)
+    first_stage=None,            # None = all extendable capacities; else explicit list
+    rho="cost-proportional",     # "cost-proportional" | float | {varname: rho}  (§7.1)
+    file_format="lp",            # "lp" | "mps"
+    cylinders=("lagrangian", "xhatshuffle"),
+    solver_name="gurobi",
+    config_file=None,            # mpi-sppy --config-file to reference (§8.2)
+    mpisppy_args=None,           # extra mpi-sppy CLI args (§8.2)
+)
+# manifest carries the exact phase-2 mpi-sppy command + an sbatch template.
+
+# Phase 3 — read the incumbent back onto the network (1 rank, PyPSA env)
+n.optimize.read_stochastic_solution(directory)   # sets *_nom_opt; optional dispatch re-solve
+
+# Inline convenience (laptop / single node) = phase 1 + subprocess solve + phase 3
 n.optimize.solve_stochastic(
     method="ph",                 # "ph" (target) | "ef" (correctness oracle only)
     solver_name="gurobi",        # QP-capable (PH proximal ⇒ QP; MIQP if integer first stage)
-    first_stage=None,            # None = all extendable capacities; else explicit list
-    rho="cost-proportional",     # "cost-proportional" | float | {varname: rho}  (§7.1)
+    first_stage=None, rho="cost-proportional",
     cylinders=("lagrangian", "xhatshuffle"),
-    config_file=None,            # path to an mpi-sppy --config-file (primary options input, §8.2)
-    mpisppy_args=None,           # extra mpi-sppy CLI args, list[str] (§8.2)
-    mpisppy_options=None,        # optional dict convenience → CLI flags (§8.2)
-    working_dir=None,            # temp dir if None
-    file_format="lp",            # "lp" | "mps"
-    keep_files=False,
+    config_file=None, mpisppy_args=None, mpisppy_options=None,   # (§8.2)
+    nprocs=None,                 # ranks for the inline mpiexec run
+    working_dir=None, file_format="lp", keep_files=False,
 )
 ```
 
-Thin sugar over two **dependency-free** functions in a new
-`pypsa/optimization/stochastic.py`:
+Implemented in a new `pypsa/optimization/stochastic.py`:
 
-- `write_mpisppy_files(scenarios, directory, first_stage=..., file_format=...) -> manifest`
-- `assign_stochastic_solution(n, solution) -> None`
+- `write_stochastic_problem(...)` and `read_stochastic_solution(...)` — the two
+  **dependency-free** phase functions (also bound as accessor methods); they
+  touch files only and do **not** import mpi-sppy;
+- `solve_stochastic(...)` = phase 1 + subprocess `mpiexec … generic_cylinders.py`
+  + phase 3; this is the **only** entry that needs the mpi-sppy driver.
 
-`mpi-sppy`, `mpi4py`, and `mip` are imported **lazily** inside `solve_stochastic`
-so that importing PyPSA never requires them. A new optional extra
-`pypsa[mpisppy]` declares `{mpi-sppy, mpi4py, mip}`.
+The optional extra `pypsa[mpisppy]` (= `{mpi-sppy, mpi4py, mip}`) is therefore
+needed only where the inline solve runs — not for the decoupled write/read jobs
+(§13.6).
 
 ### 8.1 Optional-feature integration (PyPSA conventions)
 
@@ -291,7 +311,9 @@ def solve_stochastic(self, ...):
 ```
 
 This shared helper is preferred over `tsam`'s hand-rolled `find_spec` check for
-consistency across the codebase.
+consistency across the codebase. Only `solve_stochastic` gates on mpi-sppy;
+`write_stochastic_problem` / `read_stochastic_solution` are file-only and import
+cleanly without it (§13.6).
 
 **Accessor placement.** `solve_stochastic` is a method on the **existing**
 `OptimizationAccessor` (`pypsa/optimization/optimize.py`), so the public call is
@@ -390,15 +412,116 @@ Two small additions:
   == LP/MPS-via-Pyomo objective = 123100). **Conclusion:** the file-based
   approach is sound; LP is the primary format (full naming control,
   human-readable), MPS also works.
-- **Phase 1 — exporter.** scenario slicing + `write_mpisppy_files` (LP +
-  nonant JSON + cost-proportional `_rho.csv`), validated against the
-  `_delme_test_write_mp_mps_dir/` reference.
+- **Phase 1 — exporter.** scenario slicing + `write_stochastic_problem` (clears
+  the directory, then writes LP + nonant JSON + cost-proportional `_rho.csv` + the
+  phase-2 command/sbatch), validated against the `_delme_test_write_mp_mps_dir/`
+  reference.
 - **Phase 2 — mpi-sppy file-path tweaks** (§10): `.lp` filename lookup + consume
   `_rho.csv`.
-- **Phase 3 — driver + write-back.** programmatic PH run; `assign_stochastic_solution`.
-- **Phase 4 — public method, `pypsa[mpisppy]` extra, tests (§11), docs.**
+- **Phase 3 — driver + write-back.** subprocess/scheduler PH run;
+  `read_stochastic_solution`.
+- **Phase 4 — public methods, `pypsa[mpisppy]` extra, tests (§11), docs
+  (incl. the SLURM workflow, §13.6).**
 
-## 13. Open questions / future work
+## 13. Parallel execution and scaling
+
+PyPSA is **not** part of the MPI job. It writes the scenario files (§4) and later
+reads the incumbent solution back — both serial, 1-rank steps. The mpi-sppy solve
+runs separately across many ranks, either as a blocking subprocess (inline) or as
+its own scheduler job (§13.6). The whole coupling is files at both ends; PyPSA
+never joins the MPI communicator.
+
+### 13.1 Rank ↔ cylinder mapping
+
+With `C` cylinders (e.g. 3 = PH hub + Lagrangian spoke + xhatshuffle spoke),
+mpi-sppy requires `N % C == 0` and gives each cylinder `N/C` ranks. **Every
+cylinder holds the full scenario set**, distributed across its `N/C` ranks; a
+given `{s}.lp` is read **once per cylinder** (C× total), by the rank that owns it.
+Example, S = 30 scenarios, C = 3:
+
+| `np` (N) | ranks/cylinder | scenarios/rank |
+|---|---|---|
+| 3  | 1  | 30 |
+| 30 | 10 | 3  |
+| 90 | 30 | 1  |
+
+A rank reads only *its* scenarios, so per-rank startup I/O is `S / (N/C)` files —
+exactly one `.lp` at full scale.
+
+### 13.2 File I/O is startup-only
+
+Files are touched only when each rank builds its local scenarios in
+`scenario_creator` (`.lp` → Pyomo via coin-or `mip`, plus `_nonants.json` and
+`_rho.csv` via `_rho_setter`). Thereafter PH iterations are in-memory subproblem
+solves plus MPI reductions — **no per-iteration I/O**. The file boundary is a
+one-time startup cost, not a steady-state bottleneck.
+
+### 13.3 Correctness linchpin under MPI
+
+mpi-sppy enforces nonanticipativity by reducing nonant vectors **positionally**
+across scenarios — within a cylinder (the `xbar` reduction) and across cylinders
+(bound/incumbent exchange). Therefore the `nonAnts` list must be **identical in
+both names and order across every scenario's `_nonants.json`**. The determinism
+result (§6.1) plus structural identity (§9.1) guarantee this; the exporter must
+assert it (same ordered name-list for all scenarios). This is *why* deterministic
+naming is load-bearing rather than cosmetic.
+
+### 13.4 Scaling considerations
+
+- **Shared filesystem (multi-node).** `DIR` and the solution file must be visible
+  to all nodes (shared FS), or staged per node. Single-node is a non-issue.
+- **Startup I/O.** `C × S` reads total, distributed across ranks, one-time.
+- **Parallelism ceiling.** ranks/cylinder ≤ S, so **max useful N ≈ C × S**.
+  Scenario count — not rank count — sets the ceiling; to use many ranks you need
+  many scenarios (or bundling, §14).
+- **Solver licensing.** Each rank runs its own solver engine concurrently (QP, or
+  MIQP with integer first stage, §9.4); at large N this needs a Gurobi
+  floating/cluster license permitting that many simultaneous engines.
+- **Memory.** ~one Pyomo scenario model per rank at full scale — scales well.
+
+### 13.5 Result write-back
+
+mpi-sppy writes the best incumbent's first-stage (nonant) values to a file (e.g.
+`--solution-base-name`; exact flag to confirm), which PyPSA reads to set
+`*_nom_opt` — the return half of the file boundary, consistent with §3. PyPSA may
+optionally re-solve each scenario with capacities fixed for full dispatch.
+
+### 13.6 Execution paths: inline vs decoupled (SLURM)
+
+**Inline** (laptop / single interactive node): `solve_stochastic` writes the
+files, runs `mpiexec -np N … generic_cylinders.py …` as a blocking subprocess,
+and reads the solution back — one Python call.
+
+**Decoupled** (HPC scheduler): the three phases (§8) are submitted as **separate
+jobs**, because you cannot hold a process/allocation open while a large MPI job
+queues and runs, the phases have very different resource profiles (1 core / many
+cores / 1 core), and even different environments — **PyPSA** for write + read,
+**mpi-sppy** for solve (§8). `write_stochastic_problem` emits the exact phase-2
+command and an `sbatch` template; the user submits a dependency chain:
+
+```bash
+DIR=/shared/run42
+rm -f "$DIR"/*.lp "$DIR"/*.mps "$DIR"/*_nonants.json "$DIR"/*_rho.csv  # hygiene, see below
+j1=$(sbatch --parsable write.sbatch)                           # -n 1,  PyPSA env
+j2=$(sbatch --parsable --dependency=afterok:$j1 solve.sbatch)  # -N …,  mpi-sppy env,
+                                                               #   srun … generic_cylinders.py
+sbatch            --dependency=afterok:$j2 read.sbatch         # -n 1,  PyPSA env
+```
+
+**Directory hygiene (important).** mpi-sppy discovers scenarios by *globbing* the
+transfer directory (`mps_module.scenario_names_creator` globs `*.lp` / `*.mps`).
+A previous run that wrote **more** scenarios leaves stale `{s}.lp` (+
+`_nonants.json` / `_rho.csv`) that a smaller new run would silently pick up as
+**phantom scenarios** — wrong scenario set and probabilities. So **clear the
+transfer directory before phase 1**: `write_stochastic_problem(clean=True)` (the
+default) does this in Python, and the docs / `write.sbatch` should *also* `rm` the
+stale files as belt-and-suspenders (covering a prior partial/aborted write).
+
+Sizing: `--ntasks` divisible by `C`; ranks/cylinder ≤ S (§13.1). Job 2 uses
+`srun` or `mpiexec`/`mpirun` per the site's MPI build. The shared `DIR` (and the
+solution file, §13.5) must be visible to all three jobs (§13.4).
+
+## 14. Open questions / future work
 
 - **Scenario slicing.** Carving a clean single-scenario `Network` out of a
   `set_scenarios` network (static `(scenario, name)` MultiIndex; dynamic
@@ -407,8 +530,13 @@ Two small additions:
 - **Multi-stage** investment horizons (PyPSA `investment_periods`).
 - **CVaR / risk** interaction with decomposition (PyPSA already has CVaR in the
   monolithic EF; cf. mpi-sppy `doc/designs/cvar_design.md`).
+- **Bundling for large S.** Whether the LP-file path (`mps_module`) composes with
+  proper bundles (`--scenarios-per-bundle`) to right-size subproblems and cut
+  comm when S is large; may be a separate `mps_module` item (§13.4).
+- **Solution write-back flag.** Pin down the exact `generic_cylinders` mechanism
+  that emits the incumbent first stage to a file for PyPSA to read (§13.5).
 
-## 14. Key code references
+## 15. Key code references
 
 **PyPSA** (`DLWoodruff/PyPSA` fork):
 - `pypsa/optimization/optimize.py` — `create_model` (~L600), `define_objective`
