@@ -66,12 +66,13 @@ n.optimize.solve_stochastic(method="ph", solver_name="gurobi", ...)   # NEW
         │        create_model()  → linopy.Model
         │        write  {s}.lp             (model; implicit  x{label}  names; MPS ok too)
         │        write  {s}_nonants.json   (probability + first-stage var names)
-        │        write  {s}_rho.csv        (optional: per-nonant rho)
+        │        write  {s}_rho.csv        (per-nonant cost-proportional rho)
         │
-        ├─ (2) SOLVE  — mpi-sppy, UNCHANGED except LP support:
-        │        generic_cylinders.py --mps-files-directory=DIR
+        ├─ (2) SOLVE  — mpi-sppy driver as a subprocess (MPI for cylinders):
+        │        mpiexec -np K python -m mpi4py generic_cylinders.py
+        │            --mps-files-directory=DIR [--config-file FILE]
         │            --xhatshuffle --lagrangian --default-rho ...
-        │        → converged first-stage capacities
+        │        → converged first-stage capacities + bounds
         │
         └─ (3) WRITE-BACK
                  set  *_nom_opt  on n
@@ -87,7 +88,7 @@ For a directory `DIR` (`cfg.mps_files_directory`), each scenario `s` contributes
 |------|----------|----------|---------|
 | `{s}.lp` (or `{s}.mps`) | PyPSA (linopy) | mpi-sppy `mps_reader` | the scenario subproblem |
 | `{s}_nonants.json` | PyPSA | mpi-sppy `mps_module` | probability + scenario tree + nonant names |
-| `{s}_rho.csv` | PyPSA (optional) | mpi-sppy | per-nonant rho hints |
+| `{s}_rho.csv` | PyPSA | mpi-sppy | per-nonant rho (cost-proportional default) |
 
 ### 4.1 `{s}_nonants.json`
 
@@ -116,6 +117,21 @@ The exact format is mirrored by mpi-sppy's own writer
 artifacts in `mpi-sppy-1/_delme_test_write_mp_mps_dir/`
 (`Scenario*.{mps,lp,json}`, `Scenario*_rho.csv`). PyPSA reproduces this format
 directly rather than going through that extension.
+
+### 4.2 `{s}_rho.csv`
+
+Per-nonant PH rho, in mpi-sppy's convention (header `varname,rho`, then one row
+per nonant; `scenario_lp_mps_files.py` ~L84–87):
+
+```csv
+varname,rho
+x0,1000
+x1,1500
+```
+
+PyPSA emits this by default with **cost-proportional rho** (§7.1). For two-stage
+problems every scenario's rho file is identical. (The file path does not yet
+*consume* `_rho.csv` — a small mpi-sppy wiring item, §10.)
 
 ## 5. Nonant (first-stage) identification
 
@@ -196,15 +212,33 @@ nonants) **plus that scenario's** opex. This is correct for PH/EF because
 since the scenario probabilities sum to 1. mpi-sppy applies the `scenProb`
 weighting; capex is not double-counted.
 
+### 7.1 Cost-proportional rho (default)
+
+A good PH rho for a nonant scales with its objective coefficient, so PyPSA sets,
+for each first-stage variable `i` with objective coefficient `c_i` (the
+`capital_cost` on the `*_nom` variable):
+
+```
+rho_i = max(rho_floor, alpha * |c_i|)
+```
+
+with `alpha` (default 1.0) and a small `rho_floor` so a zero-cost nonant still
+gets a positive rho. PyPSA already holds every `capital_cost`, so it computes rho
+directly and writes `{s}_rho.csv` (§4.2). The `rho` argument (§8) selects this
+default, a flat scalar, or an explicit per-variable mapping.
+
 ## 8. Public API (PyPSA)
 
 ```python
 n.optimize.solve_stochastic(
     method="ph",                 # "ph" (target) | "ef" (correctness oracle only)
-    solver_name="gurobi",        # QP-capable: PH proximal term ⇒ QP subproblems
+    solver_name="gurobi",        # QP-capable (PH proximal ⇒ QP; MIQP if integer first stage)
     first_stage=None,            # None = all extendable capacities; else explicit list
+    rho="cost-proportional",     # "cost-proportional" | float | {varname: rho}  (§7.1)
     cylinders=("lagrangian", "xhatshuffle"),
-    mpisppy_options={"default_rho": 1.0, "max_iterations": 50, "convthresh": 1e-3},
+    config_file=None,            # path to an mpi-sppy --config-file (primary options input, §8.2)
+    mpisppy_args=None,           # extra mpi-sppy CLI args, list[str] (§8.2)
+    mpisppy_options=None,        # optional dict convenience → CLI flags (§8.2)
     working_dir=None,            # temp dir if None
     file_format="lp",            # "lp" | "mps"
     keep_files=False,
@@ -269,6 +303,29 @@ consistency across the codebase.
 defaults (rho, cylinders) could later be registered under
 `params.optimize.stochastic.*`.
 
+### 8.2 Passing mpi-sppy options
+
+mpi-sppy already has a full configuration system (`mpisppy/utils/config.py`):
+`parse_command_line` reads `--config-file FILE` (declared ~L363, applied
+~L1582–1595) to load *all* options from a file, plus `--solver-options-file`
+(~L204) for layered solver options. A Python dict must therefore **not** be the
+only input mechanism.
+
+PyPSA invokes the mpi-sppy **driver as a subprocess** (under `mpiexec` for the
+cylinders), so options are layered, lowest → highest precedence:
+
+1. **PyPSA-managed essentials** it always sets: `--mps-files-directory`, the
+   chosen cylinders, `--solver-name` (default from
+   `pypsa.options.params.optimize`), and the `method`/`file_format` plumbing;
+2. **`config_file=`** — forwarded verbatim as mpi-sppy `--config-file`; this is
+   the **primary way** to pass the full option surface from a file;
+3. **`mpisppy_options=`** — optional dict, translated to CLI flags (programmatic
+   convenience for a few common knobs);
+4. **`mpisppy_args=`** — explicit extra CLI args, last word.
+
+PyPSA never reimplements mpi-sppy's option set; it forwards to mpi-sppy's own
+config (file + CLI) — consistent with the file-boundary philosophy.
+
 ## 9. Assumptions and constraints
 
 1. **Structural identity.** All scenarios share the same components and the same
@@ -280,6 +337,12 @@ defaults (rho, cylinders) could later be registered under
    format and mpi-sppy support multi-stage, but v1 targets two-stage.
 3. **QP-capable solver** for PH (the proximal term makes subproblems QPs); Gurobi
    is the default and is present in the dev env.
+4. **Integer / committable first-stage is supported.** First-stage variables may
+   be integer (e.g. modular `*-n_mod`, committable on/off). PH consensus on
+   integers is heuristic, but mpi-sppy's bounding cylinders (Lagrangian lower
+   bound + xhat upper bound) bracket the optimum and report a valid optimality
+   gap. With the PH proximal term, integer first-stage makes the subproblems
+   MIQPs — Gurobi handles these.
 
 ## 10. Changes required in mpi-sppy (small)
 
@@ -289,11 +352,18 @@ the **reader already handles LP**: `read_mps_and_create_pyomo_model`
 auto-detects `.lp` by extension — a `.lp` path round-trips with **no reader
 change** (the Phase 0 LP test went through the unchanged reader).
 
-The only change is the file-name lookup in
-`mpisppy/problem_io/mps_module.py:scenario_creator` (~L47–49), which currently
-hardcodes `sharedPath + ".mps"`. It should accept `.lp` (detect whichever of
-`{s}.lp` / `{s}.mps` exists, or take the extension from config). MPS stays
-supported.
+Two small additions:
+
+1. **`.lp` filename lookup** in
+   `mpisppy/problem_io/mps_module.py:scenario_creator` (~L47–49), which currently
+   hardcodes `sharedPath + ".mps"`. It should accept `.lp` (detect whichever of
+   `{s}.lp` / `{s}.mps` exists, or take the extension from config). MPS stays
+   supported.
+2. **Consume `{s}_rho.csv`** on the file path. The extension *writes* it
+   (`scenario_lp_mps_files.py` ~L84–87) but `mps_module`/the driver do not yet
+   *read* it; the file path should apply the per-nonant rho (directly, or via an
+   existing rho_setter / config hook). Until wired, rho falls back to
+   `--default-rho`.
 
 ## 11. Correctness and testing
 
@@ -301,7 +371,9 @@ supported.
   objective to PyPSA's native EF (`n.optimize()` on the `set_scenarios`
   network). They must match to tolerance. (This is the only role of the EF path.)
 - **PH convergence:** PH first-stage (capacities) must converge to the EF
-  first-stage solution.
+  first-stage solution. For **integer** first-stage, check instead that the
+  cylinders' bound gap brackets the EF objective (PH consensus is heuristic; the
+  bounds are valid — §9.4).
 - **Fixture:** a tiny 2-bus, ~3-scenario, few-snapshot network — small enough to
   solve the EF directly and to inspect the LP/JSON by eye.
 
@@ -319,8 +391,10 @@ supported.
   approach is sound; LP is the primary format (full naming control,
   human-readable), MPS also works.
 - **Phase 1 — exporter.** scenario slicing + `write_mpisppy_files` (LP +
-  nonant JSON), validated against the `_delme_test_write_mp_mps_dir/` reference.
-- **Phase 2 — mpi-sppy `.lp` filename support** (§10).
+  nonant JSON + cost-proportional `_rho.csv`), validated against the
+  `_delme_test_write_mp_mps_dir/` reference.
+- **Phase 2 — mpi-sppy file-path tweaks** (§10): `.lp` filename lookup + consume
+  `_rho.csv`.
 - **Phase 3 — driver + write-back.** programmatic PH run; `assign_stochastic_solution`.
 - **Phase 4 — public method, `pypsa[mpisppy]` extra, tests (§11), docs.**
 
@@ -330,10 +404,7 @@ supported.
   `set_scenarios` network (static `(scenario, name)` MultiIndex; dynamic
   `(scenario, name)` columns). If fiddly, the fallback is to accept a dict of
   pre-built per-scenario networks; the public method can support both inputs.
-- **Rho setting.** Emit `{s}_rho.csv` from capital-cost magnitudes (cost-
-  proportional rho) as a better default than a flat `default_rho`.
 - **Multi-stage** investment horizons (PyPSA `investment_periods`).
-- **Committable / integer first-stage** decisions (PH becomes heuristic).
 - **CVaR / risk** interaction with decomposition (PyPSA already has CVaR in the
   monolithic EF; cf. mpi-sppy `doc/designs/cvar_design.md`).
 
