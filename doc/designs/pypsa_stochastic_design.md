@@ -1,11 +1,11 @@
 # PyPSA Stochastic Programming via mpi-sppy (LP-file interface) — Design
 
 Status: draft for review. Spans two repos: **PyPSA** (work on the `DLWoodruff/PyPSA`
-fork) and **mpi-sppy** (`main`). The mpi-sppy change is small (accept `.lp`
-filenames in mps_module; its reader already parses LP); all new modeling logic
-lives in PyPSA. No use of the mpi-sppy
-*agnostic/guest* framework — the coupling is at the **file boundary**. Core
-feasibility has been validated end to end (Phase 0, §12).
+fork) and **mpi-sppy**. The required mpi-sppy support (`.lp` files + per-nonant
+rho from `{s}_rho.csv`) is **merged upstream** — Pyomo/mpi-sppy `main`, #770 — so
+all remaining work is on the PyPSA side. No use of the mpi-sppy *agnostic/guest*
+framework — the coupling is at the **file boundary**. Core feasibility has been
+validated end to end (Phase 0, §12).
 
 ## 1. Goal
 
@@ -129,9 +129,12 @@ x0,1000
 x1,1500
 ```
 
-PyPSA emits this by default with **cost-proportional rho** (§7.1). For two-stage
-problems every scenario's rho file is identical. (The file path does not yet
-*consume* `_rho.csv` — a small mpi-sppy wiring item, §10.)
+PyPSA emits this by default with **cost-proportional rho** (§7.1). Consumed by
+mpi-sppy's `mps_module._rho_setter` as of #770 (§10). **Per-node rho consistency
+is the writer's job:** mpi-sppy applies rhos per scenario and does *not* reconcile
+them across scenarios, so a given nonant must get the **same** rho in every
+scenario's file. For two-stage problems that means every scenario's `_rho.csv` is
+identical — PyPSA computes rho once and replicates it (§7.1).
 
 ## 5. Nonant (first-stage) identification
 
@@ -226,6 +229,12 @@ with `alpha` (default 1.0) and a small `rho_floor` so a zero-cost nonant still
 gets a positive rho. PyPSA already holds every `capital_cost`, so it computes rho
 directly and writes `{s}_rho.csv` (§4.2). The `rho` argument (§8) selects this
 default, a flat scalar, or an explicit per-variable mapping.
+
+Because rho must be **identical per nonant across scenarios** (§4.2 — mpi-sppy
+does not reconcile), PyPSA computes the rho vector **once** (capital costs are
+first-stage, hence scenario-invariant) and writes the same values to every
+scenario's `_rho.csv`. If a use case ever varied a nonant's cost by scenario,
+PyPSA would still emit a single agreed rho (e.g. the mean) to keep PH well-defined.
 
 ## 8. Public API (PyPSA)
 
@@ -366,26 +375,28 @@ config (file + CLI) — consistent with the file-boundary philosophy.
    gap. With the PH proximal term, integer first-stage makes the subproblems
    MIQPs — Gurobi handles these.
 
-## 10. Changes required in mpi-sppy (small)
+## 10. Required mpi-sppy support — MERGED (#770)
 
-LP is the primary format (§6.3), so mpi-sppy must load `{s}.lp`. Phase 0 showed
-the **reader already handles LP**: `read_mps_and_create_pyomo_model`
-(`mps_reader.py` ~L158–168) calls coin-or `mip.Model().read()`, which
-auto-detects `.lp` by extension — a `.lp` path round-trips with **no reader
-change** (the Phase 0 LP test went through the unchanged reader).
+Both changes are implemented on **Pyomo/mpi-sppy `main`** (PR #770, *"mps_module:
+accept .lp files and per-nonant rho from {s}_rho.csv"*); PyPSA needs an mpi-sppy
+at or past that commit. No driver/reader/PH changes were required. See the
+companion design `doc/designs/mps_module_lp_rho_design.md`.
 
-Two small additions:
+1. **`.lp` files.** `mps_module._scenario_model_path` resolves `{s}.lp` / `{s}.mps`
+   (`.lp` preferred when both exist); `scenario_creator` and
+   `scenario_names_creator` use it (the latter globs both extensions and derives
+   base names with `os.path.splitext`). The reader was already LP-capable
+   (coin-or `mip` auto-detects).
+2. **Per-nonant rho.** `mps_module._rho_setter` (auto-discovered by
+   `generic/decomp.py:_get_rho_setter`) reads `{s}_rho.csv` whose path
+   `scenario_creator` stashes as `model._rho_csv_path`; it returns `[]` when the
+   file is absent (so `--default-rho` still applies). `rho_utils.rho_list_from_csv`
+   now accepts a `varname` *or* `fullname` column and normalizes `()`→`_`.
 
-1. **`.lp` filename lookup** in
-   `mpisppy/problem_io/mps_module.py:scenario_creator` (~L47–49), which currently
-   hardcodes `sharedPath + ".mps"`. It should accept `.lp` (detect whichever of
-   `{s}.lp` / `{s}.mps` exists, or take the extension from config). MPS stays
-   supported.
-2. **Consume `{s}_rho.csv`** on the file path. The extension *writes* it
-   (`scenario_lp_mps_files.py` ~L84–87) but `mps_module`/the driver do not yet
-   *read* it; the file path should apply the per-nonant rho (directly, or via an
-   existing rho_setter / config hook). Until wired, rho falls back to
-   `--default-rho`.
+**Constraint PyPSA must honor:** mpi-sppy applies rho **per scenario without
+cross-scenario reconciliation**, so the writer must give a nonant the same rho in
+every scenario (§4.2, §7.1). User-facing format docs live in mpi-sppy's
+`doc/src/agnostic.rst` (scenario files + `_rho.csv`) and `doc/src/extensions.rst`.
 
 ## 11. Correctness and testing
 
@@ -414,10 +425,11 @@ Two small additions:
   human-readable), MPS also works.
 - **Phase 1 — exporter.** scenario slicing + `write_stochastic_problem` (clears
   the directory, then writes LP + nonant JSON + cost-proportional `_rho.csv` + the
-  phase-2 command/sbatch), validated against the `_delme_test_write_mp_mps_dir/`
-  reference.
-- **Phase 2 — mpi-sppy file-path tweaks** (§10): `.lp` filename lookup + consume
-  `_rho.csv`.
+  phase-2 command/sbatch), validated against mpi-sppy's
+  `mpisppy/tests/examples/mps_module_data/` fixture (#770: `Scenario*.lp`,
+  `_nonants.json`, `_rho.csv`).
+- **Phase 2 — mpi-sppy file-path support — DONE (#770, upstream main):** `.lp`
+  filename lookup + `_rho.csv` consumption + tests (§10).
 - **Phase 3 — driver + write-back.** subprocess/scheduler PH run;
   `read_stochastic_solution`.
 - **Phase 4 — public methods, `pypsa[mpisppy]` extra, tests (§11), docs
@@ -551,10 +563,14 @@ solution file, §13.5) must be visible to all three jobs (§13.4).
 - `linopy/io.py` — `to_file` (~L655), `to_lp_file` (~L588), MPS via HiGHS
   (~L690–701), `get_printers_scalar` (~L99–135).
 
-**mpi-sppy** (`main`):
-- `mpisppy/problem_io/mps_module.py` — `scenario_creator` (~L38–87).
-- `mpisppy/problem_io/mps_reader.py` — `read_mps_to_mip_model` (~L72–80),
-  `mip_model_to_pyomo` (~L83–155), `read_mps_and_create_pyomo_model` (~L158–168).
-- `mpisppy/extensions/scenario_lp_mps_files.py` — reference writer (~L24–87).
-- `mpisppy/generic_cylinders.py` — `--mps-files-directory` driver.
-- `mpi-sppy-1/_delme_test_write_mp_mps_dir/` — reference artifacts.
+**mpi-sppy** (`Pyomo/mpi-sppy` main, post-#770):
+- `mpisppy/problem_io/mps_module.py` — `_scenario_model_path`, `scenario_creator`
+  (stashes `model._rho_csv_path`), `scenario_names_creator`, `_rho_setter`.
+- `mpisppy/problem_io/mps_reader.py` — `read_mps_and_create_pyomo_model` (coin-or
+  `mip`; reads `.lp` and `.mps`).
+- `mpisppy/utils/rho_utils.py` — `rho_list_from_csv` (accepts `varname`/`fullname`).
+- `mpisppy/generic/decomp.py` — `_get_rho_setter` (auto-discovers `module._rho_setter`).
+- `mpisppy/generic/parsing.py` — maps `--mps-files-directory` → `mps_module`.
+- `mpisppy/extensions/scenario_lp_mps_files.py` — reference writer (lp/mps/json/rho).
+- `mpisppy/tests/examples/mps_module_data/` — `.lp` + json + rho test fixture (#770).
+- `doc/src/agnostic.rst`, `doc/src/extensions.rst` — user docs for the file format.
