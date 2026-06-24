@@ -136,8 +136,8 @@ integer `labels` (see §6) and writes them into `nonAnts`.
 any numeric data (objective coefficients, bounds, RHS). Empirically, two models
 built with the same sequence of `add_variables` calls produce **identical**
 on-file names even when the data differ. Therefore two structurally-identical
-scenario networks emit MPS files whose variables line up by name — which is
-exactly what mpi-sppy needs to enforce nonanticipativity across scenarios.
+scenario networks emit LP (or MPS) files whose variables line up by name — which
+is exactly what mpi-sppy needs to enforce nonanticipativity across scenarios.
 
 This is the load-bearing assumption of the whole approach. It holds **iff** all
 scenarios are structurally identical (§9).
