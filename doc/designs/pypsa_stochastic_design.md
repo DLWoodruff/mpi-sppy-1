@@ -214,6 +214,54 @@ Thin sugar over two **dependency-free** functions in a new
 so that importing PyPSA never requires them. A new optional extra
 `pypsa[mpisppy]` declares `{mpi-sppy, mpi4py, mip}`.
 
+### 8.1 Optional-feature integration (PyPSA conventions)
+
+The stochastic backend follows PyPSA's established optional-feature pattern; the
+closest precedent is `tsam` time-series aggregation
+(`pypsa/clustering/temporal.py`). The contract: importing PyPSA never requires
+the extra deps, and invoking the feature without them fails loudly with an
+install hint.
+
+**Extra.** Declare in `pyproject.toml` `[project.optional-dependencies]`, named
+after the backend to match the `tsam` / `cartopy` / `gurobipy` convention (PyPI
+names):
+
+```toml
+mpisppy = ["mpi-sppy", "mpi4py", "mip"]
+```
+
+**Gate + lazy import.** Reuse PyPSA's centralized helper
+`check_optional_dependency(module_name, install_message)` (`pypsa/common.py`,
+~L725) at the entry of `solve_stochastic`, then import inside the function.
+**Import names differ from PyPI names**: `mpi-sppy` → `mpisppy`,
+`python-mip` → `mip`.
+
+```python
+from pypsa.common import check_optional_dependency
+
+def solve_stochastic(self, ...):
+    check_optional_dependency(
+        "mpisppy",
+        "Missing optional dependencies for stochastic decomposition. "
+        "Install via `pip install pypsa[mpisppy]`.",
+    )
+    import mpisppy            # noqa: PLC0415  (lazy)
+    ...
+```
+
+This shared helper is preferred over `tsam`'s hand-rolled `find_spec` check for
+consistency across the codebase.
+
+**Accessor placement.** `solve_stochastic` is a method on the **existing**
+`OptimizationAccessor` (`pypsa/optimization/optimize.py`), so the public call is
+`n.optimize.solve_stochastic(...)` — alongside `create_model` and
+`optimize_transmission_expansion_iteratively`. No new top-level accessor.
+
+**Config.** Defaults such as `solver_name` come from the existing options system
+(`pypsa.options.params.optimize.*`, `pypsa/_options.py`); feature-specific
+defaults (rho, cylinders) could later be registered under
+`params.optimize.stochastic.*`.
+
 ## 9. Assumptions and constraints
 
 1. **Structural identity.** All scenarios share the same components and the same
