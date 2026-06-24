@@ -553,6 +553,12 @@ solution file, §13.5) must be visible to all three jobs (§13.4).
   comm when S is large; may be a separate `mps_module` item (§13.4).
 - **Solution write-back flag.** Pin down the exact `generic_cylinders` mechanism
   that emits the incumbent first stage to a file for PyPSA to read (§13.5).
+- **File-interface performance (note in the user docs).** The file interface is
+  not fast (per-run file I/O + LP/MPS write & parse). For hard-to-solve problems
+  this is negligible — wall time is dominated by the subproblem solves — but the
+  **user docs should state the caveat**. If a faster, in-memory interface is ever
+  needed, implement PyPSA as an mpi-sppy *agnostic/guest* instead of the file
+  boundary.
 
 ## 15. Key code references
 
