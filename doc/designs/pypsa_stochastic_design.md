@@ -1,9 +1,11 @@
-# PyPSA Stochastic Programming via mpi-sppy (MPS-file interface) — Design
+# PyPSA Stochastic Programming via mpi-sppy (LP-file interface) — Design
 
 Status: draft for review. Spans two repos: **PyPSA** (work on the `DLWoodruff/PyPSA`
-fork) and **mpi-sppy** (`main`). The mpi-sppy change is small and purely additive
-(LP-file reading); all new modeling logic lives in PyPSA. No use of the mpi-sppy
-*agnostic/guest* framework — the coupling is at the **file boundary**.
+fork) and **mpi-sppy** (`main`). The mpi-sppy change is small (accept `.lp`
+filenames in mps_module; its reader already parses LP); all new modeling logic
+lives in PyPSA. No use of the mpi-sppy
+*agnostic/guest* framework — the coupling is at the **file boundary**. Core
+feasibility has been validated end to end (Phase 0, §12).
 
 ## 1. Goal
 
@@ -43,10 +45,11 @@ decomposition**, which PyPSA does not have.
 
 mpi-sppy already ships a complete file-based scenario loader
 (`mpisppy/problem_io/mps_module.py`). PyPSA/`linopy` can write each scenario's
-subproblem to a standard MPS file. This keeps PyPSA free of any Pyomo dependency
-and keeps mpi-sppy free of any PyPSA dependency: the two programs meet only
-through files. mpi-sppy needs essentially **no new code** beyond adding LP-file
-reading alongside the existing MPS reader.
+subproblem to a standard LP file (MPS is also supported). This keeps PyPSA free
+of any Pyomo dependency and keeps mpi-sppy free of any PyPSA dependency: the two
+programs meet only through files. mpi-sppy needs essentially **no new code** —
+its reader already parses LP (Phase 0, §10); only the file-name lookup needs a
+small tweak.
 
 ## 3. Architecture
 
@@ -61,7 +64,7 @@ n.optimize.solve_stochastic(method="ph", solver_name="gurobi", ...)   # NEW
         ├─ (1) EXPORT  — for each scenario s:
         │        slice scenario s → standalone single-scenario Network
         │        create_model()  → linopy.Model
-        │        write  {s}.mps            (model; implicit  x{label}  names)
+        │        write  {s}.lp             (model; implicit  x{label}  names; MPS ok too)
         │        write  {s}_nonants.json   (probability + first-stage var names)
         │        write  {s}_rho.csv        (optional: per-nonant rho)
         │
@@ -82,7 +85,7 @@ For a directory `DIR` (`cfg.mps_files_directory`), each scenario `s` contributes
 
 | File | Producer | Consumer | Content |
 |------|----------|----------|---------|
-| `{s}.mps` (or `{s}.lp`) | PyPSA (linopy) | mpi-sppy `mps_reader` | the scenario subproblem |
+| `{s}.lp` (or `{s}.mps`) | PyPSA (linopy) | mpi-sppy `mps_reader` | the scenario subproblem |
 | `{s}_nonants.json` | PyPSA | mpi-sppy `mps_module` | probability + scenario tree + nonant names |
 | `{s}_rho.csv` | PyPSA (optional) | mpi-sppy | per-nonant rho hints |
 
@@ -103,8 +106,8 @@ Schema consumed by `mpisppy/problem_io/mps_module.py:scenario_creator` (~L38–8
 }
 ```
 
-The `nonAnts` entries are variable names **exactly as they appear in the MPS
-file**. The reader normalizes `(` and `)` to `_` when resolving them against the
+The `nonAnts` entries are variable names **exactly as they appear in the LP (or
+MPS) file**. The reader normalizes `(` and `)` to `_` when resolving them against the
 Pyomo model (`mps_reader.py` ~L114; `mps_module.py` ~L67) — but it does **not**
 normalize `#`. See the naming decision in §6.
 
@@ -125,7 +128,7 @@ later).
 For each first-stage `linopy` variable, PyPSA recovers its on-file names from the
 integer `labels` (see §6) and writes them into `nonAnts`.
 
-## 6. Variable naming — the enabling fact and the one risk
+## 6. Variable naming — the enabling fact
 
 ### 6.1 Determinism (verified)
 
@@ -151,8 +154,9 @@ scenarios are structurally identical (§9).
 
 **Decision: use implicit `x{label}`.** The mpi-sppy reader normalizes `()` but
 not `#`, and `#` in a Pyomo component name is fragile through
-`find_component`. `x{label}` round-trips cleanly HiGHS → coin-or `mip` →
-Pyomo. PyPSA maps a first-stage `linopy` variable to its `x{label}` names via:
+`find_component`. `x{label}` round-trips cleanly through the file writer →
+coin-or `mip` → Pyomo (validated for LP and MPS, §6.3). PyPSA maps a first-stage
+`linopy` variable to its `x{label}` names via:
 
 ```python
 labels = n.model["Generator-p_nom"].labels.data.ravel()       # ints
@@ -161,25 +165,28 @@ names  = ["x" + str(int(L)) for L in labels if L >= 0]         # mask -1 (inacti
 
 (equivalently `linopy.io.get_printers_scalar(n.model, explicit_coordinate_names=False)`).
 
-### 6.3 The risk: MPS naming is delegated to HiGHS
+### 6.3 File format: LP primary (naming validated in Phase 0)
 
-`linopy` writes **MPS** by delegating to `highspy.Highs.writeModel`
-(`linopy/io.py` ~L690–701), so the on-file names are only as controllable as
-HiGHS makes them. Exploration showed HiGHS *preserves* the names linopy supplies,
-but this must be confirmed for implicit names before relying on it (Phase 0,
-§12).
+Both formats were validated end to end in Phase 0 (PyPSA → file → mpi-sppy
+reader): implicit names are `x{label}`, deterministic across structurally-
+identical scenario networks built with different data, resolved by
+`find_component("x{label}")`, with a matching numeric round-trip (see §12).
 
-**Fallback / why LP support matters:** `linopy`'s **LP** writer (`to_lp_file`,
-`io.py` ~L588) is linopy's own code and gives **full** control of the on-file
-names. Adding LP reading to mpi-sppy therefore doubles as our naming-control
-safety net, not merely a convenience.
+**Decision: prefer LP.** `linopy` writes **LP** with its own writer
+(`to_lp_file`, `io.py` ~L588), giving full, stable control of the on-file names
+(no dependence on a third party's write behavior) and producing human-readable
+files — valuable for debugging the scenario subproblems and the nonant matching.
+
+**MPS remains supported** as an alternative. `linopy` writes MPS by delegating to
+`highspy.Highs.writeModel` (`io.py` ~L690–701); Phase 0 confirmed HiGHS preserves
+the implicit `x{label}` names, so MPS round-trips cleanly too.
 
 ## 7. Objective convention (no double counting)
 
 `create_model()` for a single network builds
 `objective = Σ capital_cost · (*_nom) + Σ marginal_cost · dispatch`
 (`pypsa/optimization/optimize.py:define_objective`, ~L139; capex on `*_nom`
-~L312–333). Each scenario's MPS therefore carries the **full** capex (on the
+~L312–333). Each scenario's file therefore carries the **full** capex (on the
 nonants) **plus that scenario's** opex. This is correct for PH/EF because
 
 ```
@@ -199,7 +206,7 @@ n.optimize.solve_stochastic(
     cylinders=("lagrangian", "xhatshuffle"),
     mpisppy_options={"default_rho": 1.0, "max_iterations": 50, "convthresh": 1e-3},
     working_dir=None,            # temp dir if None
-    file_format="mps",           # "mps" | "lp"
+    file_format="lp",            # "lp" | "mps"
     keep_files=False,
 )
 ```
@@ -274,18 +281,19 @@ defaults (rho, cylinders) could later be registered under
 3. **QP-capable solver** for PH (the proximal term makes subproblems QPs); Gurobi
    is the default and is present in the dev env.
 
-## 10. Changes required in mpi-sppy (additive only)
+## 10. Changes required in mpi-sppy (small)
 
-Add LP reading next to the MPS reader:
+LP is the primary format (§6.3), so mpi-sppy must load `{s}.lp`. Phase 0 showed
+the **reader already handles LP**: `read_mps_and_create_pyomo_model`
+(`mps_reader.py` ~L158–168) calls coin-or `mip.Model().read()`, which
+auto-detects `.lp` by extension — a `.lp` path round-trips with **no reader
+change** (the Phase 0 LP test went through the unchanged reader).
 
-- `mpisppy/problem_io/mps_reader.py`: a `read_lp_to_mip_model(path)` paralleling
-  `read_mps_to_mip_model` (~L72–80) — coin-or `mip.Model().read()` auto-detects
-  `.lp`; and let `read_mps_and_create_pyomo_model` (~L158–168) dispatch on
-  extension.
-- `mpisppy/problem_io/mps_module.py:scenario_creator` (~L47–49): try `{s}.lp`
-  when `{s}.mps` is absent.
-
-The MPS path itself is unchanged and already works.
+The only change is the file-name lookup in
+`mpisppy/problem_io/mps_module.py:scenario_creator` (~L47–49), which currently
+hardcodes `sharedPath + ".mps"`. It should accept `.lp` (detect whichever of
+`{s}.lp` / `{s}.mps` exists, or take the extension from config). MPS stays
+supported.
 
 ## 11. Correctness and testing
 
@@ -295,19 +303,24 @@ The MPS path itself is unchanged and already works.
 - **PH convergence:** PH first-stage (capacities) must converge to the EF
   first-stage solution.
 - **Fixture:** a tiny 2-bus, ~3-scenario, few-snapshot network — small enough to
-  solve the EF directly and to inspect the MPS/JSON by eye.
+  solve the EF directly and to inspect the LP/JSON by eye.
 
 ## 12. Phased plan
 
-- **Phase 0 — de-risk (do first).** `pip install mip` in the `pypsa-sppy` env;
-  write a PyPSA single-network MPS (implicit names); round-trip it through
-  `mpisppy.problem_io.mps_reader.read_mps_and_create_pyomo_model`; confirm the
-  capacity nonants resolve via `find_component("x{label}")`. Repeat for LP. This
-  validates the entire approach for minimal cost and decides MPS-vs-LP as the
-  primary format.
-- **Phase 1 — exporter.** scenario slicing + `write_mpisppy_files` (MPS +
+- **Phase 0 — de-risk — DONE.** Installed coin-or `mip` (1.17.6, bundles CBC via
+  `cbcbox`) in `pypsa-sppy`; built two structurally-identical PyPSA networks
+  (1 bus, 2 extendable generators, 3 snapshots) with different data; wrote each
+  to MPS and LP with implicit names; round-tripped through
+  `mps_reader.read_mps_and_create_pyomo_model`. **Results:** nonants are
+  `x0`, `x1`; names identical across the two networks (determinism holds through
+  the full PyPSA → HiGHS → `mip` path); `find_component` resolves every nonant
+  for both formats; and the model round-trips numerically (PyPSA-native objective
+  == LP/MPS-via-Pyomo objective = 123100). **Conclusion:** the file-based
+  approach is sound; LP is the primary format (full naming control,
+  human-readable), MPS also works.
+- **Phase 1 — exporter.** scenario slicing + `write_mpisppy_files` (LP +
   nonant JSON), validated against the `_delme_test_write_mp_mps_dir/` reference.
-- **Phase 2 — mpi-sppy LP support** (§10).
+- **Phase 2 — mpi-sppy `.lp` filename support** (§10).
 - **Phase 3 — driver + write-back.** programmatic PH run; `assign_stochastic_solution`.
 - **Phase 4 — public method, `pypsa[mpisppy]` extra, tests (§11), docs.**
 
