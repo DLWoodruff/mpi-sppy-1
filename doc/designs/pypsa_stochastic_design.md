@@ -273,7 +273,7 @@ n.optimize.read_stochastic_solution(directory)   # sets *_nom_opt; optional disp
 # Inline convenience (laptop / single node) = phase 1 + subprocess solve + phase 3
 n.optimize.solve_stochastic(
     method="ph",                 # "ph" (target) | "ef" (correctness oracle only)
-    solver_name="gurobi",        # QP-capable (PH proximal ⇒ QP; MIQP if integer first stage)
+    solver_name="gurobi",        # QP/MIQP for the PH proximal term; or LP/MILP if proximal terms linearized (§9.3)
     first_stage=None, rho="cost-proportional",
     cylinders=("lagrangian", "xhatshuffle"),
     config_file=None, mpisppy_args=None, mpisppy_options=None,   # (§8.2)
@@ -392,7 +392,8 @@ config (file + CLI) — consistent with the file-boundary philosophy.
    integers is heuristic, but mpi-sppy's bounding cylinders (Lagrangian lower
    bound + xhat upper bound) bracket the optimum and report a valid optimality
    gap. With the PH proximal term, integer first-stage makes the subproblems
-   MIQPs — Gurobi handles these.
+   MIQPs (Gurobi handles these directly, or linearize the proximal — quadratic —
+   term, §9.3, to keep them MILPs).
 
 ## 10. Required mpi-sppy support — MERGED (#770)
 
@@ -492,7 +493,8 @@ naming is load-bearing rather than cosmetic.
   Scenario count — not rank count — sets the ceiling; to use many ranks you need
   many scenarios (or bundling, §14).
 - **Solver licensing.** Each rank runs its own solver engine concurrently (QP, or
-  MIQP with integer first stage, §9.4); at large N this needs a Gurobi
+  MIQP with integer first stage, §9.4 — or LP/MILP if the proximal term is
+  linearized, §9.3); at large N this needs a Gurobi
   floating/cluster license permitting that many simultaneous engines.
 - **Memory.** ~one Pyomo scenario model per rank at full scale — scales well.
 
