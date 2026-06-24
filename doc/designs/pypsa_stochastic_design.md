@@ -2,7 +2,7 @@
 
 Status: draft for review. Spans two repos: **PyPSA** (work on the `DLWoodruff/PyPSA`
 fork) and **mpi-sppy**. The required mpi-sppy support (`.lp` files + per-nonant
-rho from `{s}_rho.csv`) is **merged upstream** — Pyomo/mpi-sppy `main`, #770 — so
+rho from `{s}_rho.csv`) is **merged upstream** — Pyomo/mpi-sppy `main` — so
 all remaining work is on the PyPSA side. No use of the mpi-sppy *agnostic/guest*
 framework — the coupling is at the **file boundary**. Core feasibility has been
 validated end to end (Phase 0, §12).
@@ -12,6 +12,12 @@ validated end to end (Phase 0, §12).
 Let a PyPSA user solve a stochastic energy-system model by **decomposition**
 (Progressive Hedging + bounding cylinders) using mpi-sppy, as an alternative to
 PyPSA's existing *monolithic* Extensive Form (EF) solve.
+
+**The point of this work is large-scale, *parallel* decomposition** — running PH
+with bounding cylinders across many MPI ranks, typically as separate scheduler
+jobs on an HPC cluster. **§13 is the heart of this design.** The integrated,
+single-process (serial) path is provided **only for testing and small problems**,
+not as the intended production mode.
 
 The user-facing entry point is a new PyPSA method:
 
@@ -48,8 +54,9 @@ mpi-sppy already ships a complete file-based scenario loader
 subproblem to a standard LP file (MPS is also supported). This keeps PyPSA free
 of any Pyomo dependency and keeps mpi-sppy free of any PyPSA dependency: the two
 programs meet only through files. mpi-sppy needs essentially **no new code** —
-its reader already parses LP (Phase 0, §10); only the file-name lookup needs a
-small tweak.
+its reader already parses LP, and the only additions (merged in #770) were two
+small file-path hooks: resolving the `.lp` / `.mps` filename and reading
+`{s}_rho.csv` (§10).
 
 ## 3. Architecture
 
@@ -154,12 +161,15 @@ integer `labels` (see §6) and writes them into `nonAnts`.
 `linopy` assigns variable *labels* strictly by **creation order**, independent of
 any numeric data (objective coefficients, bounds, RHS). Empirically, two models
 built with the same sequence of `add_variables` calls produce **identical**
-on-file names even when the data differ. Therefore two structurally-identical
-scenario networks emit LP (or MPS) files whose variables line up by name — which
-is exactly what mpi-sppy needs to enforce nonanticipativity across scenarios.
+on-file names even when the data differ. So scenario networks built with the same
+sequence of variable creations emit LP (or MPS) files whose variables line up by
+name — which is what mpi-sppy needs to enforce nonanticipativity across scenarios.
 
-This is the load-bearing assumption of the whole approach. It holds **iff** all
-scenarios are structurally identical (§9).
+This determinism is the load-bearing fact. mpi-sppy matches nonants
+**positionally**, so its actual requirement is only that the **first-stage
+nonants share names and order across scenarios** (§9.1) — weaker than full
+structural identity, which is merely a *sufficient* (and, for PyPSA, simple) way
+to guarantee it.
 
 ### 6.2 Use implicit `x{label}` names
 
@@ -359,15 +369,24 @@ config (file + CLI) — consistent with the file-boundary philosophy.
 
 ## 9. Assumptions and constraints
 
-1. **Structural identity.** All scenarios share the same components and the same
-   snapshots; only data differ. This guarantees identical `linopy` labels and
-   thus consistent nonant names (§6.1). The exporter must **assert** this — e.g.
-   compare the first-stage label→name maps across scenarios and fail loudly on
-   mismatch.
+1. **Consistent nonants (the necessary condition).** mpi-sppy matches nonants
+   positionally, so the only hard requirement is that the **first-stage nonants
+   appear with the same names in the same order in every scenario**. Building all
+   scenarios with identical structure (same components and snapshots, data-only
+   differences) is a *sufficient* — and, for PyPSA, the simplest — way to
+   guarantee this via linopy's deterministic labels (§6.1); it is **not
+   necessary** (scenarios may differ in second-stage structure as long as the
+   nonant name-list matches). The exporter must **assert** the nonant lists agree
+   (names + order) across scenarios and fail loudly on mismatch.
 2. **Two-stage first.** capacity = stage 1, dispatch = stage 2. The JSON tree
    format and mpi-sppy support multi-stage, but v1 targets two-stage.
-3. **QP-capable solver** for PH (the proximal term makes subproblems QPs); Gurobi
-   is the default and is present in the dev env.
+3. **Solver.** The PH proximal term is quadratic, so subproblems are QPs (MIQPs
+   with integer first stage, §9.4); a QP/MIQP solver such as Gurobi (the default,
+   present in the dev env) handles them natively. A QP-capable solver is **not
+   required**, though: mpi-sppy can linearize the proximal term
+   (`--linearize-proximal-terms`, a refined piecewise-linear approximation;
+   binaries exactly via `--linearize-binary-proximal-terms`), so an LP/MILP solver
+   (HiGHS, CBC, …) can be used instead.
 4. **Integer / committable first-stage is supported.** First-stage variables may
    be integer (e.g. modular `*-n_mod`, committable on/off). PH consensus on
    integers is heuristic, but mpi-sppy's bounding cylinders (Lagrangian lower
@@ -377,26 +396,12 @@ config (file + CLI) — consistent with the file-boundary philosophy.
 
 ## 10. Required mpi-sppy support — MERGED (#770)
 
-Both changes are implemented on **Pyomo/mpi-sppy `main`** (PR #770, *"mps_module:
-accept .lp files and per-nonant rho from {s}_rho.csv"*); PyPSA needs an mpi-sppy
-at or past that commit. No driver/reader/PH changes were required. See the
-companion design `doc/designs/mps_module_lp_rho_design.md`.
-
-1. **`.lp` files.** `mps_module._scenario_model_path` resolves `{s}.lp` / `{s}.mps`
-   (`.lp` preferred when both exist); `scenario_creator` and
-   `scenario_names_creator` use it (the latter globs both extensions and derives
-   base names with `os.path.splitext`). The reader was already LP-capable
-   (coin-or `mip` auto-detects).
-2. **Per-nonant rho.** `mps_module._rho_setter` (auto-discovered by
-   `generic/decomp.py:_get_rho_setter`) reads `{s}_rho.csv` whose path
-   `scenario_creator` stashes as `model._rho_csv_path`; it returns `[]` when the
-   file is absent (so `--default-rho` still applies). `rho_utils.rho_list_from_csv`
-   now accepts a `varname` *or* `fullname` column and normalizes `()`→`_`.
-
-**Constraint PyPSA must honor:** mpi-sppy applies rho **per scenario without
-cross-scenario reconciliation**, so the writer must give a nonant the same rho in
-every scenario (§4.2, §7.1). User-facing format docs live in mpi-sppy's
-`doc/src/agnostic.rst` (scenario files + `_rho.csv`) and `doc/src/extensions.rst`.
+The file-path support PyPSA relies on — `.lp` scenario files and per-nonant rho
+from `{s}_rho.csv` — is merged on Pyomo/mpi-sppy `main` (#770); PyPSA just needs
+an mpi-sppy at or past it (no driver/reader/PH changes were required). For details
+see mpi-sppy's user docs (`doc/src/agnostic.rst`, `doc/src/extensions.rst`) and
+the companion `doc/designs/mps_module_lp_rho_design.md`. The one constraint it
+places on PyPSA — identical per-nonant rho across scenarios — is in §4.2 / §7.1.
 
 ## 11. Correctness and testing
 
@@ -474,7 +479,7 @@ mpi-sppy enforces nonanticipativity by reducing nonant vectors **positionally**
 across scenarios — within a cylinder (the `xbar` reduction) and across cylinders
 (bound/incumbent exchange). Therefore the `nonAnts` list must be **identical in
 both names and order across every scenario's `_nonants.json`**. The determinism
-result (§6.1) plus structural identity (§9.1) guarantee this; the exporter must
+result (§6.1) and matching nonant lists (§9.1) guarantee this; the exporter must
 assert it (same ordered name-list for all scenarios). This is *why* deterministic
 naming is load-bearing rather than cosmetic.
 
@@ -520,8 +525,9 @@ j2=$(sbatch --parsable --dependency=afterok:$j1 solve.sbatch)  # -N …,  mpi-sp
 sbatch            --dependency=afterok:$j2 read.sbatch         # -n 1,  PyPSA env
 ```
 
-**Directory hygiene (important).** mpi-sppy discovers scenarios by *globbing* the
-transfer directory (`mps_module.scenario_names_creator` globs `*.lp` / `*.mps`).
+**Directory hygiene (important).** mpi-sppy discovers scenarios by scanning the
+transfer directory for model files — every `{s}.lp` / `{s}.mps` it finds becomes a
+scenario (`mps_module.scenario_names_creator`).
 A previous run that wrote **more** scenarios leaves stale `{s}.lp` (+
 `_nonants.json` / `_rho.csv`) that a smaller new run would silently pick up as
 **phantom scenarios** — wrong scenario set and probabilities. So **clear the
