@@ -491,7 +491,13 @@ naming is load-bearing rather than cosmetic.
 - **Startup I/O.** `C × S` reads total, distributed across ranks, one-time.
 - **Parallelism ceiling.** ranks/cylinder ≤ S, so **max useful N ≈ C × S**.
   Scenario count — not rank count — sets the ceiling; to use many ranks you need
-  many scenarios (or bundling, §14).
+  many scenarios (or bundling — see below).
+- **Bundling (large S).** Proper bundles compose with the file path (#771):
+  `--scenarios-per-bundle` works directly — mpi-sppy infers the scenario count
+  from the directory (no `--num-scens`) — and per-nonant rho from `{s}_rho.csv` is
+  assembled bundle-aware. This relies on the scenario-constant rho invariant
+  (§7.1): the bundle takes each nonant's shared rho and errors if its scenarios
+  disagree.
 - **Solver licensing.** Each rank runs its own solver engine concurrently (QP, or
   MIQP with integer first stage, §9.4 — or LP/MILP if the proximal term is
   linearized, §9.3); at large N this needs a Gurobi
@@ -550,9 +556,6 @@ solution file, §13.5) must be visible to all three jobs (§13.4).
 - **Multi-stage** investment horizons (PyPSA `investment_periods`).
 - **CVaR / risk** interaction with decomposition (PyPSA already has CVaR in the
   monolithic EF; cf. mpi-sppy `doc/designs/cvar_design.md`).
-- **Bundling for large S.** Whether the LP-file path (`mps_module`) composes with
-  proper bundles (`--scenarios-per-bundle`) to right-size subproblems and cut
-  comm when S is large; may be a separate `mps_module` item (§13.4).
 - **Solution write-back flag.** Pin down the exact `generic_cylinders` mechanism
   that emits the incumbent first stage to a file for PyPSA to read (§13.5).
 - **File-interface performance (note in the user docs).** The file interface is
