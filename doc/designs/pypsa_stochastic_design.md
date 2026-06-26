@@ -5,8 +5,10 @@ fork) and **mpi-sppy**. The required mpi-sppy support (`.lp` files + per-nonant
 rho from `{s}_rho.csv`) is **merged upstream** — Pyomo/mpi-sppy `main` — so
 all remaining work is on the PyPSA side. No use of the mpi-sppy *agnostic/guest*
 framework — the coupling is at the **file boundary**. Core feasibility has been
-validated end to end (Phase 0), and the **PyPSA exporter + read-back (Phase 1) is
-implemented and validated** against the mpi-sppy reader and the EF oracle (§12).
+validated end to end (Phase 0); the **PyPSA exporter + read-back (Phase 1)** and
+the **inline `solve_stochastic` driver (Phase 3)** are implemented and validated
+against the mpi-sppy reader, the EF oracle, and a real PH run that converges to the
+EF first stage (§12). Remaining: `n_mod`/dispatch write-back and user docs (Phase 4).
 
 ## 1. Goal
 
@@ -303,14 +305,19 @@ n.optimize.read_stochastic_solution(
 
 # Inline convenience (laptop / single node) = phase 1 + subprocess solve + phase 3
 n.optimize.solve_stochastic(
+    working_dir=None,            # None = temp dir, removed afterwards unless keep_files
     method="ph",                 # "ph" (target) | "ef" (correctness oracle only)
     solver_name="gurobi",        # QP/MIQP for the PH proximal term; or LP/MILP if proximal terms linearized (§9.3)
-    first_stage=None, rho="cost-proportional",
+    first_stage=None, rho="cost-proportional", rho_alpha=1.0, rho_floor=1e-3,
+    file_format="lp",
     cylinders=("lagrangian", "xhatshuffle"),
-    config_file=None, mpisppy_args=None, mpisppy_options=None,   # (§8.2)
-    nprocs=None,                 # ranks for the inline mpiexec run
-    working_dir=None, file_format="lp", keep_files=False,
-)
+    default_rho=1.0, max_iterations=50,
+    config_file=None, mpisppy_options=None, mpisppy_args=None,   # (§8.2)
+    nprocs=None,                 # ranks for the inline mpiexec run (PH only)
+    keep_files=False,            # keep a temp working_dir after solving
+    tee=True,                    # stream the driver output live
+    model_kwargs=None,           # forwarded to create_model() per scenario
+)   # sets *_nom_opt on n; returns {on-file nonant name: value}
 ```
 
 Implemented in a new `pypsa/optimization/stochastic.py`:
@@ -471,13 +478,28 @@ places on PyPSA — identical per-nonant rho across scenarios — is in §4.2 / 
   resolve every nonant, consuming LP + JSON + rho) and via the **EF oracle: native
   PyPSA EF == mpi-sppy EF over the written files, exact match (97210.0)**, with the
   incumbent `xhat.csv` read back to identical `*_nom_opt`. (`n_mod` write-back +
-  capacity-fixed dispatch re-solve deferred to Phase 3/4.)
+  capacity-fixed dispatch re-solve deferred to Phase 4.)
 - **Phase 2 — mpi-sppy file-path support — DONE (#770, upstream main):** `.lp`
   filename lookup + `_rho.csv` consumption + tests (§10).
-- **Phase 3 — driver + write-back.** subprocess/scheduler PH run;
-  `read_stochastic_solution`.
-- **Phase 4 — public methods, `pypsa[mpisppy]` extra, tests (§11), docs
-  (incl. the SLURM workflow, §13.6).**
+- **Phase 3 — inline driver — DONE (validated 2026-06-26).**
+  `solve_stochastic(...)` added to `pypsa/optimization/stochastic.py` and bound as
+  `n.optimize.solve_stochastic` (§8): write (Phase 1) + blocking mpi-sppy
+  subprocess + read-back (§13.5). Gates on `check_optional_dependency("mpisppy",
+  …)`; PyPSA never joins MPI — mpi-sppy runs wholly in the subprocess. `method="ph"`
+  runs the cylinders under `mpiexec`; `method="ef"` solves the extensive form in a
+  single process (`--EF --EF-solver-name`, the oracle). `mpisppy_options`
+  dict→CLI, `config_file`/`mpisppy_args` passthrough, `nprocs`/`max_iterations`
+  knobs, temp-dir `working_dir` with `keep_files`, `tee` streaming. The
+  `pypsa[mpisppy]` extra (`mpi-sppy`, `mpi4py`, `mip`) landed here too. **Validated**
+  in `pypsa-sppy`: 25 dependency-free + 1 guarded e2e test (mpi-sppy EF first stage
+  == native PyPSA EF first stage); 38 pre-existing stochastic tests still pass; and
+  a real **PH run under `mpiexec -np 3` converges exactly to the EF first stage
+  (max abs diff 0.0; EF obj 97210.0)**.
+- **Phase 4 — write-back completion + docs.** `n_mod` → `n_mod_opt` and the
+  optional capacity-fixed dispatch re-solve (§13.5, §14); user docs (the inline
+  vs decoupled/SLURM workflow, §13.6; the file-interface performance caveat, §14).
+  The public methods, the `pypsa[mpisppy]` extra and the §11 correctness tests
+  already landed in Phases 1 and 3.
 
 ## 13. Parallel execution and scaling
 
@@ -551,9 +573,11 @@ identically for EF and cylinders runs. `read_stochastic_solution` parses the
 `ROOT` rows, maps each `x{label}` back to its component via the manifest's
 `nonant_map`, and sets `*_nom_opt` (shared across all scenarios — first-stage) —
 the return half of the file boundary, consistent with §3. (`x{label}` names
-contain no `(` / `)`, so mpi-sppy's name normalisation is a no-op here.) PyPSA may
-optionally re-solve each scenario with capacities fixed for full dispatch (not yet
-implemented).
+contain no `(` / `)`, so mpi-sppy's name normalisation is a no-op here.) The
+inline `solve_stochastic` (§8) drives this whole loop — write, subprocess solve,
+read-back — in one call. Modular module counts (`*-n_mod` → `n_mod_opt`) are
+reported but not yet written back, and PyPSA may optionally re-solve each scenario
+with capacities fixed for full dispatch — both Phase 4 (§14).
 
 ### 13.6 Execution paths: inline vs decoupled (SLURM)
 
@@ -595,11 +619,12 @@ solution file, §13.5) must be visible to all three jobs (§13.4).
 
 Resolved in Phase 1: **scenario slicing** — reuse the existing `n.get_scenario(s)`
 (§12); **solution write-back flag** — mpi-sppy `--write-xhat-file` (§13.5);
-**scenario file naming** — integer stems (§4.3).
+**scenario file naming** — integer stems (§4.3). Resolved in Phase 3: the **inline
+driver** `solve_stochastic` (§8, §12).
 
-- **`n_mod` / dispatch write-back.** `read_stochastic_solution` currently sets the
+- **`n_mod` / dispatch write-back (Phase 4).** `read_stochastic_solution` sets the
   `*_nom` capacities; writing modular module counts back (`*-n_mod` → `n_mod_opt`)
-  and the optional capacity-fixed dispatch re-solve are still to do (Phase 3/4).
+  and the optional capacity-fixed dispatch re-solve are still to do.
 - **Multi-stage** investment horizons (PyPSA `investment_periods`).
 - **CVaR / risk** interaction with decomposition (PyPSA already has CVaR in the
   monolithic EF; cf. mpi-sppy `doc/designs/cvar_design.md`).
