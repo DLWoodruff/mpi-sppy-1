@@ -5,7 +5,8 @@ fork) and **mpi-sppy**. The required mpi-sppy support (`.lp` files + per-nonant
 rho from `{s}_rho.csv`) is **merged upstream** — Pyomo/mpi-sppy `main` — so
 all remaining work is on the PyPSA side. No use of the mpi-sppy *agnostic/guest*
 framework — the coupling is at the **file boundary**. Core feasibility has been
-validated end to end (Phase 0, §12).
+validated end to end (Phase 0), and the **PyPSA exporter + read-back (Phase 1) is
+implemented and validated** against the mpi-sppy reader and the EF oracle (§12).
 
 ## 1. Goal
 
@@ -68,12 +69,12 @@ n.set_scenarios({...})                       # EXISTING PyPSA UX
         ▼
 n.optimize.solve_stochastic(method="ph", solver_name="gurobi", ...)   # NEW
         │
-        ├─ (1) EXPORT  — for each scenario s:
-        │        slice scenario s → standalone single-scenario Network
+        ├─ (1) EXPORT  — for each scenario s (file stem  scenario{i}, §4.3):
+        │        slice scenario s  (n.get_scenario(s)) → standalone single-scenario Network
         │        create_model()  → linopy.Model
-        │        write  {s}.lp             (model; implicit  x{label}  names; MPS ok too)
-        │        write  {s}_nonants.json   (probability + first-stage var names)
-        │        write  {s}_rho.csv        (per-nonant cost-proportional rho)
+        │        write  {stem}.lp           (model; implicit  x{label}  names; MPS ok too)
+        │        write  {stem}_nonants.json (probability + first-stage var names)
+        │        write  {stem}_rho.csv      (per-nonant cost-proportional rho)
         │
         ├─ (2) SOLVE  — mpi-sppy driver as a subprocess (MPI for cylinders):
         │        mpiexec -np K python -m mpi4py generic_cylinders.py
@@ -143,13 +144,31 @@ them across scenarios, so a given nonant must get the **same** rho in every
 scenario's file. For two-stage problems that means every scenario's `_rho.csv` is
 identical — PyPSA computes rho once and replicates it (§7.1).
 
+### 4.3 Scenario file naming (integer stems)
+
+mpi-sppy derives each scenario's *name* from its model file **stem** and
+**requires the stem to end in an integer**: `mps_module.scenario_names_creator`
+globs `*.lp` / `*.mps`, sorts the stems lexicographically, and does
+`re.search(r"\d+$", ...)` (preferring zero-based, warning otherwise). PyPSA
+scenario names (`"low"`, `"med"`, `"high"`) therefore **cannot** be the file
+names. The exporter writes **zero-padded integer stems** — `scenario0.lp`,
+`scenario1.lp`, … (`scenario00…` once there are ≥ 10 scenarios, so the
+lexicographic sort matches the numeric order) — and preserves the human-readable
+PyPSA name in `{stem}_nonants.json` `scenarioData.name` and in the manifest's
+`scenario_files` map (`{index, name, stem, probability}`). This renaming is
+invisible to the rest of the machinery: nonant names are `x{label}` (§6) and
+write-back keys off the manifest's nonant→component map (§13.5), both independent
+of the scenario file name.
+
 ## 5. Nonant (first-stage) identification
 
-Default first stage = **all extendable capacity variables**: `Generator-p_nom`,
-`Line-s_nom`, `Link-p_nom`, `Store-e_nom`, `StorageUnit-p_nom`, plus modular
-counts `*-n_mod` where present. The user may override with an explicit list (to
-restrict the first stage, or to add e.g. committable first-stage decisions
-later).
+Default first stage = **all extendable capacity variables**, derived in code from
+`pypsa.descriptors.nominal_attrs` (`Generator-p_nom`, `Line-s_nom`,
+`Transformer-s_nom`, `Link-p_nom`, `Process-p_nom`, `Store-e_nom`,
+`StorageUnit-p_nom`) plus modular counts `{component}-n_mod`, filtered to those
+variables actually present in the built model. The user may override with an
+explicit list (to restrict the first stage, or to add e.g. committable
+first-stage decisions later).
 
 For each first-stage `linopy` variable, PyPSA recovers its on-file names from the
 integer `labels` (see §6) and writes them into `nonAnts`.
@@ -235,10 +254,13 @@ for each first-stage variable `i` with objective coefficient `c_i` (the
 rho_i = max(rho_floor, alpha * |c_i|)
 ```
 
-with `alpha` (default 1.0) and a small `rho_floor` so a zero-cost nonant still
-gets a positive rho. PyPSA already holds every `capital_cost`, so it computes rho
-directly and writes `{s}_rho.csv` (§4.2). The `rho` argument (§8) selects this
-default, a flat scalar, or an explicit per-variable mapping.
+with `rho_alpha` (default 1.0) and a small `rho_floor` (default 1e-3) so a
+zero-cost nonant still gets a positive rho. In code `c_i` is read from the built
+model's `model.objective.flat` (its `vars`/`coeffs` table), which equals
+`capital_cost` for the `*_nom` nonants — robust to any user-chosen first stage.
+PyPSA writes the values to `{stem}_rho.csv` (§4.2). The `rho` argument (§8)
+selects this default, a flat scalar, or an explicit mapping keyed by the on-file
+nonant name (`{x{label}: rho}`, missing entries → `rho_floor`).
 
 Because rho must be **identical per nonant across scenarios** (§4.2 — mpi-sppy
 does not reconcile), PyPSA computes the rho vector **once** (capital costs are
@@ -257,18 +279,27 @@ mpi-sppy needed); only the inline `solve_stochastic` runs the driver.
 manifest = n.optimize.write_stochastic_problem(
     directory,
     clean=True,                  # clear stale scenario files in `directory` first (§13.6)
-    first_stage=None,            # None = all extendable capacities; else explicit list
-    rho="cost-proportional",     # "cost-proportional" | float | {varname: rho}  (§7.1)
+    first_stage=None,            # None = all extendable capacities (+ *-n_mod); else explicit list
+    rho="cost-proportional",     # "cost-proportional" | float | {on-file name: rho}  (§7.1)
+    rho_alpha=1.0, rho_floor=1e-3,
     file_format="lp",            # "lp" | "mps"
     cylinders=("lagrangian", "xhatshuffle"),
-    solver_name="gurobi",
+    solver_name="gurobi",        # recorded in the manifest command
+    default_rho=1.0,             # mpi-sppy --default-rho fallback in the manifest command
     config_file=None,            # mpi-sppy --config-file to reference (§8.2)
     mpisppy_args=None,           # extra mpi-sppy CLI args (§8.2)
+    model_kwargs=None,           # forwarded to create_model() per scenario
 )
-# manifest carries the exact phase-2 mpi-sppy command + an sbatch template.
+# manifest (also written to DIR/pypsa_stochastic_manifest.json) carries:
+#   scenarios, scenario_files (name↔stem↔prob), first_stage, nonants, nonant_map,
+#   rho, solution_file, solve_command (the exact phase-2 mpiexec line), mpi_ranks,
+#   sbatch_template.
 
 # Phase 3 — read the incumbent back onto the network (1 rank, PyPSA env)
-n.optimize.read_stochastic_solution(directory)   # sets *_nom_opt; optional dispatch re-solve
+n.optimize.read_stochastic_solution(
+    directory,
+    solution_file=None,          # defaults to the manifest's solution_file (DIR/xhat.csv)
+)   # sets *_nom_opt from mpi-sppy's --write-xhat-file CSV (§13.5)
 
 # Inline convenience (laptop / single node) = phase 1 + subprocess solve + phase 3
 n.optimize.solve_stochastic(
@@ -429,11 +460,18 @@ places on PyPSA — identical per-nonant rho across scenarios — is in §4.2 / 
   == LP/MPS-via-Pyomo objective = 123100). **Conclusion:** the file-based
   approach is sound; LP is the primary format (full naming control,
   human-readable), MPS also works.
-- **Phase 1 — exporter.** scenario slicing + `write_stochastic_problem` (clears
-  the directory, then writes LP + nonant JSON + cost-proportional `_rho.csv` + the
-  phase-2 command/sbatch), validated against mpi-sppy's
-  `mpisppy/tests/examples/mps_module_data/` fixture (#770: `Scenario*.lp`,
-  `_nonants.json`, `_rho.csv`).
+- **Phase 1 — exporter — DONE (validated 2026-06-26).**
+  `pypsa/optimization/stochastic.py` with `write_stochastic_problem` +
+  `read_stochastic_solution` (both dependency-free), bound as `n.optimize.*`
+  methods; 14 dependency-free tests in `test/test_stochastic_export.py` (no solver,
+  no mpi-sppy). Scenario slicing reuses the existing `n.get_scenario(s)` (§14
+  resolved); writes integer-stem (§4.3) LP/MPS + nonant JSON + cost-proportional
+  `_rho.csv` + `pypsa_stochastic_manifest.json`. **Validated** against
+  `mpisppy.problem_io` in-process (`scenario_names_creator` + `scenario_creator`
+  resolve every nonant, consuming LP + JSON + rho) and via the **EF oracle: native
+  PyPSA EF == mpi-sppy EF over the written files, exact match (97210.0)**, with the
+  incumbent `xhat.csv` read back to identical `*_nom_opt`. (`n_mod` write-back +
+  capacity-fixed dispatch re-solve deferred to Phase 3/4.)
 - **Phase 2 — mpi-sppy file-path support — DONE (#770, upstream main):** `.lp`
   filename lookup + `_rho.csv` consumption + tests (§10).
 - **Phase 3 — driver + write-back.** subprocess/scheduler PH run;
@@ -506,10 +544,16 @@ naming is load-bearing rather than cosmetic.
 
 ### 13.5 Result write-back
 
-mpi-sppy writes the best incumbent's first-stage (nonant) values to a file (e.g.
-`--solution-base-name`; exact flag to confirm), which PyPSA reads to set
-`*_nom_opt` — the return half of the file boundary, consistent with §3. PyPSA may
-optionally re-solve each scenario with capacities fixed for full dispatch.
+mpi-sppy writes the incumbent's first-stage (nonant) values with
+**`--write-xhat-file PATH`** — a by-name CSV with `#` comment lines then
+`node_name, variable_name, value` rows (`sputils.write_nonant_tree_csv`); it works
+identically for EF and cylinders runs. `read_stochastic_solution` parses the
+`ROOT` rows, maps each `x{label}` back to its component via the manifest's
+`nonant_map`, and sets `*_nom_opt` (shared across all scenarios — first-stage) —
+the return half of the file boundary, consistent with §3. (`x{label}` names
+contain no `(` / `)`, so mpi-sppy's name normalisation is a no-op here.) PyPSA may
+optionally re-solve each scenario with capacities fixed for full dispatch (not yet
+implemented).
 
 ### 13.6 Execution paths: inline vs decoupled (SLURM)
 
@@ -549,15 +593,16 @@ solution file, §13.5) must be visible to all three jobs (§13.4).
 
 ## 14. Open questions / future work
 
-- **Scenario slicing.** Carving a clean single-scenario `Network` out of a
-  `set_scenarios` network (static `(scenario, name)` MultiIndex; dynamic
-  `(scenario, name)` columns). If fiddly, the fallback is to accept a dict of
-  pre-built per-scenario networks; the public method can support both inputs.
+Resolved in Phase 1: **scenario slicing** — reuse the existing `n.get_scenario(s)`
+(§12); **solution write-back flag** — mpi-sppy `--write-xhat-file` (§13.5);
+**scenario file naming** — integer stems (§4.3).
+
+- **`n_mod` / dispatch write-back.** `read_stochastic_solution` currently sets the
+  `*_nom` capacities; writing modular module counts back (`*-n_mod` → `n_mod_opt`)
+  and the optional capacity-fixed dispatch re-solve are still to do (Phase 3/4).
 - **Multi-stage** investment horizons (PyPSA `investment_periods`).
 - **CVaR / risk** interaction with decomposition (PyPSA already has CVaR in the
   monolithic EF; cf. mpi-sppy `doc/designs/cvar_design.md`).
-- **Solution write-back flag.** Pin down the exact `generic_cylinders` mechanism
-  that emits the incumbent first stage to a file for PyPSA to read (§13.5).
 - **File-interface performance (note in the user docs).** The file interface is
   not fast (per-run file I/O + LP/MPS write & parse). For hard-to-solve problems
   this is negligible — wall time is dominated by the subproblem solves — but the
@@ -569,12 +614,16 @@ solution file, §13.5) must be visible to all three jobs (§13.4).
 
 **PyPSA** (`DLWoodruff/PyPSA` fork):
 - `pypsa/optimization/optimize.py` — `create_model` (~L600), `define_objective`
-  (~L139; capex on `*_nom` ~L312–333), `assign_solution` (~L901).
-- `pypsa/network/index.py` — `set_scenarios` (~L785), `scenarios` /
-  `scenario_weightings` (~L800–890).
+  (~L139; capex on `*_nom` ~L312–333), `assign_solution` (~L901),
+  `write_stochastic_problem` / `read_stochastic_solution` accessor methods (end of
+  `OptimizationAccessor`).
+- `pypsa/optimization/stochastic.py` — the exporter + read-back (implemented).
+- `pypsa/network/index.py` — `set_scenarios` (~L719), `get_scenario` (~L933, the
+  scenario slicer the exporter reuses), `scenarios` / `scenario_weightings`.
+- `pypsa/descriptors.py` — `nominal_attrs` (default first-stage source, §5).
 - `pypsa/optimization/variables.py` — variable definitions (scenario dim on
   operational vars; none on nominal).
-- (new) `pypsa/optimization/stochastic.py` — exporter + write-back.
+- `test/test_stochastic_export.py` — dependency-free exporter/read-back tests.
 
 **linopy** (0.8.0):
 - `linopy/io.py` — `to_file` (~L655), `to_lp_file` (~L588), MPS via HiGHS
@@ -584,7 +633,9 @@ solution file, §13.5) must be visible to all three jobs (§13.4).
 - `mpisppy/problem_io/mps_module.py` — `_scenario_model_path`, `scenario_creator`
   (stashes `model._rho_csv_path`), `scenario_names_creator`, `_rho_setter`.
 - `mpisppy/problem_io/mps_reader.py` — `read_mps_and_create_pyomo_model` (coin-or
-  `mip`; reads `.lp` and `.mps`).
+  `mip`; reads `.lp` and `.mps`; returns the Pyomo model directly).
+- `mpisppy/utils/sputils.py` — `write_nonant_tree_csv` (the `--write-xhat-file`
+  format, §13.5); `mpisppy/utils/config.py` — `write_xhat_file` arg (~L1275).
 - `mpisppy/utils/rho_utils.py` — `rho_list_from_csv` (accepts `varname`/`fullname`).
 - `mpisppy/generic/decomp.py` — `_get_rho_setter` (auto-discovers `module._rho_setter`).
 - `mpisppy/generic/parsing.py` — maps `--mps-files-directory` → `mps_module`.
