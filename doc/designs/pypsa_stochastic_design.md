@@ -8,7 +8,9 @@ framework — the coupling is at the **file boundary**. Core feasibility has bee
 validated end to end (Phase 0); the **PyPSA exporter + read-back (Phase 1)** and
 the **inline `solve_stochastic` driver (Phase 3)** are implemented and validated
 against the mpi-sppy reader, the EF oracle, and a real PH run that converges to the
-EF first stage (§12). Remaining: `n_mod`/dispatch write-back and user docs (Phase 4).
+EF first stage (§12). Remaining (Phase 4): the optional capacity-fixed **dispatch
+re-solve** for full per-scenario operations + prices (§13.7; `n_mod` → `n_mod_opt`
+write-back is done) and user docs.
 
 ## 1. Goal
 
@@ -495,11 +497,12 @@ places on PyPSA — identical per-nonant rho across scenarios — is in §4.2 / 
   == native PyPSA EF first stage); 38 pre-existing stochastic tests still pass; and
   a real **PH run under `mpiexec -np 3` converges exactly to the EF first stage
   (max abs diff 0.0; EF obj 97210.0)**.
-- **Phase 4 — write-back completion + docs.** `n_mod` → `n_mod_opt` and the
-  optional capacity-fixed dispatch re-solve (§13.5, §14); user docs (the inline
-  vs decoupled/SLURM workflow, §13.6; the file-interface performance caveat, §14).
-  The public methods, the `pypsa[mpisppy]` extra and the §11 correctness tests
-  already landed in Phases 1 and 3.
+- **Phase 4 — write-back completion + docs.** `n_mod` → `n_mod_opt` **done**; the
+  optional capacity-fixed dispatch re-solve (full per-scenario operations + prices,
+  §13.7) and user docs (the inline vs decoupled/SLURM workflow, §13.6; the
+  file-interface performance caveat, §14) remain. The public methods, the
+  `pypsa[mpisppy]` extra and the §11 correctness tests already landed in Phases 1
+  and 3.
 
 ## 13. Parallel execution and scaling
 
@@ -575,9 +578,10 @@ identically for EF and cylinders runs. `read_stochastic_solution` parses the
 the return half of the file boundary, consistent with §3. (`x{label}` names
 contain no `(` / `)`, so mpi-sppy's name normalisation is a no-op here.) The
 inline `solve_stochastic` (§8) drives this whole loop — write, subprocess solve,
-read-back — in one call. Modular module counts (`*-n_mod` → `n_mod_opt`) are
-reported but not yet written back, and PyPSA may optionally re-solve each scenario
-with capacities fixed for full dispatch — both Phase 4 (§14).
+read-back — in one call. Modular module counts (`*-n_mod` → `n_mod_opt`) are also
+written back (the integer-derived `*_nom_opt = n_mod_opt × *_nom_mod`). Recovering
+the **second stage** (per-scenario dispatch and marginal prices), which the xhat
+file does not carry, is Phase 4 — see §13.7.
 
 ### 13.6 Execution paths: inline vs decoupled (SLURM)
 
@@ -615,6 +619,51 @@ Sizing: `--ntasks` divisible by `C`; ranks/cylinder ≤ S (§13.1). Job 2 uses
 `srun` or `mpiexec`/`mpirun` per the site's MPI build. The shared `DIR` (and the
 solution file, §13.5) must be visible to all three jobs (§13.4).
 
+### 13.7 Recovering the second stage (dispatch and prices) — Phase 4
+
+`--write-xhat-file` returns only the **first stage** (`*_nom`, plus `*-n_mod` →
+`n_mod_opt`). The per-scenario **dispatch** (operational time series) and
+**marginal prices** are not in that file. Three ways to recover them, in
+decreasing order of preference:
+
+1. **Re-solve dispatch in PyPSA (recommended default).** For each scenario, slice
+   it (`n.get_scenario(s)`), fix capacities to the incumbent (`*_nom = *_nom_opt`,
+   `*_nom_extendable = False` — which also drops the modular `n_mod`↔`*_nom`
+   constraint), call `n.optimize()`, and merge the per-scenario results onto the
+   stochastic network's `(scenario, name)` columns (the inverse of
+   `get_scenario`'s `xs`, via `pd.concat(keys=…)`; copy only `status == "Output"`
+   series). Each subproblem is an independent LP (capacities are now parameters),
+   so the work is **parallelizable** — but PyPSA's orchestration is **serial** (one
+   model, one blocking solver call, no built-in scenario parallelism), so the loop
+   runs serially unless a process pool is added or the re-solves are pushed out as
+   separate scheduler jobs. This is the **only** path that yields marginal prices /
+   duals and PyPSA's native statistics; for committable (unit-commitment) models it
+   is also the only correct way to get prices (fix the binaries, re-solve the LP —
+   which PyPSA already does natively). Cost: extra solves; a small chance of a
+   different-but-equal-cost dispatch under degeneracy.
+
+2. **Read mpi-sppy's full tree solution (optional fast path, primal only).** The
+   xhatter already solves every scenario subproblem to optimality — it fixes the
+   nonants and solves (`Xhat_Eval.evaluate` → `_fix_nonants` → `solve_loop`) — so
+   the complete primal solution exists in memory and mpi-sppy can write it:
+   `generic_cylinders --solution-base-name BASE` writes `BASE_soldir/{stem}.csv`,
+   one file per scenario, each row `var_name,value` for every variable
+   (`sputils.scenario_tree_solution_writer`, selectable via the
+   `module.tree_solution_writer` hook — no core fork). **Verified (2026-06-29,**
+   real `mpiexec -np 3` + Gurobi PH on the test fixture**):** the CSV uses our
+   `x{label}` names verbatim — all 20 variables (both stages) present, zero
+   extraneous rows. This avoids the extra solves and gives exactly the incumbent
+   dispatch, but carries **no duals/prices** and needs a **full**
+   `x{label} → (component, attr, asset, snapshot)` manifest map (today the manifest
+   maps only the first-stage nonants).
+
+3. **Have mpi-sppy emit duals (future work).** Possible in principle but reduces to
+   a conditionally-valid price-recovery re-solve inside the xhatter, and duals are
+   not defined for general (MIP/nonconvex) subproblems — see §14.
+
+**Decision:** default to (1); offer (2) as a no-extra-solve primal fast path when
+prices are not needed. (3) is future work, not a near-term dependency.
+
 ## 14. Open questions / future work
 
 Resolved in Phase 1: **scenario slicing** — reuse the existing `n.get_scenario(s)`
@@ -622,9 +671,27 @@ Resolved in Phase 1: **scenario slicing** — reuse the existing `n.get_scenario
 **scenario file naming** — integer stems (§4.3). Resolved in Phase 3: the **inline
 driver** `solve_stochastic` (§8, §12).
 
-- **`n_mod` / dispatch write-back (Phase 4).** `read_stochastic_solution` sets the
-  `*_nom` capacities; writing modular module counts back (`*-n_mod` → `n_mod_opt`)
-  and the optional capacity-fixed dispatch re-solve are still to do.
+- **Dispatch write-back (Phase 4).** `read_stochastic_solution` sets the `*_nom`
+  capacities and now writes modular module counts back (`*-n_mod` → `n_mod_opt`).
+  The optional capacity-fixed **dispatch re-solve** (full per-scenario operations
+  and marginal prices) is the remaining Phase 4 item — see §13.7 for the
+  recovery-options decision.
+- **Duals / marginal prices from mpi-sppy (special opt-in — future work to
+  consider).** mpi-sppy could be extended to return constraint duals from the
+  xhatter's fixed-nonant subproblem solves, letting PyPSA reconstruct
+  `buses_t.marginal_price` etc. without a re-solve. But mpi-sppy is
+  **general-purpose** — scenario subproblems may be MIP, nonconvex, or solved by a
+  backend with no dual interface — so **duals are not defined in general**; this
+  could never be default behaviour and would need an **explicit opt-in option**
+  valid only on the LP-subproblem subclass. It is an issue of the **xhatter's
+  solve**, not the LP reader: no `dual` Suffix is declared on the scenario models,
+  and the incumbent cache is **primal-only** (`update_best_solution_if_improving`
+  stores a `ComponentMap` of `(var → value)`), so the winning solve's duals are
+  discarded before write — you would re-solve at write time anyway, and a
+  committable second stage would need a fix-binaries-then-LP re-solve. The
+  near-term path (§13.7) keeps price recovery on the PyPSA side, where the model
+  class is known and the machinery exists; revisit a special mpi-sppy dual option
+  if a concrete need arises.
 - **Multi-stage** investment horizons (PyPSA `investment_periods`).
 - **CVaR / risk** interaction with decomposition (PyPSA already has CVaR in the
   monolithic EF; cf. mpi-sppy `doc/designs/cvar_design.md`).
@@ -660,9 +727,19 @@ driver** `solve_stochastic` (§8, §12).
 - `mpisppy/problem_io/mps_reader.py` — `read_mps_and_create_pyomo_model` (coin-or
   `mip`; reads `.lp` and `.mps`; returns the Pyomo model directly).
 - `mpisppy/utils/sputils.py` — `write_nonant_tree_csv` (the `--write-xhat-file`
-  format, §13.5); `mpisppy/utils/config.py` — `write_xhat_file` arg (~L1275).
+  format, §13.5); `scenario_tree_solution_writer` / `write_tree_solution` (the full
+  per-scenario primal dump behind `--solution-base-name`, §13.7);
+  `mpisppy/utils/config.py` — `write_xhat_file` arg (~L1275),
+  `solution_base_name` arg.
+- `mpisppy/utils/xhat_eval.py` — `Xhat_Eval.evaluate` → `_fix_nonants` →
+  `solve_loop` (fixes nonants and fully solves each scenario subproblem; the primal
+  source for §13.7 option 2 and the dual discussion in §14).
+- `mpisppy/cylinders/spoke.py` / `mpisppy/spbase.py` —
+  `update_best_solution_if_improving` (incumbent cache is primal-only, §14).
 - `mpisppy/utils/rho_utils.py` — `rho_list_from_csv` (accepts `varname`/`fullname`).
-- `mpisppy/generic/decomp.py` — `_get_rho_setter` (auto-discovers `module._rho_setter`).
+- `mpisppy/generic/decomp.py` — `_get_rho_setter` (auto-discovers
+  `module._rho_setter`); `_write_solutions` (`--solution-base-name` →
+  `write_tree_solution`, `--write-xhat-file` → `write_tree_nonants`, §13.7).
 - `mpisppy/generic/parsing.py` — maps `--mps-files-directory` → `mps_module`.
 - `mpisppy/extensions/scenario_lp_mps_files.py` — reference writer (lp/mps/json/rho).
 - `mpisppy/tests/examples/mps_module_data/` — `.lp` + json + rho test fixture (#770).
