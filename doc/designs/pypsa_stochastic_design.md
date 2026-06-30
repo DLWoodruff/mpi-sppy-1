@@ -8,9 +8,10 @@ framework — the coupling is at the **file boundary**. Core feasibility has bee
 validated end to end (Phase 0); the **PyPSA exporter + read-back (Phase 1)** and
 the **inline `solve_stochastic` driver (Phase 3)** are implemented and validated
 against the mpi-sppy reader, the EF oracle, and a real PH run that converges to the
-EF first stage (§12). Remaining (Phase 4): the optional capacity-fixed **dispatch
-re-solve** for full per-scenario operations + prices (§13.7; `n_mod` → `n_mod_opt`
-write-back is done) and user docs.
+EF first stage (§12). The capacity-fixed **dispatch re-solve** (`dispatch="resolve"`,
+per-scenario operations + scenario-conditional duals; `n_mod` → `n_mod_opt`) is
+also implemented (§13.7). Remaining (Phase 4): `dispatch="read"` (mpi-sppy tree
+solution, §13.7 option 2) as a follow-up PR, and user docs.
 
 ## 1. Goal
 
@@ -498,9 +499,11 @@ places on PyPSA — identical per-nonant rho across scenarios — is in §4.2 / 
   a real **PH run under `mpiexec -np 3` converges exactly to the EF first stage
   (max abs diff 0.0; EF obj 97210.0)**.
 - **Phase 4 — write-back completion + docs.** `n_mod` → `n_mod_opt` **done**; the
-  optional capacity-fixed dispatch re-solve (full per-scenario operations + prices,
-  §13.7) and user docs (the inline vs decoupled/SLURM workflow, §13.6; the
-  file-interface performance caveat, §14) remain. The public methods, the
+  capacity-fixed dispatch re-solve `dispatch="resolve"` (per-scenario operations +
+  scenario-conditional duals, with a `scenarios=` subset, §13.7) **done**.
+  Remaining: `dispatch="read"` (mpi-sppy tree solution, §13.7 option 2) as a
+  **follow-up PR**, and user docs (the inline vs decoupled/SLURM workflow, §13.6;
+  the file-interface performance caveat, §14). The public methods, the
   `pypsa[mpisppy]` extra and the §11 correctness tests already landed in Phases 1
   and 3.
 
@@ -626,7 +629,8 @@ solution file, §13.5) must be visible to all three jobs (§13.4).
 **marginal prices** are not in that file. Two ways to recover them (a third,
 emitting duals from mpi-sppy, is future work):
 
-1. **Re-solve dispatch in PyPSA.** For each scenario, slice it
+1. **Re-solve dispatch in PyPSA — IMPLEMENTED (`dispatch="resolve"`).** For each
+   scenario, slice it
    (`n.get_scenario(s)`), fix capacities to the incumbent (`*_nom = *_nom_opt`,
    `*_nom_extendable = False` — which also drops the modular `n_mod`↔`*_nom`
    constraint), call `n.optimize()`, and merge the per-scenario results onto the
@@ -656,7 +660,7 @@ emitting duals from mpi-sppy, is future work):
    cost of re-solving all of them. A user can equally hand-roll this in their own
    script (`n.get_scenario(s)` → `fix_optimal_capacities()` → `n.optimize()`).
 
-2. **Read mpi-sppy's full tree solution (primal only).** The
+2. **Read mpi-sppy's full tree solution (primal only) — NEXT PR.** The
    xhatter already solves every scenario subproblem to optimality — it fixes the
    nonants and solves (`Xhat_Eval.evaluate` → `_fix_nonants` → `solve_loop`) — so
    the complete primal solution exists in memory and mpi-sppy can write it:
@@ -667,9 +671,23 @@ emitting duals from mpi-sppy, is future work):
    real `mpiexec -np 3` + Gurobi PH on the test fixture**):** the CSV uses our
    `x{label}` names verbatim — all 20 variables (both stages) present, zero
    extraneous rows. This avoids the extra solves and gives exactly the incumbent
-   dispatch, but carries **no duals/prices** and needs a **full**
-   `x{label} → (component, attr, asset, snapshot)` manifest map (today the manifest
-   maps only the first-stage nonants).
+   dispatch, but carries **no duals/prices**.
+
+   **Implementation note (why it is its own PR).** Mapping the tree solution back
+   is more than a name lookup: the CSV holds raw *optimization variable* values,
+   whereas PyPSA's dynamic outputs are *derived* by `assign_solution` with
+   component-specific logic (`Line s` → `p0 = s, p1 = -s`; `Link p` →
+   `p0 = p, p1 = -p·η` with delay shifts; `marginal_price` from **constraint**
+   duals, not variables — confirming the tree read is dual-free). So the read path
+   must, per scenario: build the model (`create_model`, no solve) → inject the tree
+   values as linopy's `model.solution` → run `assign_solution()` → merge (reuse the
+   option-1 merge). It saves the *solve* but not the model *build*. It also needs
+   the manifest to store `model_kwargs` and the tree-solution directory, and
+   `solve_stochastic` to add `--solution-base-name {dir}/sol` (supported by both the
+   PH driver, `generic/decomp.py`, and the EF driver, `generic/ef.py`). A
+   `_variable_records(model)` generalising `_nonant_records` supplies the
+   `x{label} → (component, attr, asset, snapshot)` map (`'snapshot' in dims`
+   distinguishes operational from first-stage variables).
 
 3. **Have mpi-sppy emit duals (future work).** Possible in principle but reduces to
    a conditionally-valid price-recovery re-solve inside the xhatter, and duals are
@@ -679,13 +697,14 @@ emitting duals from mpi-sppy, is future work):
 `dispatch="none" | "read" | "resolve"` on `read_stochastic_solution` /
 `solve_stochastic` (default `"none"` = first stage only):
 
+- `"resolve"` re-solves per scenario (1) — **implemented** — yielding primal
+  dispatch **and scenario-conditional duals**, optionally restricted to a scenario
+  subset (`scenarios=`). Use it when you want prices/duals (conditional on the
+  scenario) or PyPSA-native statistics, or when only the xhat file is available.
 - `"read"` parses mpi-sppy's tree solution (2) — the cheap, exact-incumbent,
-  primal-only path; recommended when you just want dispatch. Inline
-  `solve_stochastic` auto-adds `--solution-base-name`.
-- `"resolve"` re-solves per scenario (1), yielding primal dispatch **and
-  scenario-conditional duals**, optionally restricted to a scenario subset
-  (`scenarios=`). Use it when you want prices/duals (conditional on the scenario)
-  or PyPSA-native statistics, or when only the xhat file is available.
+  primal-only path; recommended when you just want dispatch. **Next PR** (see the
+  implementation note in (2)); inline `solve_stochastic` will auto-add
+  `--solution-base-name`. Until then it raises `NotImplementedError`.
 
 Emitting duals from mpi-sppy itself remains future work (§14), not a near-term
 dependency.
@@ -698,14 +717,16 @@ Resolved in Phase 1: **scenario slicing** — reuse the existing `n.get_scenario
 driver** `solve_stochastic` (§8, §12).
 
 - **Dispatch write-back (Phase 4).** `read_stochastic_solution` sets the `*_nom`
-  capacities and writes modular module counts back (`*-n_mod` → `n_mod_opt`). The
-  remaining Phase 4 item is second-stage recovery via the `dispatch=` mode
-  (§13.7): `"read"` (mpi-sppy tree solution, primal-only) and `"resolve"`
-  (per-scenario re-solve, primal **plus scenario-conditional duals**, with a
-  `scenarios=` subset). Decision makers are often specifically interested in duals
-  *conditional on a scenario* (distinct from the EF's probability-weighted duals),
-  and may want them for only a subset of scenarios — both reasons to provide the
-  re-solve path, not just the tree read.
+  capacities and writes modular module counts back (`*-n_mod` → `n_mod_opt`).
+  Second-stage recovery is exposed via the `dispatch=` mode (§13.7).
+  `"resolve"` (per-scenario re-solve, primal **plus scenario-conditional duals**,
+  with a `scenarios=` subset) is **implemented**. Decision makers are often
+  specifically interested in duals *conditional on a scenario* (distinct from the
+  EF's probability-weighted duals) and may want them for only a subset of
+  scenarios — both reasons to provide the re-solve path, not just the tree read.
+  `"read"` (mpi-sppy tree solution, primal-only) is the **next PR** — it needs
+  `assign_solution` to translate raw variables into PyPSA outputs (§13.7 option 2),
+  so it is a self-contained follow-up.
 - **Duals / marginal prices from mpi-sppy (special opt-in — future work to
   consider).** mpi-sppy could be extended to return constraint duals from the
   xhatter's fixed-nonant subproblem solves, letting PyPSA reconstruct
