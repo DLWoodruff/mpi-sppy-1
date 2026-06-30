@@ -623,15 +623,15 @@ solution file, §13.5) must be visible to all three jobs (§13.4).
 
 `--write-xhat-file` returns only the **first stage** (`*_nom`, plus `*-n_mod` →
 `n_mod_opt`). The per-scenario **dispatch** (operational time series) and
-**marginal prices** are not in that file. Three ways to recover them, in
-decreasing order of preference:
+**marginal prices** are not in that file. Two ways to recover them (a third,
+emitting duals from mpi-sppy, is future work):
 
-1. **Re-solve dispatch in PyPSA (recommended default).** For each scenario, slice
-   it (`n.get_scenario(s)`), fix capacities to the incumbent (`*_nom = *_nom_opt`,
+1. **Re-solve dispatch in PyPSA.** For each scenario, slice it
+   (`n.get_scenario(s)`), fix capacities to the incumbent (`*_nom = *_nom_opt`,
    `*_nom_extendable = False` — which also drops the modular `n_mod`↔`*_nom`
    constraint), call `n.optimize()`, and merge the per-scenario results onto the
    stochastic network's `(scenario, name)` columns (the inverse of
-   `get_scenario`'s `xs`, via `pd.concat(keys=…)`; copy only `status == "Output"`
+   `get_scenario`'s `xs`, via `pd.concat(keys=…)`; copy `status == "Output"`
    series). Each subproblem is an independent LP (capacities are now parameters),
    so the work is **parallelizable** — but PyPSA's orchestration is **serial** (one
    model, one blocking solver call, no built-in scenario parallelism), so the loop
@@ -642,7 +642,21 @@ decreasing order of preference:
    which PyPSA already does natively). Cost: extra solves; a small chance of a
    different-but-equal-cost dispatch under degeneracy.
 
-2. **Read mpi-sppy's full tree solution (optional fast path, primal only).** The
+   **Scenario-conditional duals (DLW).** The duals from a per-scenario re-solve
+   are *conditional on the realized scenario* — the marginal values in that
+   scenario's world — which are typically what a decision maker wants, and are a
+   distinct object from the extensive form's **probability-weighted** duals (the
+   standalone dual equals the EF dual divided by the scenario probability, modulo
+   dual degeneracy; verified on the `elec` bus of the test fixture, where
+   EF/standalone = `prob_s` exactly). This scenario-conditional information is a
+   substantive reason to re-solve rather than read the (dual-free) tree solution.
+   Because the re-solve is inherently per-scenario, it naturally takes a **scenario
+   subset** (`scenarios=`): re-solve — and obtain scenario-conditional duals — for
+   only the scenarios of interest (e.g. the stressed ones), avoiding the serial
+   cost of re-solving all of them. A user can equally hand-roll this in their own
+   script (`n.get_scenario(s)` → `fix_optimal_capacities()` → `n.optimize()`).
+
+2. **Read mpi-sppy's full tree solution (primal only).** The
    xhatter already solves every scenario subproblem to optimality — it fixes the
    nonants and solves (`Xhat_Eval.evaluate` → `_fix_nonants` → `solve_loop`) — so
    the complete primal solution exists in memory and mpi-sppy can write it:
@@ -661,8 +675,20 @@ decreasing order of preference:
    a conditionally-valid price-recovery re-solve inside the xhatter, and duals are
    not defined for general (MIP/nonconvex) subproblems — see §14.
 
-**Decision:** default to (1); offer (2) as a no-extra-solve primal fast path when
-prices are not needed. (3) is future work, not a near-term dependency.
+**Decision (mode API).** Expose **both** via
+`dispatch="none" | "read" | "resolve"` on `read_stochastic_solution` /
+`solve_stochastic` (default `"none"` = first stage only):
+
+- `"read"` parses mpi-sppy's tree solution (2) — the cheap, exact-incumbent,
+  primal-only path; recommended when you just want dispatch. Inline
+  `solve_stochastic` auto-adds `--solution-base-name`.
+- `"resolve"` re-solves per scenario (1), yielding primal dispatch **and
+  scenario-conditional duals**, optionally restricted to a scenario subset
+  (`scenarios=`). Use it when you want prices/duals (conditional on the scenario)
+  or PyPSA-native statistics, or when only the xhat file is available.
+
+Emitting duals from mpi-sppy itself remains future work (§14), not a near-term
+dependency.
 
 ## 14. Open questions / future work
 
@@ -672,10 +698,14 @@ Resolved in Phase 1: **scenario slicing** — reuse the existing `n.get_scenario
 driver** `solve_stochastic` (§8, §12).
 
 - **Dispatch write-back (Phase 4).** `read_stochastic_solution` sets the `*_nom`
-  capacities and now writes modular module counts back (`*-n_mod` → `n_mod_opt`).
-  The optional capacity-fixed **dispatch re-solve** (full per-scenario operations
-  and marginal prices) is the remaining Phase 4 item — see §13.7 for the
-  recovery-options decision.
+  capacities and writes modular module counts back (`*-n_mod` → `n_mod_opt`). The
+  remaining Phase 4 item is second-stage recovery via the `dispatch=` mode
+  (§13.7): `"read"` (mpi-sppy tree solution, primal-only) and `"resolve"`
+  (per-scenario re-solve, primal **plus scenario-conditional duals**, with a
+  `scenarios=` subset). Decision makers are often specifically interested in duals
+  *conditional on a scenario* (distinct from the EF's probability-weighted duals),
+  and may want them for only a subset of scenarios — both reasons to provide the
+  re-solve path, not just the tree read.
 - **Duals / marginal prices from mpi-sppy (special opt-in — future work to
   consider).** mpi-sppy could be extended to return constraint duals from the
   xhatter's fixed-nonant subproblem solves, letting PyPSA reconstruct
