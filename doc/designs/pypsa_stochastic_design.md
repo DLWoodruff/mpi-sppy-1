@@ -346,11 +346,12 @@ install hint.
 
 **Extra.** Declare in `pyproject.toml` `[project.optional-dependencies]`, named
 after the backend to match the `tsam` / `cartopy` / `gurobipy` convention.
-`mpi-sppy` is pulled **from GitHub** because the PyPI release can lag the MPS-file
-loader support PyPSA relies on:
+The extra pulls only the PyPI-installable helpers (`mpi4py`, `mip`); `mpi-sppy`
+itself is installed separately from GitHub until a PyPI release ships the MPS-file
+loader support, after which it returns here as a plain `mpi-sppy>=<version>` pin:
 
 ```toml
-mpisppy = ["mpi-sppy @ git+https://github.com/Pyomo/mpi-sppy.git", "mpi4py", "mip"]
+mpisppy = ["mpi4py", "mip"]
 ```
 
 (`mip` is coin-or python-mip, the LP/MPS parser behind mpi-sppy's `mps_module`.)
