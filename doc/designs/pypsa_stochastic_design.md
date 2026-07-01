@@ -6,7 +6,7 @@ rho from `{s}_rho.csv`) is **merged upstream** — Pyomo/mpi-sppy `main` — so
 all remaining work is on the PyPSA side. No use of the mpi-sppy *agnostic/guest*
 framework — the coupling is at the **file boundary**. Core feasibility has been
 validated end to end (Phase 0); the **PyPSA exporter + read-back (Phase 1)** and
-the **inline `solve_stochastic` driver (Phase 3)** are implemented and validated
+the **inline `solve_stochastic_mpisppy` driver (Phase 3)** are implemented and validated
 against the mpi-sppy reader, the EF oracle, and a real PH run that converges to the
 EF first stage (§12). The capacity-fixed **dispatch re-solve** (`dispatch="resolve"`,
 per-scenario operations + scenario-conditional duals; `n_mod` → `n_mod_opt`) is
@@ -31,7 +31,7 @@ The user-facing entry point is a new PyPSA method:
 ```python
 n.set_scenarios({"low": 0.3, "med": 0.4, "high": 0.3})   # existing PyPSA UX
 # ... set per-scenario data ...
-n.optimize.solve_stochastic(method="ph", solver_name="gurobi", ...)   # NEW
+n.optimize.solve_stochastic_mpisppy(method="ph", solver_name="gurobi", ...)   # NEW
 ```
 
 ## 2. Background and motivation
@@ -73,7 +73,7 @@ Three layers, all on the PyPSA side except the unchanged mpi-sppy solve:
 n.set_scenarios({...})                       # EXISTING PyPSA UX
         │
         ▼
-n.optimize.solve_stochastic(method="ph", solver_name="gurobi", ...)   # NEW
+n.optimize.solve_stochastic_mpisppy(method="ph", solver_name="gurobi", ...)   # NEW
         │
         ├─ (1) EXPORT  — for each scenario s (file stem  scenario{i}, §4.3):
         │        slice scenario s  (n.get_scenario(s)) → standalone single-scenario Network
@@ -278,11 +278,11 @@ PyPSA would still emit a single agreed rho (e.g. the mean) to keep PH well-defin
 
 The API exposes the **three phases** (§13.6) as methods on the existing
 `OptimizationAccessor`. The write/read phases are **dependency-free** (no
-mpi-sppy needed); only the inline `solve_stochastic` runs the driver.
+mpi-sppy needed); only the inline `solve_stochastic_mpisppy` runs the driver.
 
 ```python
 # Phase 1 — write the problem for mpi-sppy (1 rank, PyPSA env)
-manifest = n.optimize.write_stochastic_problem(
+manifest = n.optimize.write_stochastic_problem_mpisppy(
     directory,
     clean=True,                  # clear stale scenario files in `directory` first (§13.6)
     first_stage=None,            # None = all extendable capacities (+ *-n_mod); else explicit list
@@ -302,13 +302,13 @@ manifest = n.optimize.write_stochastic_problem(
 #   sbatch_template.
 
 # Phase 3 — read the incumbent back onto the network (1 rank, PyPSA env)
-n.optimize.read_stochastic_solution(
+n.optimize.read_stochastic_solution_mpisppy(
     directory,
     solution_file=None,          # defaults to the manifest's solution_file (DIR/xhat.csv)
 )   # sets *_nom_opt from mpi-sppy's --write-xhat-file CSV (§13.5)
 
 # Inline convenience (laptop / single node) = phase 1 + subprocess solve + phase 3
-n.optimize.solve_stochastic(
+n.optimize.solve_stochastic_mpisppy(
     working_dir=None,            # None = temp dir, removed afterwards unless keep_files
     method="ph",                 # "ph" (target) | "ef" (correctness oracle only)
     solver_name="gurobi",        # QP/MIQP for the PH proximal term; or LP/MILP if proximal terms linearized (§9.3)
@@ -324,12 +324,12 @@ n.optimize.solve_stochastic(
 )   # sets *_nom_opt on n; returns {on-file nonant name: value}
 ```
 
-Implemented in a new `pypsa/optimization/stochastic.py`:
+Implemented in a new `pypsa/optimization/stochastic_mpisppy.py`:
 
-- `write_stochastic_problem(...)` and `read_stochastic_solution(...)` — the two
+- `write_stochastic_problem_mpisppy(...)` and `read_stochastic_solution_mpisppy(...)` — the two
   **dependency-free** phase functions (also bound as accessor methods); they
   touch files only and do **not** import mpi-sppy;
-- `solve_stochastic(...)` = phase 1 + subprocess `mpiexec … generic_cylinders.py`
+- `solve_stochastic_mpisppy(...)` = phase 1 + subprocess `mpiexec … generic_cylinders.py`
   + phase 3; this is the **only** entry that needs the mpi-sppy driver.
 
 The optional extra `pypsa[mpisppy]` (= `{mpi-sppy, mpi4py, mip}`) is therefore
@@ -357,14 +357,14 @@ mpisppy = ["mpi-sppy @ git+https://github.com/Pyomo/mpi-sppy.git", "mpi4py", "mi
 
 **Gate + lazy import.** Reuse PyPSA's centralized helper
 `check_optional_dependency(module_name, install_message)` (`pypsa/common.py`,
-~L725) at the entry of `solve_stochastic`, then import inside the function.
+~L725) at the entry of `solve_stochastic_mpisppy`, then import inside the function.
 **Import names differ from PyPI names**: `mpi-sppy` → `mpisppy`,
 `python-mip` → `mip`.
 
 ```python
 from pypsa.common import check_optional_dependency
 
-def solve_stochastic(self, ...):
+def solve_stochastic_mpisppy(self, ...):
     check_optional_dependency(
         "mpisppy",
         "Missing optional dependencies for stochastic decomposition. "
@@ -375,13 +375,13 @@ def solve_stochastic(self, ...):
 ```
 
 This shared helper is preferred over `tsam`'s hand-rolled `find_spec` check for
-consistency across the codebase. Only `solve_stochastic` gates on mpi-sppy;
-`write_stochastic_problem` / `read_stochastic_solution` are file-only and import
+consistency across the codebase. Only `solve_stochastic_mpisppy` gates on mpi-sppy;
+`write_stochastic_problem_mpisppy` / `read_stochastic_solution_mpisppy` are file-only and import
 cleanly without it (§13.6).
 
-**Accessor placement.** `solve_stochastic` is a method on the **existing**
+**Accessor placement.** `solve_stochastic_mpisppy` is a method on the **existing**
 `OptimizationAccessor` (`pypsa/optimization/optimize.py`), so the public call is
-`n.optimize.solve_stochastic(...)` — alongside `create_model` and
+`n.optimize.solve_stochastic_mpisppy(...)` — alongside `create_model` and
 `optimize_transmission_expansion_iteratively`. No new top-level accessor.
 
 **Config.** Defaults such as `solver_name` come from the existing options system
@@ -479,8 +479,8 @@ places on PyPSA — identical per-nonant rho across scenarios — is in §4.2 / 
   approach is sound; LP is the primary format (full naming control,
   human-readable), MPS also works.
 - **Phase 1 — exporter — DONE (validated 2026-06-26).**
-  `pypsa/optimization/stochastic.py` with `write_stochastic_problem` +
-  `read_stochastic_solution` (both dependency-free), bound as `n.optimize.*`
+  `pypsa/optimization/stochastic_mpisppy.py` with `write_stochastic_problem_mpisppy` +
+  `read_stochastic_solution_mpisppy` (both dependency-free), bound as `n.optimize.*`
   methods; 14 dependency-free tests in `test/test_stochastic_export.py` (no solver,
   no mpi-sppy). Scenario slicing reuses the existing `n.get_scenario(s)` (§14
   resolved); writes integer-stem (§4.3) LP/MPS + nonant JSON + cost-proportional
@@ -493,8 +493,8 @@ places on PyPSA — identical per-nonant rho across scenarios — is in §4.2 / 
 - **Phase 2 — mpi-sppy file-path support — DONE (#770, upstream main):** `.lp`
   filename lookup + `_rho.csv` consumption + tests (§10).
 - **Phase 3 — inline driver — DONE (validated 2026-06-26).**
-  `solve_stochastic(...)` added to `pypsa/optimization/stochastic.py` and bound as
-  `n.optimize.solve_stochastic` (§8): write (Phase 1) + blocking mpi-sppy
+  `solve_stochastic_mpisppy(...)` added to `pypsa/optimization/stochastic_mpisppy.py` and bound as
+  `n.optimize.solve_stochastic_mpisppy` (§8): write (Phase 1) + blocking mpi-sppy
   subprocess + read-back (§13.5). Gates on `check_optional_dependency("mpisppy",
   …)`; PyPSA never joins MPI — mpi-sppy runs wholly in the subprocess. `method="ph"`
   runs the cylinders under `mpiexec`; `method="ef"` solves the extensive form in a
@@ -583,12 +583,12 @@ naming is load-bearing rather than cosmetic.
 mpi-sppy writes the incumbent's first-stage (nonant) values with
 **`--write-xhat-file PATH`** — a by-name CSV with `#` comment lines then
 `node_name, variable_name, value` rows (`sputils.write_nonant_tree_csv`); it works
-identically for EF and cylinders runs. `read_stochastic_solution` parses the
+identically for EF and cylinders runs. `read_stochastic_solution_mpisppy` parses the
 `ROOT` rows, maps each `x{label}` back to its component via the manifest's
 `nonant_map`, and sets `*_nom_opt` (shared across all scenarios — first-stage) —
 the return half of the file boundary, consistent with §3. (`x{label}` names
 contain no `(` / `)`, so mpi-sppy's name normalisation is a no-op here.) The
-inline `solve_stochastic` (§8) drives this whole loop — write, subprocess solve,
+inline `solve_stochastic_mpisppy` (§8) drives this whole loop — write, subprocess solve,
 read-back — in one call. Modular module counts (`*-n_mod` → `n_mod_opt`) are also
 written back (the integer-derived `*_nom_opt = n_mod_opt × *_nom_mod`). Recovering
 the **second stage** (per-scenario dispatch and marginal prices), which the xhat
@@ -596,7 +596,7 @@ file does not carry, is Phase 4 — see §13.7.
 
 ### 13.6 Execution paths: inline vs decoupled (SLURM)
 
-**Inline** (laptop / single interactive node): `solve_stochastic` writes the
+**Inline** (laptop / single interactive node): `solve_stochastic_mpisppy` writes the
 files, runs `mpiexec -np N … generic_cylinders.py …` as a blocking subprocess,
 and reads the solution back — one Python call.
 
@@ -604,7 +604,7 @@ and reads the solution back — one Python call.
 jobs**, because you cannot hold a process/allocation open while a large MPI job
 queues and runs, the phases have very different resource profiles (1 core / many
 cores / 1 core), and even different environments — **PyPSA** for write + read,
-**mpi-sppy** for solve (§8). `write_stochastic_problem` emits the exact phase-2
+**mpi-sppy** for solve (§8). `write_stochastic_problem_mpisppy` emits the exact phase-2
 command and an `sbatch` template; the user submits a dependency chain:
 
 ```bash
@@ -622,7 +622,7 @@ scenario (`mps_module.scenario_names_creator`).
 A previous run that wrote **more** scenarios leaves stale `{s}.lp` (+
 `_nonants.json` / `_rho.csv`) that a smaller new run would silently pick up as
 **phantom scenarios** — wrong scenario set and probabilities. So **clear the
-transfer directory before phase 1**: `write_stochastic_problem(clean=True)` (the
+transfer directory before phase 1**: `write_stochastic_problem_mpisppy(clean=True)` (the
 default) does this in Python, and the docs / `write.sbatch` should *also* `rm` the
 stale files as belt-and-suspenders (covering a prior partial/aborted write).
 
@@ -691,7 +691,7 @@ emitting duals from mpi-sppy, is future work):
    values as linopy's `model.solution` → run `assign_solution()` → merge (reuse the
    option-1 merge). It saves the *solve* but not the model *build*. It also needs
    the manifest to store `model_kwargs` and the tree-solution directory, and
-   `solve_stochastic` to add `--solution-base-name {dir}/sol` (supported by both the
+   `solve_stochastic_mpisppy` to add `--solution-base-name {dir}/sol` (supported by both the
    PH driver, `generic/decomp.py`, and the EF driver, `generic/ef.py`). A
    `_variable_records(model)` generalising `_nonant_records` supplies the
    `x{label} → (component, attr, asset, snapshot)` map (`'snapshot' in dims`
@@ -702,8 +702,8 @@ emitting duals from mpi-sppy, is future work):
    not defined for general (MIP/nonconvex) subproblems — see §14.
 
 **Decision (mode API).** Expose **both** via
-`dispatch="none" | "read" | "resolve"` on `read_stochastic_solution` /
-`solve_stochastic` (default `"none"` = first stage only):
+`dispatch="none" | "read" | "resolve"` on `read_stochastic_solution_mpisppy` /
+`solve_stochastic_mpisppy` (default `"none"` = first stage only):
 
 - `"resolve"` re-solves per scenario (1) — **implemented** — yielding primal
   dispatch **and scenario-conditional duals**, optionally restricted to a scenario
@@ -711,7 +711,7 @@ emitting duals from mpi-sppy, is future work):
   scenario) or PyPSA-native statistics, or when only the xhat file is available.
 - `"read"` parses mpi-sppy's tree solution (2) — the cheap, exact-incumbent,
   primal-only path; recommended when you just want dispatch. **Next PR** (see the
-  implementation note in (2)); inline `solve_stochastic` will auto-add
+  implementation note in (2)); inline `solve_stochastic_mpisppy` will auto-add
   `--solution-base-name`. Until then it raises `NotImplementedError`.
 
 Emitting duals from mpi-sppy itself remains future work (§14), not a near-term
@@ -722,9 +722,9 @@ dependency.
 Resolved in Phase 1: **scenario slicing** — reuse the existing `n.get_scenario(s)`
 (§12); **solution write-back flag** — mpi-sppy `--write-xhat-file` (§13.5);
 **scenario file naming** — integer stems (§4.3). Resolved in Phase 3: the **inline
-driver** `solve_stochastic` (§8, §12).
+driver** `solve_stochastic_mpisppy` (§8, §12).
 
-- **Dispatch write-back (Phase 4).** `read_stochastic_solution` sets the `*_nom`
+- **Dispatch write-back (Phase 4).** `read_stochastic_solution_mpisppy` sets the `*_nom`
   capacities and writes modular module counts back (`*-n_mod` → `n_mod_opt`).
   Second-stage recovery is exposed via the `dispatch=` mode (§13.7).
   `"resolve"` (per-scenario re-solve, primal **plus scenario-conditional duals**,
@@ -766,9 +766,9 @@ driver** `solve_stochastic` (§8, §12).
 **PyPSA** (`DLWoodruff/PyPSA` fork):
 - `pypsa/optimization/optimize.py` — `create_model` (~L600), `define_objective`
   (~L139; capex on `*_nom` ~L312–333), `assign_solution` (~L901),
-  `write_stochastic_problem` / `read_stochastic_solution` accessor methods (end of
+  `write_stochastic_problem_mpisppy` / `read_stochastic_solution_mpisppy` accessor methods (end of
   `OptimizationAccessor`).
-- `pypsa/optimization/stochastic.py` — the exporter + read-back (implemented).
+- `pypsa/optimization/stochastic_mpisppy.py` — the exporter + read-back (implemented).
 - `pypsa/network/index.py` — `set_scenarios` (~L719), `get_scenario` (~L933, the
   scenario slicer the exporter reuses), `scenarios` / `scenario_weightings`.
 - `pypsa/descriptors.py` — `nominal_attrs` (default first-stage source, §5).
