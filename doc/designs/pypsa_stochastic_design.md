@@ -10,8 +10,9 @@ the **inline `solve_stochastic` driver (Phase 3)** are implemented and validated
 against the mpi-sppy reader, the EF oracle, and a real PH run that converges to the
 EF first stage (§12). The capacity-fixed **dispatch re-solve** (`dispatch="resolve"`,
 per-scenario operations + scenario-conditional duals; `n_mod` → `n_mod_opt`) is
-also implemented (§13.7). Remaining (Phase 4): `dispatch="read"` (mpi-sppy tree
-solution, §13.7 option 2) as a follow-up PR, and user docs.
+also implemented (§13.7), as are the **user docs** (the PyPSA user-guide page
+`docs/user-guide/optimization/stochastic-decomposition.md`). Remaining (Phase 4):
+`dispatch="read"` (mpi-sppy tree solution, §13.7 option 2) as a follow-up PR.
 
 ## 1. Goal
 
@@ -344,12 +345,15 @@ the extra deps, and invoking the feature without them fails loudly with an
 install hint.
 
 **Extra.** Declare in `pyproject.toml` `[project.optional-dependencies]`, named
-after the backend to match the `tsam` / `cartopy` / `gurobipy` convention (PyPI
-names):
+after the backend to match the `tsam` / `cartopy` / `gurobipy` convention.
+`mpi-sppy` is pulled **from GitHub** because the PyPI release can lag the MPS-file
+loader support PyPSA relies on:
 
 ```toml
-mpisppy = ["mpi-sppy", "mpi4py", "mip"]
+mpisppy = ["mpi-sppy @ git+https://github.com/Pyomo/mpi-sppy.git", "mpi4py", "mip"]
 ```
+
+(`mip` is coin-or python-mip, the LP/MPS parser behind mpi-sppy's `mps_module`.)
 
 **Gate + lazy import.** Reuse PyPSA's centralized helper
 `check_optional_dependency(module_name, install_message)` (`pypsa/common.py`,
@@ -406,7 +410,11 @@ cylinders), so options are layered, lowest → highest precedence:
 4. **`mpisppy_args=`** — explicit extra CLI args, last word.
 
 PyPSA never reimplements mpi-sppy's option set; it forwards to mpi-sppy's own
-config (file + CLI) — consistent with the file-boundary philosophy.
+config (file + CLI) — consistent with the file-boundary philosophy. For example,
+mpi-sppy's runtime **rho setters** — which adapt the PH penalty during the solve
+(`--coeff-rho`, `--sensi-rho`, `--grad-rho`, …) — are reached this way (e.g.
+`mpisppy_args=["--coeff-rho"]`), complementing the *initial* per-nonant rho PyPSA
+writes to `{s}_rho.csv` (§7.1).
 
 ## 9. Assumptions and constraints
 
@@ -500,12 +508,12 @@ places on PyPSA — identical per-nonant rho across scenarios — is in §4.2 / 
   (max abs diff 0.0; EF obj 97210.0)**.
 - **Phase 4 — write-back completion + docs.** `n_mod` → `n_mod_opt` **done**; the
   capacity-fixed dispatch re-solve `dispatch="resolve"` (per-scenario operations +
-  scenario-conditional duals, with a `scenarios=` subset, §13.7) **done**.
-  Remaining: `dispatch="read"` (mpi-sppy tree solution, §13.7 option 2) as a
-  **follow-up PR**, and user docs (the inline vs decoupled/SLURM workflow, §13.6;
-  the file-interface performance caveat, §14). The public methods, the
-  `pypsa[mpisppy]` extra and the §11 correctness tests already landed in Phases 1
-  and 3.
+  scenario-conditional duals, with a `scenarios=` subset, §13.7) **done**; and the
+  **user docs done** — `docs/user-guide/optimization/stochastic-decomposition.md`
+  covers the inline vs decoupled/SLURM workflow (§13.6) and the file-interface
+  performance caveat (§14). Remaining: `dispatch="read"` (mpi-sppy tree solution,
+  §13.7 option 2) as a **follow-up PR**. The public methods, the `pypsa[mpisppy]`
+  extra and the §11 correctness tests already landed in Phases 1 and 3.
 
 ## 13. Parallel execution and scaling
 
@@ -746,12 +754,12 @@ driver** `solve_stochastic` (§8, §12).
 - **Multi-stage** investment horizons (PyPSA `investment_periods`).
 - **CVaR / risk** interaction with decomposition (PyPSA already has CVaR in the
   monolithic EF; cf. mpi-sppy `doc/designs/cvar_design.md`).
-- **File-interface performance (note in the user docs).** The file interface is
+- **File-interface performance (noted in the user docs).** The file interface is
   not fast (per-run file I/O + LP/MPS write & parse). For hard-to-solve problems
-  this is negligible — wall time is dominated by the subproblem solves — but the
-  **user docs should state the caveat**. If a faster, in-memory interface is ever
-  needed, implement PyPSA as an mpi-sppy *agnostic/guest* instead of the file
-  boundary.
+  this is negligible — wall time is dominated by the subproblem solves — and the
+  **user docs state this caveat** (the Performance note in
+  `stochastic-decomposition.md`). If a faster, in-memory interface is ever needed,
+  implement PyPSA as an mpi-sppy *agnostic/guest* instead of the file boundary.
 
 ## 15. Key code references
 
