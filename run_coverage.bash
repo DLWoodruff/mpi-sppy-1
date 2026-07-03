@@ -217,6 +217,9 @@ run_phase "test_boot_sp_simulate (serial)" \
 run_phase "test_boot_sp_smoothed (serial)" \
     coverage run --rcfile=.coveragerc mpisppy/tests/test_boot_sp_smoothed.py
 
+run_phase "test_boot_generic (serial)" \
+    coverage run --rcfile=.coveragerc mpisppy/tests/test_boot_generic.py
+
 run_phase "test_gradient_rho (spawns mpiexec)" \
     coverage run --rcfile=.coveragerc mpisppy/tests/test_gradient_rho.py
 
@@ -239,6 +242,9 @@ run_phase "test_boot_sp_simulate (mpiexec -np 2)" \
 
 run_phase "test_boot_sp_smoothed (mpiexec -np 2)" \
     mpiexec -np 2 coverage run --rcfile="$PROJ_DIR/.coveragerc" -m mpi4py mpisppy/tests/test_boot_sp_smoothed.py
+
+run_phase "test_boot_generic (mpiexec -np 2)" \
+    mpiexec -np 2 coverage run --rcfile="$PROJ_DIR/.coveragerc" -m mpi4py mpisppy/tests/test_boot_generic.py
 
 run_phase "test_cg_main (serial)" \
     coverage run --rcfile=.coveragerc mpisppy/tests/test_cg_main.py

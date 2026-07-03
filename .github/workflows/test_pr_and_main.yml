@@ -835,6 +835,7 @@ jobs:
           coverage run $COV_ARGS test_boot_sp.py
           coverage run $COV_ARGS test_boot_sp_simulate.py
           coverage run $COV_ARGS test_boot_sp_smoothed.py
+          coverage run $COV_ARGS test_boot_generic.py
 
       - name: run bootstrap CI tests (mpiexec -np 2)
         timeout-minutes: 10
@@ -842,6 +843,7 @@ jobs:
           cd mpisppy/tests
           mpiexec -np 2 coverage run $COV_ARGS -m mpi4py test_boot_sp_simulate.py
           mpiexec -np 2 coverage run $COV_ARGS -m mpi4py test_boot_sp_smoothed.py
+          mpiexec -np 2 coverage run $COV_ARGS -m mpi4py test_boot_generic.py
 
       - name: Upload coverage data
         if: always()
