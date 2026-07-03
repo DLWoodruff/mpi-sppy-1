@@ -5,6 +5,10 @@
 upstream as draft [Pyomo/mpi-sppy#783](https://github.com/Pyomo/mpi-sppy/pull/783);
 extended 2026-07-03 to state the end goal
 (`generic_cylinders` integration) and a stacked, multi-PR roadmap (§6, §9).
+PR-2 (statdist + smoothed) and PR-3 (the `generic_cylinders` integration, the
+end goal — `--boot-*` group, `do_boot`, the positional layer with a strictly
+disjoint M/N split, the `K = 1` batch executor) are implemented on the stacked
+branches `bootsp-pr-b` / `bootsp-pr-c`.
 **Author:** dlw (captured with Claude Code assistance)
 **Last updated:** 2026-07-03
 
@@ -315,15 +319,22 @@ usual "branch off main" default.)
   distributions the smoothed methods actually request), the empirical
   farmer/cvar tests that PR-1 could not host, and the smoothed MPI test;
   doc completion.
-- **PR-3 — `generic_cylinders` integration (the end goal).** A `--boot-*`
-  option group in `generic_cylinders` that takes a dataset (a data file for
-  the first examples), finds `xhat` from part of it and a bootstrap/bagging
-  CI on the gap from the rest, reusing the driver's solve machinery. Includes
-  the positional name/sample layer (§9), mutual-exclusion guards against the
-  sampling-based CI options (§9), at least one worked data-file example
-  (building on `examples/bootsp/schultz_data`), tests (serial + `mpiexec`),
-  and docs. If it grows past review size, the additional examples/features
-  split into a PR-4. Full design in §9.
+- **PR-3 — `generic_cylinders` integration (the end goal).** *Implemented.* A
+  `--boot-*` option group in `generic_cylinders` (`config.py::boot_args`,
+  registered in `parsing.py`) plus `mpisppy/generic/boot.py`
+  (`boot_requested` + `do_boot`, mirroring `mmw.py`) that takes a dataset (a
+  data file for the first examples), finds `xhat` from part of it and reports a
+  bootstrap/bagging CI on the gap from a strictly disjoint rest, reusing the
+  driver's solve machinery. The positional name/sample layer (§9.2) is a single
+  seam in `boot_sp.py` — a position→name resolver, default-preserving for
+  `user_boot`/`simulate_boot` — that `do_boot` drives by resizing the
+  estimator's address space to the disjoint `N`-record pool. Includes the
+  mutual-exclusion guards against the sampling-based CI options and multistage
+  (§9.3), the `K = 1` batch executor (the existing Gatherv batch split; `K > 1`
+  errors), the worked `examples/bootsp/schultz_data/schultz_data_boot.bash`
+  example, `test_boot_generic.py` (serial + `mpiexec -np 2`), and docs. `K > 1`
+  (a wheel per group of ranks) is the scheduled follow-on (§9.4). Full design
+  in §9.
 - **Post-merge (not a PR).** Update the boot-sp README to point at the
   mpi-sppy docs and archive the GitHub repo. `paper_runs/`, the copula/
   vine/bicop code, and the multivariate classes remain there.

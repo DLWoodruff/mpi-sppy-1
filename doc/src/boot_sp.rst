@@ -204,9 +204,10 @@ option. The dataset defines the "population" the estimators work from:
 ``candidate_sample_size`` of them (the scenarios
 ``[sample_size : sample_size + candidate_sample_size]``), and the bootstrap
 draws a pool of ``sample_size`` rows from the whole dataset and resamples it
-for its batches. (The pool is drawn from all ``max_count`` rows, so it can
-overlap the candidate rows; a strictly disjoint candidate/estimation split
-arrives with the ``generic_cylinders`` integration.) For example:
+for its batches. (In this standalone mode the pool is drawn from all
+``max_count`` rows, so it can overlap the candidate rows; the
+``generic_cylinders`` integration below keeps the candidate and pool strictly
+disjoint.) For example:
 
 .. code-block:: bash
 
@@ -218,6 +219,85 @@ arrives with the ``generic_cylinders`` integration.) For example:
 ``schultz_data.csv`` is produced by ``schultz_data_generator.py`` (a fixed seed
 makes it reproducible); replace it with your own two-column dataset, or point
 ``--data-file`` at another file, to run the bootstrap on your own data.
+
+In generic_cylinders
+--------------------
+
+The everyday driver ``generic_cylinders`` can report a data-based bootstrap
+confidence interval as a first-class option, the data-based analog of its
+``--mmw-*`` (MMW) group. Given a dataset, it finds a candidate solution
+``xhat`` with whatever the command line configured (an extensive form for small
+instances, or the PH cylinder system for large ones) and then reports a
+bootstrap/bagging CI on the optimality gap of ``xhat``, computed from a part of
+the data that is held **strictly disjoint** from the records that produced
+``xhat``. That disjointness is a correctness requirement: a gap CI is only
+meaningful when estimated on data that did not choose ``xhat``.
+
+The workflow is a hold-out split over the *positions* in the dataset. The
+driver treats ``scenario_names_creator(None)`` as the whole dataset (one
+scenario name per record), reserves the first ``--boot-candidate-sample-size``
+(``M``) records as the candidate block that ``xhat`` came from, and resamples
+the next ``--boot-sample-size`` (``N``) records — disjoint from the candidate
+block — for the CI. Because a model stays name-based while bootstrap resampling
+is positional, the driver owns the position/name reconciliation: a model only
+has to follow the usual mpi-sppy naming and map its own names to its own data.
+
+The dataset is interpreted by the **model**, not the framework: the model owns
+loading and any data-source option (e.g. ``--data-file``), and reports the
+dataset by returning every implied scenario name from
+``scenario_names_creator(None)``. There is no dataset-size or data-source
+``--boot-*`` flag.
+
+The ``--boot-*`` options are:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 30 70
+
+   * - Option
+     - Meaning
+   * - ``--boot-method``
+     - the empirical estimator (the ``Smoothed_*`` methods are not yet
+       available here; use the standalone ``user_boot`` for those)
+   * - ``--boot-candidate-sample-size``
+     - ``M``: leading records reserved for ``xhat``; omit or ``0`` when
+       ``--boot-xhat-input-file-name`` is given (the two are mutually exclusive)
+   * - ``--boot-sample-size``
+     - ``N``: records resampled for the CI (the disjoint pool)
+   * - ``--boot-subsample-size``
+     - subsample size (subsampling and bagging methods)
+   * - ``--boot-nB``
+     - number of bootstrap/bagging batches
+   * - ``--boot-alpha``
+     - two-sided significance level
+   * - ``--boot-seed-offset``
+     - RNG offset for replication
+   * - ``--boot-xhat-input-file-name``
+     - optional precomputed ``xhat`` (the no-wheel path)
+   * - ``--boot-solver-name``
+     - solver for the batch solves (falls back to the generic ``--solver-name``)
+   * - ``--boot-ranks-per-batch``
+     - ``K``: ranks cooperating on one batch solve; only ``K = 1`` (a per-rank
+       extensive form) is supported so far
+
+Because it works from a fixed dataset, a bootstrap run is mutually exclusive
+with the distribution-sampling CI methods (MMW and sequential sampling) and is
+two-stage only. ``examples/bootsp/schultz_data/schultz_data_boot.bash`` runs
+the whole workflow end to end:
+
+.. code-block:: bash
+
+   $ mpiexec -np 3 python -m mpisppy.generic_cylinders \
+       --module-name schultz_data --num-scens 5 \
+       --max-iterations 20 --default-rho 1.0 --solver-name gurobi_direct \
+       --xhatshuffle --lagrangian \
+       --boot-method Classical_quantile \
+       --boot-candidate-sample-size 5 --boot-sample-size 100 \
+       --boot-subsample-size 20 --boot-nB 20 --boot-alpha 0.1 \
+       --boot-seed-offset 100
+
+Here the main run finds ``xhat`` from the first 5 dataset records and the
+bootstrap resamples the next 100 (disjoint) records for the gap CI.
 
 Smoothed methods and statdist
 -----------------------------
