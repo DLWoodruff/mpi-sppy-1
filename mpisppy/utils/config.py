@@ -1753,9 +1753,13 @@ class Config(pyofig.ConfigDict):
             domain=str,
             default=None,
         )
-        # Note: a per-batch --boot-solver-options is deferred to the K>1 batch
-        # executor (design 9.4/9.5), which reworks the batch solve path; the
-        # first integration honors only the batch solver name.
+        self.add_to_config(
+            "boot_solver_options",
+            description="Options string for the bootstrap batch solver, e.g."
+            " 'mipgap=0.01' (default None)",
+            domain=str,
+            default=None,
+        )
         self.add_to_config(
             "boot_ranks_per_batch",
             description="K: number of MPI ranks that cooperate on one batch solve."

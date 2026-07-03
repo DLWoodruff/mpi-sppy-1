@@ -276,6 +276,8 @@ The ``--boot-*`` options are:
      - optional precomputed ``xhat`` (the no-wheel path)
    * - ``--boot-solver-name``
      - solver for the batch solves (falls back to the generic ``--solver-name``)
+   * - ``--boot-solver-options``
+     - options string for the batch solver, e.g. ``mipgap=0.01``
    * - ``--boot-ranks-per-batch``
      - ``K``: ranks cooperating on one batch solve; only ``K = 1`` (a per-rank
        extensive form) is supported so far

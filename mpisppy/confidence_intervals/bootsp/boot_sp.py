@@ -140,6 +140,12 @@ def solve_routine(cfg, module, scenarios, num_threads=None, duplication=False):
 
     solver = pyo.SolverFactory(cfg.solver_name)
     solver.options["threads"] = num_threads
+    # optional batch-solver options (e.g. from generic_cylinders --boot-solver-
+    # options); absent for the standalone drivers, so this is a no-op there
+    solver_options = cfg.get("solver_options", None)
+    if solver_options:
+        for k, v in solver_options.items():
+            solver.options[k] = v
     teeme = tee_rank0_solves if my_rank == 0 else False
     if 'persistent' in cfg.solver_name:
         solver.set_instance(ef, symbolic_solver_labels=True)
@@ -165,8 +171,11 @@ def evaluate_routine(cfg, module, xhat, scenario_names, sample_mapping):
     Returns:
         zhat (float): the computed expected value
     """
-    xhat_eval_options = {"iter0_solver_options": None,
-                         "iterk_solver_options": None,
+    # optional batch-solver options (see solve_routine); None for the standalone
+    # drivers, so the xhat-evaluation solves are unchanged there
+    solver_options = cfg.get("solver_options", None)
+    xhat_eval_options = {"iter0_solver_options": solver_options,
+                         "iterk_solver_options": solver_options,
                          "display_timing": False,
                          "solver_name": cfg.solver_name,
                          "verbose": False,

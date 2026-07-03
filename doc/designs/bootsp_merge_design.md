@@ -331,7 +331,10 @@ usual "branch off main" default.)
   estimator's address space to the disjoint `N`-record pool. Includes the
   mutual-exclusion guards against the sampling-based CI options and multistage
   (§9.3), the `K = 1` batch executor (the existing Gatherv batch split; `K > 1`
-  errors), the worked `examples/bootsp/schultz_data/schultz_data_boot.bash`
+  errors), the `boot` solver role (`--boot-solver-name` / `--boot-solver-
+  options`, resolved via `solver_specification(cfg, ["boot", ""])` and applied
+  to the batch EF and xhat-evaluation solves), the worked
+  `examples/bootsp/schultz_data/schultz_data_boot.bash`
   example, `test_boot_generic.py` (serial + `mpiexec -np 2`), and docs. `K > 1`
   (a wheel per group of ranks) is the scheduled follow-on (§9.4). Full design
   in §9.

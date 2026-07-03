@@ -129,8 +129,15 @@ def _estimator_cfg(module_basename, module, cfg, N, M, pool_names):
     boot_cfg.seed_offset = cfg.get("boot_seed_offset")
 
     # the batch ("boot") solver role, falling back to the generic solver_name
-    _, boot_solver_name, _ = solver_specification(cfg, ["boot", ""])
+    # (and its options), so the batch EF solves are independent of any xhat-EF
+    # solver
+    _, boot_solver_name, boot_solver_options = solver_specification(cfg, ["boot", ""])
     boot_cfg.solver_name = boot_solver_name
+    boot_cfg.add_to_config(
+        "solver_options",
+        description="options dict for the bootstrap batch solver",
+        domain=None, default=None, argparse=False)
+    boot_cfg.solver_options = boot_solver_options
 
     # the positional resolver: estimator position p -> canonical pool name
     boot_cfg.add_to_config(
