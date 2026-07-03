@@ -152,6 +152,14 @@ with ``Gatherv``, so a run can be accelerated with, e.g.,
 The estimate on rank 0 depends on the number of ranks because each rank seeds
 its own bootstrap stream.
 
+The optimality gap of each batch is its value at ``xhat`` minus the batch's
+optimal. For the optimal the estimators use the solver's **best bound** (an
+outer bound), not the incumbent objective: a mixed-integer batch is solved only
+to a MIP gap, so its incumbent would understate the gap. Using the outer bound
+keeps the interval conservative — never optimistic — and a tighter solver gap
+makes it tighter. (The solver's incumbent is used only where no bound is
+reported.)
+
 boot_general_prep
 -----------------
 
