@@ -31,7 +31,7 @@ import mpisppy.utils.sputils as sputils
 import mpisppy.confidence_intervals.ciutils as ciutils
 import mpisppy.confidence_intervals.bootsp.boot_utils as boot_utils
 from mpisppy.tests.utils import get_solver, round_pos_sig
-from mpisppy.generic.boot import do_boot, boot_requested
+from mpisppy.generic.boot import do_boot, boot_requested, _estimator_cfg
 
 sputils.disable_tictoc_output()
 
@@ -143,6 +143,23 @@ class Test_boot_generic(unittest.TestCase):
         cfg.num_scens = 5
         res = do_boot(MODULE_NAME, cfg, wheel=_FakeWheel())
         self._assert_gap(res, locked_ci_gap_wheel, locked_center_gap_wheel)
+
+    def test_boot_solver_role_resolution(self):
+        # the batch ("boot") solver role resolves its own name and options, and
+        # falls back to the generic solver_name when --boot-solver-name is unset
+        import schultz_data
+        pool = schultz_data.scenario_names_creator(3)
+
+        cfg = _make_cfg("Classical_quantile")
+        cfg.boot_solver_name = "myboot_solver"
+        cfg.boot_solver_options = "mipgap=0.01"
+        boot_cfg = _estimator_cfg("schultz_data", schultz_data, cfg, 3, 0, pool)
+        self.assertEqual(boot_cfg.solver_name, "myboot_solver")
+        self.assertIn("mipgap", boot_cfg.solver_options)
+
+        cfg2 = _make_cfg("Classical_quantile")   # no boot_solver_name
+        boot_cfg2 = _estimator_cfg("schultz_data", schultz_data, cfg2, 3, 0, pool)
+        self.assertEqual(boot_cfg2.solver_name, solver_name)
 
     def test_boot_requested_none(self):
         cfg = _make_cfg()
