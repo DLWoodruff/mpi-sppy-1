@@ -112,8 +112,14 @@ def scenario_creator(scenario_name, num_scens=None, seedoffset=0,
 
 #=========
 def scenario_names_creator(num_scens, start=None):
-    # (only for Amalgamator): return the full list of num_scens scenario names
+    # return the full list of num_scens scenario names
     # if start!=None, the list starts with the 'start' labeled scenario
+    # num_scens=None means "the whole dataset": one scenario per row in the
+    # data file. generic_cylinders's bootstrap CI uses this to learn the
+    # dataset size (design section 9.1).
+    if num_scens is None:
+        num_scens = len(load_data())
+        start = 0
     if (start is None):
         start = 0
     return [f"scen{i}" for i in range(start, start + num_scens)]
@@ -122,6 +128,10 @@ def scenario_names_creator(num_scens, start=None):
 #=========
 def inparser_adder(cfg):
     # add options unique to this model
+    # num_scens (for generic_cylinders) selects how many leading dataset records
+    # form the candidate block used to find xhat; the standalone bootstrap path
+    # leaves it None and uses uniform scenario probabilities.
+    cfg.num_scens_optional()
     cfg.add_to_config("data_file",
                       description="csv dataset of (xi1, xi2) observations "
                                   f"(default {DEFAULT_DATA_FILE})",
