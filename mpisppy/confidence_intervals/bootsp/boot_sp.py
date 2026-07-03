@@ -27,6 +27,21 @@ my_rank = boot_utils.my_rank
 rankcomm = boot_utils.rankcomm
 
 
+def _name_of_position_fn(cfg):
+    """Return a function mapping a dataset position to a scenario name.
+
+    By default a position ``p`` maps to the historical name ``Scenario{p}``,
+    so ``user_boot`` / ``simulate_boot`` are unchanged. generic_cylinders's
+    ``do_boot`` installs a resolver (``cfg.boot_name_of_position``) that maps a
+    position to the canonical scenario name for that record, so the integrated
+    path addresses records by list position rather than a scraped integer.
+    """
+    resolver = cfg.get("boot_name_of_position", None)
+    if resolver is not None:
+        return resolver
+    return lambda p: "Scenario" + str(p)
+
+
 def _scenario_creator_w_mapping(scenario_name, module=None, mapping=None, **kwargs):
     """ A wrapper to allow for bootstrap samples to map to actual samples
     Args:
@@ -109,11 +124,12 @@ def solve_routine(cfg, module, scenarios, num_threads=None, duplication=False):
     scenario_creator_kwargs = module.kw_creator(cfg)  # we get a new one every time...
     scenario_creator_kwargs['module'] = module  # we are going to call a wrapper
 
+    name_of_pos = _name_of_position_fn(cfg)
     if duplication:
         scenario_names = ['SampleScenario' + str(i) for i in range(len(scenarios))]
-        scenario_creator_kwargs['mapping'] = {'SampleScenario' + str(i): 'Scenario' + str(scenarios[i]) for i in range(len(scenarios))}
+        scenario_creator_kwargs['mapping'] = {'SampleScenario' + str(i): name_of_pos(scenarios[i]) for i in range(len(scenarios))}
     else:
-        scenario_names = ['Scenario' + str(i) for i in scenarios]
+        scenario_names = [name_of_pos(s) for s in scenarios]
         scenario_creator_kwargs['mapping'] = None
 
     ef = sputils.create_EF(
@@ -193,11 +209,12 @@ def evaluate_scenarios(cfg, module, scenarios, xhat, duplication=True):
     # If need mapping, create a set of scenario names and a mapping function that maps the scenario names to the original ones
     # Return the function value evaluated for a given xhat
 
+    name_of_pos = _name_of_position_fn(cfg)
     if duplication:
         scenario_names = ['SampleScenario' + str(i) for i in range(len(scenarios))]
-        sample_mapping = {'SampleScenario' + str(i): 'Scenario' + str(scenarios[i]) for i in range(len(scenarios))}
+        sample_mapping = {'SampleScenario' + str(i): name_of_pos(scenarios[i]) for i in range(len(scenarios))}
     else:
-        scenario_names = ['Scenario' + str(i) for i in scenarios]
+        scenario_names = [name_of_pos(s) for s in scenarios]
         sample_mapping = None
 
     return evaluate_routine(cfg, module, xhat, scenario_names, sample_mapping)

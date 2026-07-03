@@ -1685,6 +1685,86 @@ class Config(pyofig.ConfigDict):
             default=None,
         )
 
+    def boot_args(self):
+        # Data-based bootstrap/bagging confidence interval for generic_cylinders.
+        # A sibling of mmw_args (see mpisppy/generic/boot.py::do_boot).
+        self.add_to_config(
+            "boot_method",
+            description="Bootstrap/bagging estimator for the optimality-gap CI"
+            " (Classical_gaussian, Classical_quantile, Extended, Subsampling,"
+            " Bagging_with_replacement, Bagging_without_replacement)."
+            " Setting it requests a bootstrap CI after the main run (default None)",
+            domain=str,
+            default=None,
+        )
+        self.add_to_config(
+            "boot_candidate_sample_size",
+            description="M: number of leading dataset records reserved for finding"
+            " xhat; the resampling pool is kept disjoint from them. Omit or give 0"
+            " when boot_xhat_input_file_name is used (default None)",
+            domain=int,
+            default=None,
+        )
+        self.add_to_config(
+            "boot_sample_size",
+            description="N: number of (disjoint) dataset records resampled per"
+            " batch for the bootstrap CI (default None)",
+            domain=int,
+            default=None,
+        )
+        self.add_to_config(
+            "boot_subsample_size",
+            description="Subsample size for subsampling and bagging methods"
+            " (default None)",
+            domain=int,
+            default=None,
+        )
+        self.add_to_config(
+            "boot_nB",
+            description="Number of bootstrap/bagging batches (default None)",
+            domain=int,
+            default=None,
+        )
+        self.add_to_config(
+            "boot_alpha",
+            description="Two-sided significance level for the bootstrap CI,"
+            " e.g. 0.05 (default None)",
+            domain=float,
+            default=None,
+        )
+        self.add_to_config(
+            "boot_seed_offset",
+            description="RNG seed offset for bootstrap replication (default None)",
+            domain=int,
+            default=None,
+        )
+        self.add_to_config(
+            "boot_xhat_input_file_name",
+            description="Path to a .npy file with a precomputed xhat for the"
+            " bootstrap CI (the no-wheel path; mutually exclusive with a positive"
+            " boot_candidate_sample_size) (default None)",
+            domain=str,
+            default=None,
+        )
+        self.add_to_config(
+            "boot_solver_name",
+            description="Solver for the bootstrap batch solves; falls back to the"
+            " generic solver_name when unset (default None)",
+            domain=str,
+            default=None,
+        )
+        # Note: a per-batch --boot-solver-options is deferred to the K>1 batch
+        # executor (design 9.4/9.5), which reworks the batch solve path; the
+        # first integration honors only the batch solver name.
+        self.add_to_config(
+            "boot_ranks_per_batch",
+            description="K: number of MPI ranks that cooperate on one batch solve."
+            " Only K=1 (a per-rank extensive form) is supported so far"
+            " (default 1)",
+            domain=int,
+            default=1,
+        )
+
     #================
     def create_parser(self,progname=None):
         # seldom used
