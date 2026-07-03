@@ -64,6 +64,39 @@ def _name_of_position_fn(cfg):
     return lambda p: "Scenario" + str(p)
 
 
+def _best_bound(ef, results):
+    """The solver's outer bound on the EF objective.
+
+    Lower bound for a minimization, upper bound for a maximization; falls back
+    to the incumbent objective value when the solver reports no bound.
+    """
+    bound = None
+    try:
+        prob = results.problem[0]
+        bound = prob.lower_bound if ef.EF_Obj.sense == pyo.minimize \
+            else prob.upper_bound
+    except (AttributeError, IndexError, KeyError, TypeError):
+        bound = None
+    if bound is None:
+        return pyo.value(ef.EF_Obj)
+    return float(bound)
+
+
+def _ef_optimal_value(ef):
+    """The bootstrap "optimal" of a solved batch EF: the solver's outer bound
+    (stashed on the ef by solve_routine), not the incumbent objective.
+
+    A mixed-integer EF is solved only to a MIP gap, so its incumbent
+    (``pyo.value(EF_Obj)``) is an inner bound on the batch optimal; using it
+    would make the optimality gap (value at xhat minus the optimal) read
+    optimistically. The solver's best bound is the correct, conservative choice
+    and unifies with the cylinders batch executor, whose decomposition bound
+    plays the same role.
+    """
+    val = getattr(ef, "_mpisppy_boot_optimal", None)
+    return pyo.value(ef.EF_Obj) if val is None else val
+
+
 def _scenario_creator_w_mapping(scenario_name, module=None, mapping=None, **kwargs):
     """ A wrapper to allow for bootstrap samples to map to actual samples
     Args:
@@ -211,9 +244,13 @@ def solve_routine(cfg, module, scenarios, num_threads=None, duplication=False):
     teeme = tee_rank0_solves if my_rank == 0 else False
     if 'persistent' in cfg.solver_name:
         solver.set_instance(ef, symbolic_solver_labels=True)
-        solver.solve(tee=teeme)
+        results = solver.solve(tee=teeme)
     else:
-        solver.solve(ef, tee=teeme, symbolic_solver_labels=True)
+        results = solver.solve(ef, tee=teeme, symbolic_solver_labels=True)
+
+    # Stash the solver's best (outer) bound; this is the principled "optimal"
+    # for the bootstrap gap (see _ef_optimal_value).
+    ef._mpisppy_boot_optimal = _best_bound(ef, results)
 
     return ef
 
@@ -318,7 +355,7 @@ def _bootstrap_resample(cfg, module, scenario_pool, xhat, serial=False):
         scenarios = rng.choice(scenario_pool, size=cfg.sample_size, replace=True)
         boot_ev = evaluate_scenarios(cfg, module, scenarios, xhat, duplication=True)
         boot_ef = solve_routine(cfg, module, scenarios, num_threads=2, duplication=True)
-        local_boot_optimals[iter] = pyo.value(boot_ef.EF_Obj)
+        local_boot_optimals[iter] = _ef_optimal_value(boot_ef)
         local_boot_uppers[iter] = boot_ev
         local_boot_gaps[iter] = local_boot_uppers[iter] - local_boot_optimals[iter]
 
@@ -345,7 +382,7 @@ def classical_bootstrap(cfg, module, xhat, quantile=True):
     dag_upper = evaluate_scenarios(cfg, module, scenario_pool, xhat, duplication=False)
     dag_ef = solve_routine(cfg, module, scenario_pool, num_threads=2, duplication=False)
 
-    dag_optimal = pyo.value(dag_ef.EF_Obj)
+    dag_optimal = _ef_optimal_value(dag_ef)
     dag_gap = dag_upper - dag_optimal  # this is gamma(D) in the note
 
     # tron is a "secret" way to turn on internal trace information
@@ -428,7 +465,7 @@ def _sub_resample(cfg, module, scenario_pool, xhat, serial=False):
         if cfg.get("tron", False) and my_rank == 0:
             print(f"_sub_resample using EF_obj: {pyo.value(boot_ef.EF_Obj)}")
             print(f"   using evaluation: {boot_ev}")
-        local_boot_optimals[iter] = pyo.value(boot_ef.EF_Obj)
+        local_boot_optimals[iter] = _ef_optimal_value(boot_ef)
         local_boot_uppers[iter] = boot_ev
         local_boot_gaps[iter] = local_boot_uppers[iter] - local_boot_optimals[iter]
 
@@ -453,7 +490,7 @@ def subsampling(cfg, module, xhat):
     scenario_pool = rng.choice(eligible_scenarios(cfg), size=cfg.sample_size, replace=False)
     dag_upper = evaluate_scenarios(cfg, module, scenario_pool, xhat, duplication=False)
     dag_ef = solve_routine(cfg, module, scenario_pool, num_threads=2, duplication=False)
-    dag_optimal = pyo.value(dag_ef.EF_Obj)
+    dag_optimal = _ef_optimal_value(dag_ef)
     dag_gap = dag_upper - dag_optimal  # this is gamma(D) in the note
 
     comm.Barrier()
@@ -528,7 +565,7 @@ def _extended_resample(cfg, module, xhat, serial=False):
         boot_optimal_ef = solve_routine(cfg, module, scenarios, num_threads=2, duplication=True)
         boot_upper = evaluate_scenarios(cfg, module, scenarios, xhat, duplication=True)
 
-        local_boot_optimals_diff[iter] = pyo.value(boot_optimal_ef.EF_Obj) - pyo.value(dag_optimal_ef.EF_Obj)
+        local_boot_optimals_diff[iter] = _ef_optimal_value(boot_optimal_ef) - _ef_optimal_value(dag_optimal_ef)
         local_boot_uppers_diff[iter] = boot_upper - dag_upper
 
         local_boot_gaps_diff[iter] = local_boot_uppers_diff[iter] - local_boot_optimals_diff[iter]
@@ -577,14 +614,14 @@ def extended_bootstrap(cfg, module, xhat):
         eligible = eligible_scenarios(cfg)
         scenarios = rng.choice(eligible, size=cfg.sample_size, replace=True)
         dag_optimal_ef = solve_routine(cfg, module, scenarios, num_threads=2, duplication=True)
-        dag_optimal = pyo.value(dag_optimal_ef.EF_Obj)
+        dag_optimal = _ef_optimal_value(dag_optimal_ef)
         dag_upper = evaluate_scenarios(cfg, module, scenarios, xhat, duplication=True)
 
         scenarios_ = rng.choice(eligible, size=cfg.sample_size, replace=True)
         scenarios_combined = np.concatenate([scenarios, scenarios_])
 
         dag_optimal_ef_combined = solve_routine(cfg, module, scenarios_combined, num_threads=2, duplication=True)
-        dag_optimal_combined = pyo.value(dag_optimal_ef_combined.EF_Obj)
+        dag_optimal_combined = _ef_optimal_value(dag_optimal_ef_combined)
         dag_upper_combined = evaluate_scenarios(cfg, module, scenarios_combined, xhat, duplication=True)
 
         center_optimal = 2 * dag_optimal_combined - dag_optimal
@@ -631,7 +668,7 @@ def _bagging_resample(cfg, module, scenario_pool, xhat, serial=False, replacemen
         boot_ev = evaluate_scenarios(cfg, module, scenarios, xhat, duplication=replacement)
         boot_ef = solve_routine(cfg, module, scenarios, num_threads=2, duplication=replacement)
 
-        local_boot_optimals[iter] = pyo.value(boot_ef.EF_Obj)
+        local_boot_optimals[iter] = _ef_optimal_value(boot_ef)
         local_boot_uppers[iter] = boot_ev
         local_boot_gaps[iter] = local_boot_uppers[iter] - local_boot_optimals[iter]
 
