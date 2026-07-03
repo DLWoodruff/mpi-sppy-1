@@ -17,6 +17,7 @@ from mpisppy import MPI, global_toc
 # Re-export public API for backwards compatibility
 from mpisppy.generic.decomp import do_decomp  # noqa: F401
 from mpisppy.generic.mmw import do_mmw  # noqa: F401
+from mpisppy.generic.boot import do_boot  # noqa: F401
 
 from mpisppy.generic.parsing import model_fname, load_module, parse_args, proper_bundles, name_lists
 from mpisppy.generic.ef import do_EF
@@ -24,6 +25,7 @@ from mpisppy.generic.scenario_io import (write_bundles, write_scenarios,
                                           read_pickled_scenario,
                                           write_scenario_lp_mps_files_only)
 from mpisppy.generic.mmw import mmw_requested
+from mpisppy.generic.boot import boot_requested
 
 
 ##########################################################################
@@ -183,11 +185,16 @@ def main():
               scenario_denouement, bundle_wrapper=bundle_wrapper)
         if mmw_requested(cfg) and cfg.get("mmw_xhat_input_file_name") is not None:
             do_mmw(fname, cfg)
+        # The EF path returns no wheel, so a bootstrap CI needs an xhat file.
+        if boot_requested(cfg) and cfg.get("boot_xhat_input_file_name") is not None:
+            do_boot(fname, cfg)
     else:
         wheel = do_decomp(module, cfg, scenario_creator, scenario_creator_kwargs,
                           scenario_denouement, bundle_wrapper=bundle_wrapper)
         if mmw_requested(cfg):
             do_mmw(fname, cfg, wheel=wheel)
+        if boot_requested(cfg):
+            do_boot(fname, cfg, wheel=wheel)
 
 
 if __name__ == "__main__":
