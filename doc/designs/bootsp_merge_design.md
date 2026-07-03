@@ -333,7 +333,8 @@ usual "branch off main" default.)
   (§9.3), the `K = 1` batch executor (the existing Gatherv batch split; `K > 1`
   errors), the `boot` solver role (`--boot-solver-name` / `--boot-solver-
   options`, resolved via `solver_specification(cfg, ["boot", ""])` and applied
-  to the batch EF and xhat-evaluation solves), the worked
+  to the batch EF and xhat-evaluation solves — superseded in PR-4 by the batch
+  config file, §9.5), the worked
   `examples/bootsp/schultz_data/schultz_data_boot.bash`
   example, `test_boot_generic.py` (serial + `mpiexec -np 2`), and docs. `K > 1`
   (a wheel per group of ranks) is the scheduled follow-on (§9.4). Full design
@@ -534,12 +535,33 @@ The `xhat`-evaluation (upper-bound) solves for a batch are embarrassingly
 parallel across that batch's scenarios and spread across the group's ranks the
 same way.
 
-**This unifies the config and the rank problem:** one **batch sub-config**
-describes how to solve *any* batch (it is singular — you resample the data, not
-re-tune the solver — so it is not per-batch and never a `boot_*`-prefixed copy
-of the whole option surface), and every group applies it. For `K = 1` the
-sub-config is just the `boot` solver role (§9.5); for `K > 1` it is a nested
-`generic_cylinders` option set parsed by the same `Config` machinery.
+**Three solves, and which config governs each.** Keep three solves distinct:
+(1) the **xhat solve** — the configured `generic_cylinders` run over the `M`
+candidate records that produces `xhat`; (2) the **batch optimal solve** — the
+solve of each resampled batch that yields the batch's optimal (outer) bound;
+(3) the **xhat evaluation** — fixing `xhat` and solving the recourse of each
+batch scenario for the value at `xhat`. Solve (3) is embarrassingly parallel and
+needs only a solver; solve (1) uses the existing `generic_cylinders` surface as
+given.
+
+The **batch config** governs solve (2). It is *singular across batches* — you
+resample the data, not re-tune per batch, so it is one config, never a per-batch
+or `boot_*`-prefixed copy of the whole option surface — but it is **distinct
+from the xhat-solve config**: a batch has `N` (or the subsample size) scenarios,
+usually far more than the `M` candidate records, so its rho, iteration count,
+and spoke mix are a different problem and must be set independently rather than
+inherited from the xhat solve. Because it is a *full* `generic_cylinders`
+configuration (solver, rho, which spokes, convergence, relative gap), it is
+supplied as a **file** — `--boot-batch-config-file` (§9.5), parsed by the same
+`Config` machinery — not as a growing set of `boot_*`-prefixed CLI flags or an
+escape-prone nested arg string. The split is by *role*: the `--boot-*` command
+line carries only the estimator/formation knobs (method, sizes, `nB`, `alpha`,
+seed, ranks-per-batch), while everything controlling *how a formed batch is
+solved* — including the batch solver and its options and the relative gap that
+§9.4.1 ties to conservatism — lives in the file. The framework injects only the
+batch scenario set (its count and the positional name mapping). For `K = 1` the
+file need only name a solver (a batch is a direct EF); for `K > 1` it is the
+group's full cylinder configuration.
 
 **Prerequisite (essentially in hand).** Running a wheel on a group's
 sub-communicator already works: `WheelSpinner.run(comm_world=...)` threads a
@@ -548,11 +570,104 @@ across `mpisppy/cylinders/` the only residual `COMM_WORLD` references are two
 logging-only module globals in the xhat bounders, tracked in
 [Pyomo/mpi-sppy#782](https://github.com/Pyomo/mpi-sppy/issues/782).
 
-**Phasing.** The first integration ships `K = 1` (SLURM-fine, simple,
-forward-compatible). `K > 1` — the batch executor splitting the allocation into
-`G` groups of `K` and running a wheel per group from the batch sub-config — is
-the scheduled enhancement right after the first stack merges; the prerequisite
-(#782) is expected to land quickly, so the enhancement is largely unblocked.
+**Phasing.** PR-3 shipped `K = 1` (SLURM-fine, simple, forward-compatible: each
+batch a direct EF). `K > 1` — the batch executor splitting the allocation into
+`G` groups of `K` and running a wheel per group from the batch config — is PR-4.
+Note the two endpoints are the same mechanism: `K = 1` is `G = R` (one rank per
+group, batches spread one-per-rank), and "serial cylinders per batch" is `K = R`
+→ `G = 1` (one group of all `R` ranks, batches in sequence). So PR-4 is a single
+executor with `--boot-ranks-per-batch` as its only new rank knob, and the
+`G = 1` case is a development checkpoint, not a separate PR. The prerequisite
+(#782) has landed, so PR-4 is unblocked.
+
+### 9.4.1 The per-batch value: inner bound minus outer bound
+
+A batch contributes three numbers to the estimators of §9.1: its optimal
+function value, the value at `xhat`, and their difference (the gap). With an
+exact solve these are exact; but a cylinder solve returns only *bounds* on the
+optimal, and — as noted below — so does a MIP even at `K = 1`. So the estimator
+must be deliberate about which number it uses for the optimal.
+
+**Notation.** For a batch `b` (a resample of the pool `D`):
+
+- `u_b` = the value at `xhat` over `b`, `(1/|b|) Σ_{s∈b} f(xhat, ξ_s)`, computed
+  by fixing `xhat` and solving each scenario's recourse (the xhat evaluation).
+  `xhat` is feasible, so `u_b` is an achievable objective — an **inner bound** on
+  the batch optimal.
+- `o_b` = the true optimal of batch `b`'s SAA problem,
+  `min_x (1/|b|) Σ_{s∈b} f(x, ξ_s)`.
+- `L_b` = the **outer bound** on `o_b` the solve produces (a lower bound, for a
+  minimization): for `K > 1` the wheel's Lagrangian/subgradient bound, for
+  `K = 1` the extensive form's best bound. Write the bound slack
+  `δ_b = o_b − L_b ≥ 0`.
+
+The true per-batch gap is `g_b = u_b − o_b ≥ 0`. What we compute — inner bound
+for the value at `xhat`, outer bound for the optimal — is the **reported** gap
+
+    ĝ_b = u_b − L_b = (u_b − o_b) + (o_b − L_b) = g_b + δ_b,
+
+the true gap plus a non-negative bound slack. (Maximization mirrors: the value
+at `xhat` is a lower bound, the relaxation an upper bound; take the correct side
+so the reported gap still `≥` the true gap.)
+
+**MIPs carry a slack even at `K = 1`.** It is tempting to treat the `K = 1`
+extensive-form solve as exact, but a mixed-integer EF is solved only to a MIP
+gap: the solver returns an incumbent `I_b ≥ o_b` (an inner bound) and a best
+bound `L_b ≤ o_b` (the outer bound), with `I_b − L_b` the MIP gap. So `δ_b = 0`
+only for LPs (or MIPs driven to a zero gap). The principled optimal is therefore
+the **best bound `L_b`, not the incumbent**: using `I_b` gives `u_b − I_b ≤ g_b`,
+which *under*-states the gap (optimistic — the wrong direction). The inner−outer
+treatment is thus universal across `K`; cylinders just produce a (looser) outer
+bound the same way an EF's best bound does.
+
+**How the slack flows through each estimator.** Each estimator also uses a
+full-pool "`D`" quantity computed once, `ĝ_D = u_D − L_D = g_D + δ_D`.
+
+- **Classical, Gaussian** — `CI = ĝ_D ± z·std({ĝ_b})`. The center is shifted up
+  by `δ_D` and the spread is inflated by the variability of `δ_b`; both push the
+  same way, so the interval is **conservative** (its upper end over-states the
+  gap) for any `δ ≥ 0`. The clean case.
+- **Classical, quantile (pivotal)** — `CI = quantile(2·ĝ_D − {ĝ_b}, …)`. Here
+  `2ĝ_D − ĝ_b = (2g_D − g_b) + (2δ_D − δ_b)`; the slack enters as `2δ_D − δ_b`
+  and does **not** cancel, since the full-pool slack `δ_D` and the per-batch
+  slack `δ_b` differ (batches are smaller, so typically `δ_b ≥ δ_D`). Coverage
+  is clean only as `δ → 0`.
+- **Subsampling** — `CI = ĝ_D − √(m/N)·quantile({ĝ_b − ĝ_D}, …)`; the residual
+  `δ_b − δ_D` again does not cancel, and subsample bounds (smaller `m`) are
+  looser, so `δ_b` can exceed `δ_D` substantially.
+- **Extended** — built from differences of resample-of-resample optima; each
+  difference carries `δ' − δ''` at different sample sizes, leaving a residual.
+- **Bagging** — `center = mean({ĝ_b})` (shifted up by `mean(δ_b)`); the
+  infinitesimal-jackknife covariance `Cov(ĝ_b, counts)` picks up the covariance
+  of `δ_b` with the resample counts, perturbing (generally inflating) the
+  variance estimate.
+
+**Takeaways.**
+
+1. Every method is **conservative in the point/center sense**: the outer bound
+   never understates the gap (`ĝ_b ≥ g_b`), so the reported gap and the upper end
+   of the interval over-state it — the safe direction for "is `xhat` good
+   enough?", and the code already floors the lower end at 0.
+2. The **Gaussian** method is cleanly conservative for any bound gap.
+3. The **pivotal methods** (classical quantile, subsampling, extended) do not
+   cancel the slack; they recover their coverage guarantee only as the bounds
+   tighten, so they want a controlled batch bound gap.
+4. **Control the batch outer-bound gap.** If each batch optimal solve reaches a
+   small relative gap `ε` (so `δ_b ≲ ε·|L_b|`), all residual slack terms are
+   `O(ε)` and the exact-solve theory is recovered as `ε → 0`. The batch relative
+   gap is set in the batch config file (§9.5, `--rel-gap` in the file); the CI is
+   documented as conservative and convergent to the exact-solve CI as that gap
+   tightens. Whether to additionally *de-bias* by estimating `δ` is left open.
+
+**Done (`K = 1`).** The `K = 1` path now uses the solver's best bound (an outer
+bound on the batch optimal), not the incumbent `pyo.value(EF_Obj)`, so a MIP
+batch solved to a nonzero gap is read conservatively rather than optimistically
+(`boot_sp.py`: `solve_routine` stashes the bound, `_ef_optimal_value` reads it,
+falling back to the incumbent when the solver reports no bound). This makes the
+inner/outer treatment uniform across `K`: the PR-4 cylinders executor supplies
+its decomposition (outer) bound as `L_b` the same way. The reference `z*` used
+by the coverage simulation (`process_optimal`) intentionally stays the incumbent
+— the best estimate of the true optimum, not a bound.
 
 ### 9.5 Flag names
 
@@ -581,23 +696,33 @@ model's all-scenario-names function (§9.1).
 `boot_requested(cfg)` (mirroring `mmw_requested`) is true iff `--boot-method`
 is set, and it validates the candidate-size / xhat-file exclusivity.
 
-**Batch executor and the xhat/batch solve-option split.** Finding `xhat` and
-solving the batches are two *different* solves and must not share one solver
-option (the awkward case is when `xhat` is also an EF). mpi-sppy already
-disambiguates solves by role: `solver_specification(cfg, prefix)` resolves
-`<prefix>_solver_name` / `<prefix>_solver_options` with a fallback chain. So:
+**Batch executor and the xhat/batch solve split.** Finding `xhat` and solving
+the batches are two *different* solves of different sizes and are configured
+separately, by role:
 
 - **`xhat`** uses the existing `generic_cylinders` surface — `solver_name` plus
   the PH/spoke/EF options — exactly as today. No new flags.
-- **Batches** get their own `boot` solver role: `--boot-solver-name` /
-  `--boot-solver-options`, resolved via `solver_specification(cfg, ["boot",
-  ""])` — the batch solver, falling back to the generic `solver_name` (not
-  `EF_solver_name`, so a batch stays independent of any xhat-EF solver).
+- **Batches** are configured entirely by `--boot-batch-config-file`, a file of
+  `generic_cylinders` options parsed by the same `Config` machinery (§9.4). It
+  holds *everything that controls how a formed batch is solved*: the batch
+  solver name and options, rho, which spokes/cylinders, convergence, and the
+  relative gap that §9.4.1 ties to conservatism. The framework injects only the
+  batch scenario set (count + positional mapping); the file must not set the
+  scenario-formation options (those are the `--boot-*` flags above). For `K = 1`
+  the file need only name a solver (a direct EF); for `K > 1` it is the group's
+  full cylinder configuration.
 - `--boot-ranks-per-batch` — `K`, the group size: how many ranks cooperate on
   one batch solve (§9.4), default `1`. The framework forms `R // K` groups that
   all run at once, so this is a partition of the allocation, not a subset that
-  leaves other ranks idle. `K = 1` (a per-rank EF) needs only the `boot` solver
-  role above. `K > 1` runs a wheel per group and takes a full **batch
-  sub-config** — a nested `generic_cylinders` option set, not a
-  `boot_*`-prefixed copy of every option; the exact way that nested set is
-  supplied is settled with the `K > 1` enhancement (§9.4).
+  leaves other ranks idle.
+
+*Locked (2026-07-03).* The batch config file is **required whenever a bootstrap
+run is requested**, for `K = 1` as well as `K > 1`: one uniform mechanism, no
+simple-case shortcut. PR-4 therefore **retires `--boot-solver-name` /
+`--boot-solver-options`** (PR-3's interim `boot` solver role) — the batch solver
+name and options come from the file like every other batch-solve option. The
+file is an **options file of `generic_cylinders` flags** parsed by the same
+`Config` machinery (not JSON), so it is literally a batch `generic_cylinders`
+configuration; `boot_requested` validation errors when `--boot-batch-config-file`
+is absent. For `K = 1` the file is typically a one-liner (`--solver-name …`); for
+`K > 1` it is the group's full cylinder configuration.
