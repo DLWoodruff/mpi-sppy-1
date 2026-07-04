@@ -124,14 +124,19 @@ class BatchExecutor:
         return slice_lens_for(nB, self.n_groups)[self.group_index]
 
     def group_seed(self, seed_offset):
-        """RNG seed for this group.
+        """RNG seed (a SeedSequence pair) for this group's batch stream.
 
         All ranks in a group share it so they resample the *same* batches (and
         then cooperate on solving them); distinct groups get distinct seeds so
-        they cover different batches. At K=1 this is ``seed_offset + rank``, the
-        original per-rank seeding.
+        they cover different batches. The seed is the ``[seed_offset, word]``
+        pair numpy's SeedSequence hashes, with ``word = group_index + 1`` so the
+        batch stream never coincides with the pool/center stream (word 0; see
+        ``boot_sp._pool_rng``) or across seed_offsets -- summing the two instead
+        can collide. At K=1 the group index is the rank, so this is
+        ``[seed_offset, rank + 1]``, exactly the original per-rank batch stream
+        (the former ``boot_sp._batch_rng``).
         """
-        return seed_offset + self.group_index
+        return [seed_offset, self.group_index + 1]
 
     def gather(self, local, nB, item_len=1):
         """Gather each group's local results into the full array.
