@@ -349,6 +349,10 @@ bootstrap resamples the next 100 (disjoint) records for the gap CI. The batch
 config file names the solver for the ``K = 1`` batch extensive forms; to solve
 each batch with cylinders instead, raise ``--boot-ranks-per-batch`` and give the
 group's wheel configuration in the batch config file.
+``examples/bootsp/schultz_data/schultz_data_boot_cylinders.bash`` is a runnable
+``K > 1`` demo: 6 ranks find ``xhat`` together, then re-form into two groups of
+three that solve the batches concurrently, each batch by a subgradient wheel
+(configured in ``schultz_wheel_batch.txt``).
 
 Smoothed methods and statdist
 -----------------------------

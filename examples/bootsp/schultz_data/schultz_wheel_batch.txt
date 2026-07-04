@@ -1,0 +1,17 @@
+# Batch config for solving each resampled bootstrap batch WITH CYLINDERS (K > 1).
+#
+# This is a file of generic_cylinders flags (# starts a comment). It configures
+# how ONE resampled batch is solved. A batch has N scenarios -- a different, and
+# usually larger, problem than the xhat solve over the M candidate records -- so
+# its solver, rho, spokes and convergence are set here, independently of the
+# main command line. The framework injects only the batch's scenario set.
+#
+# A K > 1 batch must yield an OUTER (decomposition) bound on the batch optimal
+# (that bound is the batch's optimal L_b). The subgradient hub is a single
+# cylinder that does exactly that, so it works for any group size K. A PH hub
+# plus a Lagrangian or subgradient spoke would work too, when K is a multiple of
+# the cylinder count.
+--solver-name gurobi_direct
+--subgradient-hub
+--max-iterations 20
+--default-rho 1.0
