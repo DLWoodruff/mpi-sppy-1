@@ -150,7 +150,10 @@ The bootstrap batches are split across MPI ranks and reassembled on rank 0
 with ``Gatherv``, so a run can be accelerated with, e.g.,
 ``mpiexec -np 2 python -m mpi4py -m mpisppy.confidence_intervals.bootsp.user_boot ...``.
 The estimate on rank 0 depends on the number of ranks because each rank seeds
-its own bootstrap stream.
+its own bootstrap stream. In the standalone drivers each rank solves its own
+batches as extensive forms; the ``generic_cylinders`` integration generalizes
+this to groups of ``K`` ranks per batch (see *MPI ranks: groups of* ``K``
+below), of which this is the ``K = 1`` case.
 
 The optimality gap of each batch is its value at ``xhat`` minus the batch's
 optimal. For the optimal the estimators use the solver's **best bound** (an
@@ -282,13 +285,46 @@ The ``--boot-*`` options are:
      - RNG offset for replication
    * - ``--boot-xhat-input-file-name``
      - optional precomputed ``xhat`` (the no-wheel path)
-   * - ``--boot-solver-name``
-     - solver for the batch solves (falls back to the generic ``--solver-name``)
-   * - ``--boot-solver-options``
-     - options string for the batch solver, e.g. ``mipgap=0.01``
+   * - ``--boot-batch-config-file``
+     - **required**: a file of ``generic_cylinders`` flags configuring how each
+       resampled batch is solved (see below)
    * - ``--boot-ranks-per-batch``
-     - ``K``: ranks cooperating on one batch solve; only ``K = 1`` (a per-rank
-       extensive form) is supported so far
+     - ``K``: MPI ranks cooperating on one batch solve. ``K = 1`` solves each
+       batch as a per-rank extensive form; ``K > 1`` runs a wheel per group of
+       ``K`` ranks. ``K`` must divide the rank count
+
+How a batch is solved is a *different* problem from the ``xhat`` solve — a batch
+has ``N`` scenarios, usually far more than the ``M`` candidate records — so its
+solver, rho, spokes, convergence and relative gap are configured separately, by
+role. The ``xhat`` solve uses the ordinary ``generic_cylinders`` command line;
+the batch solves are configured entirely by ``--boot-batch-config-file``, which
+is literally a file of ``generic_cylinders`` flags (``#`` starts a comment),
+e.g.::
+
+   # batch config for K = 1 (a direct extensive form): just name a solver
+   --solver-name gurobi
+
+   # batch config for K > 1 (a wheel per group): the group's full configuration
+   --solver-name gurobi --subgradient-hub --max-iterations 50 --default-rho 1.0
+
+The framework injects only the batch scenario set (its count and the positional
+sample→record mapping); the file must not set the scenario-formation options
+(those are the ``--boot-*`` flags above). For ``K = 1`` the file need only name
+a solver; for ``K > 1`` it must configure a wheel that yields an **outer**
+(decomposition) bound on the batch optimal — a Lagrangian/subgradient spoke or
+the subgradient hub — since that outer bound is the batch's optimal ``L_b``.
+
+MPI ranks: groups of ``K``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A batch is solved by a group of ``K`` ranks (``--boot-ranks-per-batch``). The
+bootstrap partitions all ``R`` ranks into ``G = R // K`` groups that run
+concurrently, each solving its share of the batches in sequence, with the
+results gathered to rank 0. The two endpoints are the same mechanism: ``K = 1``
+is ``G = R`` (each rank its own group, a direct extensive form per batch), and
+``K = R`` is ``G = 1`` (one group of all ranks solving the batches in sequence,
+each by a full wheel). The xhat-evaluation solves are spread across the group's
+ranks the same way.
 
 Because it works from a fixed dataset, a bootstrap run is mutually exclusive
 with the distribution-sampling CI methods (MMW and sequential sampling) and is
@@ -297,6 +333,7 @@ the whole workflow end to end:
 
 .. code-block:: bash
 
+   $ echo "--solver-name gurobi_direct" > batch_config.txt
    $ mpiexec -np 3 python -m mpisppy.generic_cylinders \
        --module-name schultz_data --num-scens 5 \
        --max-iterations 20 --default-rho 1.0 --solver-name gurobi_direct \
@@ -304,10 +341,14 @@ the whole workflow end to end:
        --boot-method Classical_quantile \
        --boot-candidate-sample-size 5 --boot-sample-size 100 \
        --boot-subsample-size 20 --boot-nB 20 --boot-alpha 0.1 \
-       --boot-seed-offset 100
+       --boot-seed-offset 100 \
+       --boot-batch-config-file batch_config.txt
 
 Here the main run finds ``xhat`` from the first 5 dataset records and the
-bootstrap resamples the next 100 (disjoint) records for the gap CI.
+bootstrap resamples the next 100 (disjoint) records for the gap CI. The batch
+config file names the solver for the ``K = 1`` batch extensive forms; to solve
+each batch with cylinders instead, raise ``--boot-ranks-per-batch`` and give the
+group's wheel configuration in the batch config file.
 
 Smoothed methods and statdist
 -----------------------------
