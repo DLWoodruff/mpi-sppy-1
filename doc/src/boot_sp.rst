@@ -419,6 +419,10 @@ subgradient solve (configured in ``schultz_wheel_batch.txt``).
 Smoothed methods
 ----------------
 
+At present the smoothed methods are available only through the standalone
+drivers (``user_boot`` and ``simulate_boot``); ``generic_cylinders`` offers the
+empirical methods only.
+
 The smoothed methods (the ``Smoothed_*`` tokens) fit a univariate distribution
 to the sampled data and then resample from the *fitted* distribution rather
 than from the data directly. The distribution fitting is provided by the
