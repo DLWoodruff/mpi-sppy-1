@@ -20,55 +20,24 @@ resample from the fitted distribution; they need `scipy
 imports lazily. If scipy is not installed, the empirical methods still work
 and a smoothed method fails with an informative import error.
 
-Modes
------
+The rest of this page is organized around how a bootstrap run is put together.
+**Background** collects the pieces every run shares: the estimator *methods*,
+the *contract* a model module must satisfy, and how the *optimality gap* is
+defined. There are then two ways to compute an interval — the **standalone
+drivers** (``user_boot`` for a single interval, ``simulate_boot`` for coverage
+studies), and the everyday **generic_cylinders** driver, which offers the
+data-based bootstrap as a first-class option alongside its other
+confidence-interval methods. The **smoothed methods** and their ``statdist``
+dependency come last; they are currently available only through the standalone
+drivers.
 
-There are two modes, each runnable with ``python -m``:
+Background
+----------
 
-*User mode* (``user_boot``) computes a confidence interval for one problem
-instance. A long list of arguments is supplied on the command line, so users
-usually put the command in a shell script:
-
-.. code-block:: bash
-
-   $ python -m mpisppy.confidence_intervals.bootsp.user_boot module arguments
-
-Here ``module`` is the name of an importable Python module (without ``.py``)
-that supplies the scenario creator and helper functions, and ``arguments`` is
-the list of double-dash options described below.
-
-*Simulation mode* (``simulate_boot``) estimates the coverage rate of a method
-over many replications; it is aimed at researchers. All options come from a
-json file:
-
-.. code-block:: bash
-
-   $ python -m mpisppy.confidence_intervals.bootsp.simulate_boot instance.json
-
-The model module
-----------------
-
-The named module must provide the usual mpi-sppy scenario-creation contract
-plus a few helpers used by the bootstrap code:
-
-* ``scenario_creator(scenario_name, ...)`` — build a Pyomo model for one
-  (data) scenario, annotated as usual for mpi-sppy;
-* ``scenario_names_creator(num_scens, start=None)`` — the list of scenario
-  names;
-* ``kw_creator(cfg)`` — keyword arguments for the scenario creator;
-* ``inparser_adder(cfg)`` — add any model-specific options;
-* ``xhat_generator(scenario_names, solver_name=None, ...)`` — solve for a
-  candidate solution ``xhat`` when none is supplied. The bootstrap code looks
-  for this fixed name first and falls back to the legacy
-  ``xhat_generator_<module_name>``. If a precomputed ``xhat`` file is given
-  (``--xhat-fname``) the generator is not called.
-* ``data_sampler(record_num, cfg)`` — return the data for one record (a scalar,
-  or a dict keyed by variable name for multivariate data). This is used by the
-  *smoothed* methods to build the sample that a distribution is fitted to; the
-  empirical methods do not need it.
+These pieces are shared by every bootstrap run, whichever driver you use.
 
 Methods
--------
+~~~~~~~
 
 The ``--boot-method`` (json ``boot_method``) option selects the estimator:
 
@@ -106,8 +75,72 @@ The epi-spline fit builds a small Pyomo nonlinear program, so those two methods
 additionally need a nonlinear solver (e.g. ``ipopt``); the kernel methods do
 not.
 
+The model module
+~~~~~~~~~~~~~~~~~~
+
+The named module must provide the usual mpi-sppy scenario-creation contract
+plus a few helpers used by the bootstrap code:
+
+* ``scenario_creator(scenario_name, ...)`` — build a Pyomo model for one
+  (data) scenario, annotated as usual for mpi-sppy;
+* ``scenario_names_creator(num_scens, start=None)`` — the list of scenario
+  names;
+* ``kw_creator(cfg)`` — keyword arguments for the scenario creator;
+* ``inparser_adder(cfg)`` — add any model-specific options;
+* ``xhat_generator(scenario_names, solver_name=None, ...)`` — solve for a
+  candidate solution ``xhat`` when none is supplied. The bootstrap code looks
+  for this fixed name first and falls back to the legacy
+  ``xhat_generator_<module_name>``. If a precomputed ``xhat`` file is given
+  (``--xhat-fname``) the generator is not called.
+* ``data_sampler(record_num, cfg)`` — return the data for one record (a scalar,
+  or a dict keyed by variable name for multivariate data). This is used by the
+  *smoothed* methods to build the sample that a distribution is fitted to; the
+  empirical methods do not need it.
+
+The optimality gap
+~~~~~~~~~~~~~~~~~~~
+
+The optimality gap of each batch is its value at ``xhat`` minus the batch's
+optimal. For the optimal the estimators use the solver's **best bound** (an
+outer bound), not the incumbent objective: a mixed-integer batch is solved only
+to a MIP gap, so its incumbent would understate the gap. Using the outer bound
+keeps the interval conservative — never optimistic — and a tighter solver gap
+makes it tighter. (The solver's incumbent is used only where no bound is
+reported.)
+
+Standalone drivers
+------------------
+
+The standalone drivers compute a bootstrap CI directly, outside the everyday
+driver. Both are run with ``python -m``.
+
+Modes
+~~~~~
+
+There are two modes:
+
+*User mode* (``user_boot``) computes a confidence interval for one problem
+instance. A long list of arguments is supplied on the command line, so users
+usually put the command in a shell script:
+
+.. code-block:: bash
+
+   $ python -m mpisppy.confidence_intervals.bootsp.user_boot module arguments
+
+Here ``module`` is the name of an importable Python module (without ``.py``)
+that supplies the scenario creator and helper functions, and ``arguments`` is
+the list of double-dash options described below.
+
+*Simulation mode* (``simulate_boot``) estimates the coverage rate of a method
+over many replications; it is aimed at researchers. All options come from a
+json file:
+
+.. code-block:: bash
+
+   $ python -m mpisppy.confidence_intervals.bootsp.simulate_boot instance.json
+
 Arguments
----------
+~~~~~~~~~
 
 Simulation and user modes use almost the same options; simulation mode reads
 them from json (some with underscores), while user mode takes them on the
@@ -144,7 +177,7 @@ the json, for the empirical methods):
 There may also be model-specific options added by ``inparser_adder``.
 
 Batch parallelism
------------------
+~~~~~~~~~~~~~~~~~~
 
 The bootstrap batches are split across MPI ranks and reassembled on rank 0
 with ``Gatherv``, so a run can be accelerated with, e.g.,
@@ -152,19 +185,11 @@ with ``Gatherv``, so a run can be accelerated with, e.g.,
 The estimate on rank 0 depends on the number of ranks because each rank seeds
 its own bootstrap stream. In the standalone drivers each rank solves its own
 batches as extensive forms; the ``generic_cylinders`` integration generalizes
-this to groups of ``K`` ranks per batch (see *MPI ranks: groups of* ``K``
-below), of which this is the ``K = 1`` case.
-
-The optimality gap of each batch is its value at ``xhat`` minus the batch's
-optimal. For the optimal the estimators use the solver's **best bound** (an
-outer bound), not the incumbent objective: a mixed-integer batch is solved only
-to a MIP gap, so its incumbent would understate the gap. Using the outer bound
-keeps the interval conservative — never optimistic — and a tighter solver gap
-makes it tighter. (The solver's incumbent is used only where no bound is
-reported.)
+this to groups of ``K`` ranks per batch (see `MPI ranks: groups of K`_ below),
+of which this is the ``K = 1`` case.
 
 boot_general_prep
------------------
+~~~~~~~~~~~~~~~~~~
 
 ``boot_general_prep`` writes the two npy files (a candidate ``xhat`` and a
 presumed optimal value) that a simulation can reuse:
@@ -173,8 +198,11 @@ presumed optimal value) that a simulation can reuse:
 
    $ python -m mpisppy.confidence_intervals.bootsp.boot_general_prep instance.json
 
-Example
--------
+Examples
+~~~~~~~~
+
+On-the-fly data
+^^^^^^^^^^^^^^^^
 
 The ``examples/bootsp/schultz`` directory has a small two-stage example whose
 data is a deterministic function of the scenario number, so its results are
@@ -192,8 +220,8 @@ reproducible across solvers. From that directory:
 See ``examples/bootsp/schultz/schultz.bash`` for a serial run, a parallel run,
 and a coverage simulation.
 
-Working from a dataset file
----------------------------
+From a dataset file
+^^^^^^^^^^^^^^^^^^^^
 
 The ``schultz`` example above generates its data arithmetically from the
 scenario number. The companion example ``examples/bootsp/schultz_data`` shows
@@ -236,14 +264,13 @@ In generic_cylinders
 
 The driver ``generic_cylinders`` (see :ref:`generic_cylinders`) can report a
 data-based bootstrap confidence interval as a first-class option, the
-data-based analog of its
-``--mmw-*`` (MMW) group. Given a dataset, it finds a candidate solution
-``xhat`` with whatever the command line configured (an extensive form for small
-instances, or the PH cylinder system for large ones) and then reports a
-bootstrap/bagging CI on the optimality gap of ``xhat``, computed from a part of
-the data that is held **strictly disjoint** from the records that produced
-``xhat``. That disjointness is a correctness requirement: a gap CI is only
-meaningful when estimated on data that did not choose ``xhat``.
+data-based analog of its ``--mmw-*`` (MMW) group. Given a dataset, it finds a
+candidate solution ``xhat`` with whatever the command line configured (an
+extensive form for small instances, or the PH cylinder system for large ones)
+and then reports a bootstrap/bagging CI on the optimality gap of ``xhat``,
+computed from a part of the data that is held **strictly disjoint** from the
+records that produced ``xhat``. That disjointness is a correctness requirement:
+a gap CI is only meaningful when estimated on data that did not choose ``xhat``.
 
 The workflow is a hold-out split over the *positions* in the dataset. The
 driver treats ``scenario_names_creator(None)`` as the whole dataset (one
@@ -259,6 +286,13 @@ loading and any data-source option (e.g. ``--data-file``), and reports the
 dataset by returning every implied scenario name from
 ``scenario_names_creator(None)``. There is no dataset-size or data-source
 ``--boot-*`` flag.
+
+Because it works from a fixed dataset, a bootstrap run is mutually exclusive
+with the distribution-sampling CI methods (MMW and sequential sampling) and is
+two-stage only.
+
+Options
+~~~~~~~
 
 The ``--boot-*`` options are:
 
@@ -291,24 +325,28 @@ The ``--boot-*`` options are:
        resampled batch is solved (see below)
    * - ``--boot-ranks-per-batch``
      - ``K``: MPI ranks cooperating on one batch solve. ``K = 1`` solves each
-       batch as a per-rank extensive form; ``K > 1`` solves it with cylinders on
-       a group of ``K`` ranks. ``K`` must divide the rank count and, for ``K > 1``, be a
-       multiple of the number of cylinders in the batch config
+       batch as a per-rank extensive form; ``K > 1`` solves it with cylinders
+       on a group of ``K`` ranks. ``K`` must divide the rank count and, for
+       ``K > 1``, be a multiple of the number of cylinders in the batch config
+
+The batch config file
+~~~~~~~~~~~~~~~~~~~~~~~
 
 A batch solve is *different* from the ``xhat`` solve — a batch is a resample of
 the data, with its own scenario count (``N`` for the classical and extended
 methods, the subsample size for subsampling and bagging) set independently of
 the ``M`` candidate records — so its solver, rho, spokes, convergence and
-relative gap are configured separately, by role. The ``xhat`` solve uses the ordinary ``generic_cylinders`` command line;
-the batch solves are configured entirely by ``--boot-batch-config-file``, which
-is literally a file of ``generic_cylinders`` flags (``#`` starts a comment). The
-two cases below are alternatives — one file per run, not both together. A
-``K = 1`` file (a direct extensive form) need only name a solver::
+relative gap are configured separately, by role. The ``xhat`` solve uses the
+ordinary ``generic_cylinders`` command line; the batch solves are configured
+entirely by ``--boot-batch-config-file``, which is literally a file of
+``generic_cylinders`` flags (``#`` starts a comment). The two cases below are
+alternatives — one file per run, not both together. A ``K = 1`` file (a direct
+extensive form) need only name a solver::
 
    --solver-name gurobi
 
-while a ``K > 1`` file is the group's full cylinder configuration — a hub and one or
-more spokes, e.g. a PH hub with a Lagrangian bounding spoke::
+while a ``K > 1`` file is the group's full cylinder configuration — a hub and
+one or more spokes, e.g. a PH hub with a Lagrangian bounding spoke::
 
    --solver-name gurobi --lagrangian --default-rho 1.0 --max-iterations 50 --max-solver-threads 2
 
@@ -319,8 +357,8 @@ sample→record mapping); the file must not set the scenario-formation options
 subgradient spoke, or the subgradient hub — since that outer bound is the
 batch's optimal ``L_b``.
 
-MPI ranks: groups of ``K``
-~~~~~~~~~~~~~~~~~~~~~~~~~~~
+MPI ranks: groups of K
+~~~~~~~~~~~~~~~~~~~~~~~~
 
 A batch is solved by a group of ``K`` ranks (``--boot-ranks-per-batch``). The
 bootstrap partitions all ``R`` ranks into ``G = R // K`` groups that run
@@ -328,8 +366,8 @@ concurrently, each solving its share of the batches in sequence, with the
 results gathered to rank 0. The two endpoints are the same mechanism: ``K = 1``
 is ``G = R`` (each rank its own group, a direct extensive form per batch), and
 ``K = R`` is ``G = 1`` (one group of all ranks solving the batches in sequence,
-each solved with cylinders). The xhat-evaluation solves are spread across the group's
-ranks the same way.
+each solved with cylinders). The xhat-evaluation solves are spread across the
+group's ranks the same way.
 
 ``K`` obeys two divisibility rules: it must divide the rank count ``R`` (so the
 groups partition the ranks with none left idle), and for ``K > 1`` it must be a
@@ -342,10 +380,11 @@ at once. Cap the threads each solver may take with ``--max-solver-threads`` in
 the batch config (``2`` above) so the concurrent solves do not oversubscribe the
 cores.
 
-Because it works from a fixed dataset, a bootstrap run is mutually exclusive
-with the distribution-sampling CI methods (MMW and sequential sampling) and is
-two-stage only. ``examples/bootsp/schultz_data/schultz_data_boot.bash`` runs
-the whole workflow end to end:
+Example
+~~~~~~~
+
+``examples/bootsp/schultz_data/schultz_data_boot.bash`` runs the whole workflow
+end to end:
 
 .. code-block:: bash
 
@@ -368,8 +407,7 @@ group's cylinder configuration in the batch config file.
 ``examples/bootsp/schultz_data/schultz_data_boot_cylinders.bash`` is a runnable
 ``K > 1`` demo: 6 ranks find ``xhat`` together, then re-form into two groups of
 three that solve the batches concurrently, each batch by a single-cylinder
-subgradient solve
-(configured in ``schultz_wheel_batch.txt``).
+subgradient solve (configured in ``schultz_wheel_batch.txt``).
 
 Smoothed methods
 ----------------
