@@ -287,7 +287,7 @@ stays name-based while bootstrap resampling
 is positional, the driver owns the position/name reconciliation: a model only
 has to follow the usual mpi-sppy naming and map its own names to its own data.
 
-The dataset is interpreted by the **model**, not the framework: the model owns
+The dataset is interpreted by the **model** python module: the model owns
 loading and any data-source option (e.g. ``--data-file``), and reports the
 dataset by returning every implied scenario name from
 ``scenario_names_creator(None)``. There is no dataset-size or data-source
