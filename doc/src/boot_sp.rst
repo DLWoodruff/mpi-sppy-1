@@ -280,7 +280,10 @@ driver treats ``scenario_names_creator(None)`` as the whole dataset (one
 scenario name per record), reserves the first ``--boot-candidate-sample-size``
 (``M``) records as the candidate block that ``xhat`` came from, and resamples
 the next ``--boot-sample-size`` (``N``) records — disjoint from the candidate
-block — for the CI. Because a model stays name-based while bootstrap resampling
+block — for the CI. The two blocks are disjoint, so ``M + N`` cannot exceed the
+dataset size; you normally make them add up to it, using every record — the
+first ``M`` to find ``xhat`` and the remaining ``N`` for the CI. Because a model
+stays name-based while bootstrap resampling
 is positional, the driver owns the position/name reconciliation: a model only
 has to follow the usual mpi-sppy naming and map its own names to its own data.
 
