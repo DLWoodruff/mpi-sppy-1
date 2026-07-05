@@ -15,3 +15,5 @@
 --subgradient-hub
 --max-iterations 20
 --default-rho 1.0
+# cap threads per solver so the concurrent batch groups do not oversubscribe the cores
+--max-solver-threads 2

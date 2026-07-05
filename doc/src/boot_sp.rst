@@ -399,7 +399,7 @@ end to end:
    $ mpiexec -np 3 python -m mpisppy.generic_cylinders \
        --module-name schultz_data --num-scens 5 \
        --max-iterations 20 --default-rho 1.0 --solver-name gurobi_direct \
-       --xhatshuffle --lagrangian \
+       --xhatshuffle --lagrangian --max-solver-threads 2 \
        --boot-method Classical_quantile \
        --boot-candidate-sample-size 5 --boot-sample-size 100 \
        --boot-subsample-size 20 --boot-nB 20 --boot-alpha 0.1 \
