@@ -292,7 +292,8 @@ The ``--boot-*`` options are:
    * - ``--boot-ranks-per-batch``
      - ``K``: MPI ranks cooperating on one batch solve. ``K = 1`` solves each
        batch as a per-rank extensive form; ``K > 1`` runs a wheel per group of
-       ``K`` ranks. ``K`` must divide the rank count
+       ``K`` ranks. ``K`` must divide the rank count and, for ``K > 1``, be a
+       multiple of the number of cylinders in the batch config
 
 A batch solve is *different* from the ``xhat`` solve — a batch is a resample of
 the data, with its own scenario count (``N`` for the classical and extended
@@ -306,9 +307,10 @@ two cases below are alternatives — one file per run, not both together. A
 
    --solver-name gurobi
 
-while a ``K > 1`` file is the group's full wheel configuration, e.g.::
+while a ``K > 1`` file is the group's full wheel configuration — a hub and one or
+more spokes, e.g. a PH hub with a Lagrangian bounding spoke::
 
-   --solver-name gurobi --subgradient-hub --max-iterations 50 --default-rho 1.0
+   --solver-name gurobi --lagrangian --default-rho 1.0 --max-iterations 50 --max-solver-threads 2
 
 The framework injects only the batch scenario set (its count and the positional
 sample→record mapping); the file must not set the scenario-formation options
@@ -328,6 +330,17 @@ is ``G = R`` (each rank its own group, a direct extensive form per batch), and
 ``K = R`` is ``G = 1`` (one group of all ranks solving the batches in sequence,
 each by a full wheel). The xhat-evaluation solves are spread across the group's
 ranks the same way.
+
+``K`` obeys two divisibility rules: it must divide the rank count ``R`` (so the
+groups partition the ranks with none left idle), and for ``K > 1`` it must be a
+multiple of the number of cylinders in the batch config (so a group's ``K``
+ranks split evenly among that wheel's hub and spokes). A two-cylinder batch — a
+PH hub and one bounding spoke, as above — therefore needs an even ``K``.
+
+Because the ``G`` groups run at the same time, many batch solves are in flight
+at once. Cap the threads each solver may take with ``--max-solver-threads`` in
+the batch config (``2`` above) so the concurrent solves do not oversubscribe the
+cores.
 
 Because it works from a fixed dataset, a bootstrap run is mutually exclusive
 with the distribution-sampling CI methods (MMW and sequential sampling) and is
