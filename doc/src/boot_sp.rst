@@ -265,7 +265,7 @@ and a coverage simulation.
 In generic_cylinders
 --------------------
 
-The driver ``generic_cylinders`` (see :ref:`generic_cylinders`) can report a
+The standard driver ``generic_cylinders`` (see :ref:`generic_cylinders`) can report a
 data-based bootstrap confidence interval as a first-class option, the
 data-based analog of its ``--mmw-*`` (MMW) group. Given a dataset, it finds a
 candidate solution ``xhat`` with whatever the command line configured (an
@@ -275,7 +275,7 @@ computed from a part of the data that is held **strictly disjoint** from the
 records that produced ``xhat``. That disjointness is a correctness requirement:
 a gap CI is only meaningful when estimated on data that did not choose ``xhat``.
 
-The workflow is a hold-out split over the *positions* in the dataset. The
+The workflow involves a hold-out split over the *positions* in the dataset. The
 driver treats ``scenario_names_creator(None)`` as the whole dataset (one
 scenario name per record), reserves the first ``--boot-candidate-sample-size``
 (``M``) records as the candidate block that ``xhat`` came from, and resamples
@@ -294,8 +294,8 @@ dataset by returning every implied scenario name from
 ``--boot-*`` flag.
 
 Because it works from a fixed dataset, a bootstrap run is mutually exclusive
-with the distribution-sampling CI methods (MMW and sequential sampling) and is
-two-stage only.
+with the distribution-sampling CI methods (MMW and sequential sampling). At
+present, it is two-stage only.
 
 Options
 ~~~~~~~
@@ -317,7 +317,8 @@ The ``--boot-*`` options are:
    * - ``--boot-sample-size``
      - ``N``: records resampled for the CI (the disjoint pool)
    * - ``--boot-subsample-size``
-     - subsample size (subsampling and bagging methods)
+     - the number of records in each subsample (or bag) drawn from the
+       ``N``-record pool (subsampling and bagging methods)
    * - ``--boot-nB``
      - number of bootstrap/bagging batches
    * - ``--boot-alpha``
