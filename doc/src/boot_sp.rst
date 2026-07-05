@@ -300,21 +300,22 @@ methods, the subsample size for subsampling and bagging) set independently of
 the ``M`` candidate records — so its solver, rho, spokes, convergence and
 relative gap are configured separately, by role. The ``xhat`` solve uses the ordinary ``generic_cylinders`` command line;
 the batch solves are configured entirely by ``--boot-batch-config-file``, which
-is literally a file of ``generic_cylinders`` flags (``#`` starts a comment),
-e.g.::
+is literally a file of ``generic_cylinders`` flags (``#`` starts a comment). The
+two cases below are alternatives — one file per run, not both together. A
+``K = 1`` file (a direct extensive form) need only name a solver::
 
-   # batch config for K = 1 (a direct extensive form): just name a solver
    --solver-name gurobi
 
-   # batch config for K > 1 (a wheel per group): the group's full configuration
+while a ``K > 1`` file is the group's full wheel configuration, e.g.::
+
    --solver-name gurobi --subgradient-hub --max-iterations 50 --default-rho 1.0
 
 The framework injects only the batch scenario set (its count and the positional
 sample→record mapping); the file must not set the scenario-formation options
-(those are the ``--boot-*`` flags above). For ``K = 1`` the file need only name
-a solver; for ``K > 1`` it must configure a wheel that yields an **outer**
-(decomposition) bound on the batch optimal — a Lagrangian/subgradient spoke or
-the subgradient hub — since that outer bound is the batch's optimal ``L_b``.
+(those are the ``--boot-*`` flags above). A ``K > 1`` batch must yield an
+**outer** (decomposition) bound on the batch optimal — via a Lagrangian or
+subgradient spoke, or the subgradient hub — since that outer bound is the
+batch's optimal ``L_b``.
 
 MPI ranks: groups of ``K``
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~
