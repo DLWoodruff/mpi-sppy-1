@@ -294,10 +294,11 @@ The ``--boot-*`` options are:
        batch as a per-rank extensive form; ``K > 1`` runs a wheel per group of
        ``K`` ranks. ``K`` must divide the rank count
 
-How a batch is solved is a *different* problem from the ``xhat`` solve — a batch
-has ``N`` scenarios, usually far more than the ``M`` candidate records — so its
-solver, rho, spokes, convergence and relative gap are configured separately, by
-role. The ``xhat`` solve uses the ordinary ``generic_cylinders`` command line;
+A batch solve is *different* from the ``xhat`` solve — a batch is a resample of
+the data, with its own scenario count (``N`` for the classical and extended
+methods, the subsample size for subsampling and bagging) set independently of
+the ``M`` candidate records — so its solver, rho, spokes, convergence and
+relative gap are configured separately, by role. The ``xhat`` solve uses the ordinary ``generic_cylinders`` command line;
 the batch solves are configured entirely by ``--boot-batch-config-file``, which
 is literally a file of ``generic_cylinders`` flags (``#`` starts a comment),
 e.g.::

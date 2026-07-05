@@ -1751,9 +1751,10 @@ class Config(pyofig.ConfigDict):
             description="Required for a bootstrap run: a file of generic_cylinders"
             " flags (e.g. '--solver-name gurobi --lagrangian --default-rho 1.0')"
             " that configures how each resampled batch is solved. It is a separate"
-            " problem from the xhat solve (a batch has N scenarios, not the M"
-            " candidate records), so its solver, rho, spokes, convergence and"
-            " relative gap are set here, not inherited. For K=1 it need only name a"
+            " problem from the xhat solve (a batch is a resample of the data, sized"
+            " independently of the M candidate records), so its solver, rho, spokes,"
+            " convergence and relative gap are set here, not inherited. For K=1 it"
+            " need only name a"
             " solver (a direct EF); for K>1 it is the group's full cylinder"
             " configuration (default None)",
             domain=str,

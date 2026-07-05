@@ -552,10 +552,11 @@ given.
 The **batch config** governs solve (2). It is *singular across batches* — you
 resample the data, not re-tune per batch, so it is one config, never a per-batch
 or `boot_*`-prefixed copy of the whole option surface — but it is **distinct
-from the xhat-solve config**: a batch has `N` (or the subsample size) scenarios,
-usually far more than the `M` candidate records, so its rho, iteration count,
-and spoke mix are a different problem and must be set independently rather than
-inherited from the xhat solve. Because it is a *full* `generic_cylinders`
+from the xhat-solve config**: a batch is a resample of the data, with its own
+scenario count (`N` for the classical and extended methods, the subsample size
+for subsampling and bagging) set independently of the `M` candidate records, so
+its rho, iteration count, and spoke mix are a different problem and must be set
+independently rather than inherited from the xhat solve. Because it is a *full* `generic_cylinders`
 configuration (solver, rho, which spokes, convergence, relative gap), it is
 supplied as a **file** — `--boot-batch-config-file` (§9.5), parsed by the same
 `Config` machinery — not as a growing set of `boot_*`-prefixed CLI flags or an
