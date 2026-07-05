@@ -39,6 +39,7 @@ mpiexec -np 3 python -m mpisppy.generic_cylinders \
     --default-rho 1.0 \
     --solver-name ${SOLVER} \
     --xhatshuffle --lagrangian \
+    --max-solver-threads 2 \
     ${BOOT}
 
 rm -f "${BATCH_CONFIG}"
