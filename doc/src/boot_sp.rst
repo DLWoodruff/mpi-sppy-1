@@ -8,8 +8,8 @@ and bagging confidence intervals for the optimality gap (and for the optimal
 value and the value at a candidate solution) of *data-based*, two-stage
 stochastic programs. The estimators
 work directly from data. The methods and software are described in
-[ChenWoodruff2023]_ and [ChenWoodruff2024]_.  Although both boostrap and
-bagging are supported we often just refer to the methods collectively
+[ChenWoodruff2023]_ and [ChenWoodruff2024]_.  Although both bootstrap and
+bagging are supported, we often just refer to the methods collectively
 as "bootstrap" for ease of exposition.
 
 The package has two families of estimators. The *empirical* methods
@@ -22,7 +22,7 @@ imports lazily. If scipy is not installed, the empirical methods still work
 and a smoothed method fails with an informative import error.
 
 The rest of this page is organized around how a bootstrap run is put together.
-**Background** collects the pieces every run shares: the estimator *methods*,
+The **Background** section describes the pieces every run shares: the estimator *methods*,
 the *contract* a model module must satisfy, and how the *optimality gap* is
 defined. There are then two ways to compute an interval — the **standalone
 drivers** (``user_boot`` for a single interval, ``simulate_boot`` for coverage
@@ -113,8 +113,8 @@ reported.)
 Standalone drivers
 ------------------
 
-The standalone drivers compute a bootstrap CI directly, outside the everyday
-driver. Both are run with ``python -m``.
+The legacy standalone drivers compute a bootstrap CI directly, outside the ``generic_cylinders``
+driver. Both standalone drivers are run with ``python -m``.
 
 Modes
 ~~~~~
@@ -145,7 +145,7 @@ Arguments
 ~~~~~~~~~
 
 Simulation and user modes use almost the same options; simulation mode reads
-them from json (some with underscores), while user mode takes them on the
+them from json (some with underscores), while user mode takes them from the
 command line (with dashes). The main options are:
 
 * ``max_count`` / ``--max-count`` — total sample size (integer).
@@ -203,32 +203,12 @@ presumed optimal value) that a simulation can reuse:
 Examples
 ~~~~~~~~
 
-On-the-fly data
-^^^^^^^^^^^^^^^^
-
-The ``examples/bootsp/schultz`` directory has a small two-stage example whose
-data is a deterministic function of the scenario number, so its results are
-reproducible across solvers. From that directory:
-
-.. code-block:: bash
-
-   $ python -m mpisppy.confidence_intervals.bootsp.user_boot unique_schultz \
-       --max-count 50 --candidate-sample-size 1 --sample-size 30 \
-       --subsample-size 10 --nB 20 --alpha 0.1 --seed-offset 100 \
-       --solver-name gurobi_direct --boot-method Classical_quantile
-
-   $ python -m mpisppy.confidence_intervals.bootsp.simulate_boot unique_schultz.json
-
-See ``examples/bootsp/schultz/schultz.bash`` for a serial run, a parallel run,
-and a coverage simulation.
-
 From a dataset file
 ^^^^^^^^^^^^^^^^^^^^
 
-The ``schultz`` example above generates its data arithmetically from the
-scenario number. The companion example ``examples/bootsp/schultz_data`` shows
-the more typical *data-based* setup: the same model, but each scenario reads
-one observation (one row) from a committed dataset, ``schultz_data.csv``:
+The typical *data-based* workflow reads each scenario's observation from a
+dataset. ``examples/bootsp/schultz_data`` is a small two-stage model wired that
+way: each scenario reads one row from a committed dataset, ``schultz_data.csv``:
 
 .. code-block:: text
 
@@ -260,6 +240,27 @@ disjoint.) For example:
 ``schultz_data.csv`` is produced by ``schultz_data_generator.py`` (a fixed seed
 makes it reproducible); replace it with your own two-column dataset, or point
 ``--data-file`` at another file, to run the bootstrap on your own data.
+
+On-the-fly data
+^^^^^^^^^^^^^^^^
+
+An unusual example that is useful for testing does not have to read a data file,
+``examples/bootsp/schultz`` is the same two-stage model as ``schultz_data``
+above, except each scenario computes its own observation from the scenario
+number instead of reading a row — so it is self-contained and needs no dataset.
+From that directory:
+
+.. code-block:: bash
+
+   $ python -m mpisppy.confidence_intervals.bootsp.user_boot unique_schultz \
+       --max-count 50 --candidate-sample-size 1 --sample-size 30 \
+       --subsample-size 10 --nB 20 --alpha 0.1 --seed-offset 100 \
+       --solver-name gurobi_direct --boot-method Classical_quantile
+
+   $ python -m mpisppy.confidence_intervals.bootsp.simulate_boot unique_schultz.json
+
+See ``examples/bootsp/schultz/schultz.bash`` for a serial run, a parallel run,
+and a coverage simulation.
 
 In generic_cylinders
 --------------------
