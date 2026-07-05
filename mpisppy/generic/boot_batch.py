@@ -11,8 +11,9 @@
 For ``--boot-ranks-per-batch`` (K) greater than 1 a resampled batch is not a
 direct extensive form but a full hub/spoke wheel run on the batch's group of K
 ranks. How that wheel is configured -- solver, rho, which spokes, convergence,
-the relative gap -- is a *different* problem from the xhat solve (a batch has N
-scenarios, usually far more than the M candidate records), so it is supplied
+the relative gap -- is a *different* problem from the xhat solve (a batch is a
+resample of the data, with its own scenario count set independently of the M
+candidate records), so it is supplied
 separately as ``--boot-batch-config-file``: literally a file of
 ``generic_cylinders`` flags. This module parses that file into a Config and
 turns it into a callable that the estimator invokes per batch, returning the
