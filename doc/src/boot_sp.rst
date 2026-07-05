@@ -371,8 +371,8 @@ three that solve the batches concurrently, each batch by a single-cylinder
 subgradient solve
 (configured in ``schultz_wheel_batch.txt``).
 
-Smoothed methods and statdist
------------------------------
+Smoothed methods
+----------------
 
 The smoothed methods (the ``Smoothed_*`` tokens) fit a univariate distribution
 to the sampled data and then resample from the *fitted* distribution rather
