@@ -234,8 +234,9 @@ makes it reproducible); replace it with your own two-column dataset, or point
 In generic_cylinders
 --------------------
 
-The everyday driver ``generic_cylinders`` can report a data-based bootstrap
-confidence interval as a first-class option, the data-based analog of its
+The driver ``generic_cylinders`` (see :ref:`generic_cylinders`) can report a
+data-based bootstrap confidence interval as a first-class option, the
+data-based analog of its
 ``--mmw-*`` (MMW) group. Given a dataset, it finds a candidate solution
 ``xhat`` with whatever the command line configured (an extensive form for small
 instances, or the PH cylinder system for large ones) and then reports a
