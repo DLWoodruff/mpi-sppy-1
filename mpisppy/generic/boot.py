@@ -61,6 +61,17 @@ def boot_requested(cfg):
             "boot_candidate_sample_size (M) and boot_xhat_input_file_name are "
             "mutually exclusive: give a positive M to find xhat from the "
             "candidate records, or an xhat file to read it (with M omitted or 0).")
+
+    # The batch config file is required whenever a bootstrap run is requested,
+    # for K = 1 as well as K > 1 (design 9.5): one uniform mechanism, no
+    # simple-case shortcut. It configures how each resampled batch is solved.
+    if cfg.get("boot_batch_config_file") is None:
+        raise ValueError(
+            "a bootstrap run requires --boot-batch-config-file: a file of "
+            "generic_cylinders flags configuring how each resampled batch is "
+            "solved (its solver, and for K>1 its rho/spokes/convergence). For "
+            "K=1 it need only name a solver, e.g. a one-line file "
+            "'--solver-name gurobi'.")
     return True
 
 
@@ -82,16 +93,8 @@ def _check_compatibility(cfg):
             raise ValueError(
                 f"The bootstrap CI cannot be combined with --{opt.replace('_', '-')}.")
 
-    # K > 1 (a wheel per group of ranks on a sub-communicator) is a scheduled
-    # follow-on; the first integration ships K = 1 (a per-rank extensive form).
-    K = cfg.get("boot_ranks_per_batch", 1)
-    if K is not None and K != 1:
-        raise ValueError(
-            f"boot_ranks_per_batch={K}: only K=1 (a per-rank extensive form) "
-            "is supported so far.")
 
-
-def _estimator_cfg(module_basename, module, cfg, N, M, pool_names):
+def _estimator_cfg(module_basename, module, cfg, batch_cfg, N, M, pool_names):
     """Build the Config the bootsp estimator expects from the boot_* options.
 
     The estimator (boot_sp) reads its own historical option names (max_count,
@@ -100,6 +103,11 @@ def _estimator_cfg(module_basename, module, cfg, N, M, pool_names):
     addresses records by position 0..N-1; we set max_count = N so its resampling
     pool *is* the disjoint N-record block, and install a resolver mapping each
     position to its canonical scenario name.
+
+    The batch solver name and options come from the parsed ``batch_cfg`` (the
+    --boot-batch-config-file), not the xhat-solve command line: they govern the
+    K=1 direct-EF solve and the xhat-evaluation solves, so both agree with the
+    K>1 wheel, which reads batch_cfg directly (design 9.4 / 9.5).
     """
     import mpisppy.confidence_intervals.bootsp.boot_utils as boot_utils
 
@@ -128,16 +136,14 @@ def _estimator_cfg(module_basename, module, cfg, N, M, pool_names):
     boot_cfg.alpha = cfg.get("boot_alpha")
     boot_cfg.seed_offset = cfg.get("boot_seed_offset")
 
-    # the batch ("boot") solver role, falling back to the generic solver_name
-    # (and its options), so the batch EF solves are independent of any xhat-EF
-    # solver
-    _, boot_solver_name, boot_solver_options = solver_specification(cfg, ["boot", ""])
-    boot_cfg.solver_name = boot_solver_name
+    # the batch solver name and options, from the batch config file
+    _, batch_solver_name, batch_solver_options = solver_specification(batch_cfg, "")
+    boot_cfg.solver_name = batch_solver_name
     boot_cfg.add_to_config(
         "solver_options",
         description="options dict for the bootstrap batch solver",
         domain=None, default=None, argparse=False)
-    boot_cfg.solver_options = boot_solver_options
+    boot_cfg.solver_options = batch_solver_options
 
     # the positional resolver: estimator position p -> canonical pool name
     boot_cfg.add_to_config(
@@ -239,9 +245,27 @@ def do_boot(module_fname, cfg, wheel=None):
             except OSError:
                 pass
 
-    boot_cfg = _estimator_cfg(module_basename, module, cfg, N, M, pool_names)
+    # The batch config file (required) governs how each resampled batch is
+    # solved. For K=1 it feeds the estimator's direct-EF and xhat-eval solves;
+    # for K>1 it also builds the per-group wheel (design 9.4 / 9.5).
+    from mpisppy.generic import boot_batch
+    from mpisppy.confidence_intervals.bootsp.batch_executor import BatchExecutor
 
-    result = boot_sp.compute_ci(boot_cfg, module, xhat)
+    batch_cfg = boot_batch.parse_batch_config_file(
+        cfg.boot_batch_config_file, module)
+
+    # Build the executor first so it validates K against the rank count before
+    # we build the (K>1) wheel solver, which validates the batch config's rho.
+    K = cfg.get("boot_ranks_per_batch", 1)
+    executor = BatchExecutor(K, comm=global_comm)
+    if executor.uses_cylinders:
+        executor.batch_optimal_solver = boot_batch.make_batch_optimal_solver(
+            batch_cfg, module)
+    # else K=1: each batch is a direct extensive form (no wheel solver)
+
+    boot_cfg = _estimator_cfg(module_basename, module, cfg, batch_cfg, N, M, pool_names)
+
+    result = boot_sp.compute_ci(boot_cfg, module, xhat, executor=executor)
 
     if global_rank == 0:
         ci_optimal, ci_upper, ci_gap, c_optimal, c_upper, c_gap = result

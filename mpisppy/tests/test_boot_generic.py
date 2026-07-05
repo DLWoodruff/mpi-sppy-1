@@ -51,6 +51,20 @@ if data_example_dir not in sys.path:
 
 MODULE_NAME = "schultz_data"
 
+# A bootstrap run now requires --boot-batch-config-file (a file of
+# generic_cylinders flags for the batch solves). For the K=1 tests it need only
+# name the solver. One file per rank avoids a write race under mpiexec.
+_batch_cfg_fd, BATCH_CFG_PATH = tempfile.mkstemp(prefix=f"bootbatch{my_rank}", suffix=".txt")
+with os.fdopen(_batch_cfg_fd, "w") as _f:
+    _f.write(f"--solver-name {solver_name or 'gurobi'}\n")
+
+# For the K>1 (wheel-per-batch) test: a subgradient hub is a single cylinder
+# (works at any rank count) that yields an outer (dual) bound on each batch.
+_wheel_cfg_fd, WHEEL_BATCH_CFG_PATH = tempfile.mkstemp(prefix=f"bootwheel{my_rank}", suffix=".txt")
+with os.fdopen(_wheel_cfg_fd, "w") as _f:
+    _f.write(f"--solver-name {solver_name or 'gurobi'}\n"
+             "--subgradient-hub\n--max-iterations 5\n--default-rho 1.0\n")
+
 # A fixed, feasible candidate solution so the CI depends only on the
 # (deterministic) bootstrap draws over the dataset rows, not on which optimum a
 # given solver returns.
@@ -93,7 +107,20 @@ def _make_cfg(method="Classical_quantile"):
     cfg.boot_nB = 20
     cfg.boot_alpha = 0.1
     cfg.boot_seed_offset = 100
+    cfg.boot_batch_config_file = BATCH_CFG_PATH
     cfg.data_file = "schultz_data.csv"
+    return cfg
+
+
+def _make_small_cfg(K, batch_cfg_path):
+    """A cheap cfg for the wheel-vs-EF comparison: a small pool and few batches
+    so the per-batch wheel solves stay fast."""
+    cfg = _make_cfg("Classical_quantile")
+    cfg.boot_sample_size = 8
+    cfg.boot_subsample_size = 4
+    cfg.boot_nB = 4
+    cfg.boot_batch_config_file = batch_cfg_path
+    cfg.boot_ranks_per_batch = K
     return cfg
 
 
@@ -144,22 +171,71 @@ class Test_boot_generic(unittest.TestCase):
         res = do_boot(MODULE_NAME, cfg, wheel=_FakeWheel())
         self._assert_gap(res, locked_ci_gap_wheel, locked_center_gap_wheel)
 
-    def test_boot_solver_role_resolution(self):
-        # the batch ("boot") solver role resolves its own name and options, and
-        # falls back to the generic solver_name when --boot-solver-name is unset
+    def test_batch_solver_from_config_file(self):
+        # the estimator's solver name and options come from the batch config
+        # file, not the xhat-solve command line (PR-4 retired --boot-solver-*).
+        from mpisppy.generic import boot_batch
         import schultz_data
         pool = schultz_data.scenario_names_creator(3)
 
-        cfg = _make_cfg("Classical_quantile")
-        cfg.boot_solver_name = "myboot_solver"
-        cfg.boot_solver_options = "mipgap=0.01"
-        boot_cfg = _estimator_cfg("schultz_data", schultz_data, cfg, 3, 0, pool)
-        self.assertEqual(boot_cfg.solver_name, "myboot_solver")
-        self.assertIn("mipgap", boot_cfg.solver_options)
+        bf = tempfile.mkstemp(suffix=".txt")[1]
+        with open(bf, "w") as f:
+            f.write("--solver-name myboot_solver --solver-options mipgap=0.01\n")
+        try:
+            batch_cfg = boot_batch.parse_batch_config_file(bf, schultz_data)
+            cfg = _make_cfg("Classical_quantile")
+            boot_cfg = _estimator_cfg("schultz_data", schultz_data, cfg, batch_cfg, 3, 0, pool)
+            self.assertEqual(boot_cfg.solver_name, "myboot_solver")
+            self.assertIn("mipgap", boot_cfg.solver_options)
+        finally:
+            if os.path.exists(bf):
+                os.remove(bf)
 
-        cfg2 = _make_cfg("Classical_quantile")   # no boot_solver_name
-        boot_cfg2 = _estimator_cfg("schultz_data", schultz_data, cfg2, 3, 0, pool)
-        self.assertEqual(boot_cfg2.solver_name, solver_name)
+    def test_boot_requested_requires_batch_config(self):
+        # a bootstrap run must name a batch config file
+        cfg = _make_cfg("Classical_quantile")
+        cfg.boot_batch_config_file = None
+        with self.assertRaises(ValueError):
+            boot_requested(cfg)
+
+    @unittest.skipIf(not solver_available, "no solver is available")
+    @unittest.skipIf(n_proc < 2, "the K>1 wheel path needs at least 2 ranks")
+    def test_do_boot_g1_wheel_matches_ef(self):
+        # The G=1 checkpoint (design 9.4): K = n_proc, so one group of all ranks
+        # solves each batch by a wheel in sequence. Compare that wheel path to
+        # the K=1 direct-EF path over the *same* pool (both deterministic, file
+        # xhat). The value at xhat (center_upper) is solver-exact and does not
+        # depend on K, so it must match exactly; the wheel's optimal is an outer
+        # (dual) bound, so it must sit at or below the EF optimum, making the
+        # reported gap conservative (>= the EF gap).
+        xf = tempfile.mkstemp(prefix=f"xhatw{my_rank}", suffix=".npy")[1]
+        ciutils.write_xhat(XHAT, path=xf)
+        try:
+            cfg_ef = _make_small_cfg(K=1, batch_cfg_path=BATCH_CFG_PATH)
+            cfg_ef.boot_xhat_input_file_name = xf
+            res_ef = do_boot(MODULE_NAME, cfg_ef)
+
+            cfg_wheel = _make_small_cfg(K=n_proc, batch_cfg_path=WHEEL_BATCH_CFG_PATH)
+            cfg_wheel.boot_xhat_input_file_name = xf
+            res_wheel = do_boot(MODULE_NAME, cfg_wheel)
+
+            if my_rank == 0:
+                co_ef, cu_ef, cg_ef = res_ef[3], res_ef[4], res_ef[5]
+                co_w, cu_w, cg_w = res_wheel[3], res_wheel[4], res_wheel[5]
+                ci_gap_w = list(res_wheel[2])
+                tol = 1e-4 * (1 + abs(cu_ef))
+                # value at xhat is K-invariant -> exact match
+                self.assertAlmostEqual(cu_w, cu_ef, delta=tol)
+                # wheel optimal is an outer bound -> at or below the EF optimum
+                self.assertLessEqual(co_w, co_ef + tol)
+                # so the reported gap over-states (is conservative)
+                self.assertGreaterEqual(cg_w, cg_ef - tol)
+                # and the CI is ordered and finite
+                self.assertLessEqual(ci_gap_w[0], ci_gap_w[1])
+                self.assertTrue(all(abs(v) < float("inf") for v in ci_gap_w))
+        finally:
+            if os.path.exists(xf):
+                os.remove(xf)
 
     def test_boot_requested_none(self):
         cfg = _make_cfg()
@@ -195,13 +271,22 @@ class Test_boot_generic(unittest.TestCase):
         with self.assertRaises(ValueError):
             do_boot(MODULE_NAME, cfg, wheel=_FakeWheel())
 
-    def test_do_boot_ranks_per_batch_gt_1_raises(self):
+    def test_do_boot_bad_ranks_per_batch_raises(self):
+        # K must divide the number of MPI ranks; serially (1 rank) any K > 1 is
+        # invalid (K > R), so the executor rejects it.
         cfg = _make_cfg("Classical_quantile")
         cfg.boot_candidate_sample_size = 5
         cfg.num_scens = 5
-        cfg.boot_ranks_per_batch = 2
+        cfg.boot_ranks_per_batch = n_proc + 1
         with self.assertRaises(ValueError):
             do_boot(MODULE_NAME, cfg, wheel=_FakeWheel())
+
+
+def tearDownModule():
+    # remove the per-rank batch config files created at import time
+    for path in (BATCH_CFG_PATH, WHEEL_BATCH_CFG_PATH):
+        if os.path.exists(path):
+            os.remove(path)
 
 
 if __name__ == '__main__':

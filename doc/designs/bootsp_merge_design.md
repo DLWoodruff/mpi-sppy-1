@@ -8,7 +8,12 @@ extended 2026-07-03 to state the end goal
 PR-2 (statdist + smoothed) and PR-3 (the `generic_cylinders` integration, the
 end goal — `--boot-*` group, `do_boot`, the positional layer with a strictly
 disjoint M/N split, the `K = 1` batch executor) are implemented on the stacked
-branches `bootsp-pr-b` / `bootsp-pr-c`.
+branches `bootsp-pr-b` / `bootsp-pr-c`. PR-4 (the `K > 1` batch executor: a
+`BatchExecutor` that groups the ranks and a wheel per group from
+`--boot-batch-config-file`, retiring the interim `--boot-solver-*`) is
+implemented on `bootsp-pr-d`; both endpoints are validated end to end — the
+`G = 1` checkpoint (one group, a wheel per batch in sequence) and `G > 1`
+(np = 4, K = 2).
 **Author:** dlw (captured with Claude Code assistance)
 **Last updated:** 2026-07-03
 
@@ -547,10 +552,11 @@ given.
 The **batch config** governs solve (2). It is *singular across batches* — you
 resample the data, not re-tune per batch, so it is one config, never a per-batch
 or `boot_*`-prefixed copy of the whole option surface — but it is **distinct
-from the xhat-solve config**: a batch has `N` (or the subsample size) scenarios,
-usually far more than the `M` candidate records, so its rho, iteration count,
-and spoke mix are a different problem and must be set independently rather than
-inherited from the xhat solve. Because it is a *full* `generic_cylinders`
+from the xhat-solve config**: a batch is a resample of the data, with its own
+scenario count (`N` for the classical and extended methods, the subsample size
+for subsampling and bagging) set independently of the `M` candidate records, so
+its rho, iteration count, and spoke mix are a different problem and must be set
+independently rather than inherited from the xhat solve. Because it is a *full* `generic_cylinders`
 configuration (solver, rho, which spokes, convergence, relative gap), it is
 supplied as a **file** — `--boot-batch-config-file` (§9.5), parsed by the same
 `Config` machinery — not as a growing set of `boot_*`-prefixed CLI flags or an
@@ -577,8 +583,22 @@ Note the two endpoints are the same mechanism: `K = 1` is `G = R` (one rank per
 group, batches spread one-per-rank), and "serial cylinders per batch" is `K = R`
 → `G = 1` (one group of all `R` ranks, batches in sequence). So PR-4 is a single
 executor with `--boot-ranks-per-batch` as its only new rank knob, and the
-`G = 1` case is a development checkpoint, not a separate PR. The prerequisite
-(#782) has landed, so PR-4 is unblocked.
+`G = 1` case is a development checkpoint, not a separate PR.
+
+*Implemented (PR-4).* A `BatchExecutor`
+(`mpisppy/confidence_intervals/bootsp/batch_executor.py`) owns the rank
+arithmetic and the collectives: it splits `R` ranks into `G = R // K` groups,
+exposes each group's communicator (for the wheel / xhat-evaluation) and a
+leaders-only communicator (for the cross-group `Gatherv`), and reproduces the
+`K = 1` per-rank behavior bit-for-bit as its degenerate case (so the standalone
+drivers are unchanged). The empirical estimators route their parallelism through
+it. For `K > 1` the per-group wheel is built from `--boot-batch-config-file`
+(`mpisppy/generic/boot_batch.py`), and its outer (decomposition) bound is read
+back as `L_b`. Validated end to end on the `schultz_data` MIP: the `G = 1`
+checkpoint and `G > 1` (np = 4, K = 2) both reproduce the exact value-at-`xhat`
+of the `K = 1` EF path (the xhat-evaluation is K-invariant) while their outer
+bound sits at or below the EF optimum, so the reported gap is conservative,
+exactly as §9.4.1 predicts.
 
 ### 9.4.1 The per-batch value: inner bound minus outer bound
 

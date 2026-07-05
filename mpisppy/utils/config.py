@@ -1747,24 +1747,25 @@ class Config(pyofig.ConfigDict):
             default=None,
         )
         self.add_to_config(
-            "boot_solver_name",
-            description="Solver for the bootstrap batch solves; falls back to the"
-            " generic solver_name when unset (default None)",
-            domain=str,
-            default=None,
-        )
-        self.add_to_config(
-            "boot_solver_options",
-            description="Options string for the bootstrap batch solver, e.g."
-            " 'mipgap=0.01' (default None)",
+            "boot_batch_config_file",
+            description="Required for a bootstrap run: a file of generic_cylinders"
+            " flags (e.g. '--solver-name gurobi --lagrangian --default-rho 1.0')"
+            " that configures how each resampled batch is solved. It is a separate"
+            " problem from the xhat solve (a batch is a resample of the data, sized"
+            " independently of the M candidate records), so its solver, rho, spokes,"
+            " convergence and relative gap are set here, not inherited. For K=1 it"
+            " need only name a"
+            " solver (a direct EF); for K>1 it is the group's full cylinder"
+            " configuration (default None)",
             domain=str,
             default=None,
         )
         self.add_to_config(
             "boot_ranks_per_batch",
-            description="K: number of MPI ranks that cooperate on one batch solve."
-            " Only K=1 (a per-rank extensive form) is supported so far"
-            " (default 1)",
+            description="K: number of MPI ranks that cooperate on one batch solve"
+            " (design 9.4). K=1 solves each batch as a per-rank extensive form;"
+            " K>1 runs a wheel per group of K ranks using boot_batch_config_file."
+            " K must divide the number of MPI ranks (default 1)",
             domain=int,
             default=1,
         )

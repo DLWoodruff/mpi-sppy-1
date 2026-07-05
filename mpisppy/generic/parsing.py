@@ -92,9 +92,20 @@ def load_module(model_fname):
     return importlib.import_module(fname)
 
 
-def parse_args(m):
-    """Parse CLI args given the model module m. Returns a Config object."""
-    cfg = config.Config()
+def register_generic_args(cfg, m):
+    """Register the full generic_cylinders option set on cfg (no parsing).
+
+    Factored out of parse_args so a second consumer -- the bootstrap batch
+    config file (--boot-batch-config-file), which is literally a batch
+    generic_cylinders configuration -- can build an identical Config and then
+    read its options from a file rather than the command line. parse_args calls
+    this and then parses argv; the batch reader calls this and then imports the
+    file. Keeping a single registration point means the two never drift.
+
+    Args:
+        cfg (Config): a fresh Config to populate.
+        m (module or class): the model, for its inparser_adder.
+    """
     cfg.proper_bundle_config()
     cfg.pickle_scenarios_config()
     cfg.pre_pickle_args()
@@ -177,6 +188,12 @@ def parse_args(m):
 
     from mpisppy.generic.admm import admm_args
     admm_args(cfg)
+
+
+def parse_args(m):
+    """Parse CLI args given the model module m. Returns a Config object."""
+    cfg = config.Config()
+    register_generic_args(cfg, m)
 
     cfg.parse_command_line(f"mpi-sppy for {cfg.module_name}")
 
