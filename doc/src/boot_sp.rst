@@ -6,10 +6,11 @@ Bootstrap Confidence Intervals
 The ``mpisppy.confidence_intervals.bootsp`` subpackage provides bootstrap
 and bagging confidence intervals for the optimality gap (and for the optimal
 value and the value at a candidate solution) of *data-based*, two-stage
-stochastic programs. Unlike the other confidence-interval methods in
-mpi-sppy, no distribution of the uncertain data is assumed: the estimators
-work directly from sampled data. The methods and software are described in
-[ChenWoodruff2023]_ and [ChenWoodruff2024]_.
+stochastic programs. The estimators
+work directly from data. The methods and software are described in
+[ChenWoodruff2023]_ and [ChenWoodruff2024]_.  Although both boostrap and
+bagging are supported we often just refer to the methods collectively
+as "bootstrap" for ease of exposition.
 
 The package has two families of estimators. The *empirical* methods
 (classical, extended, subsampling, and bagging) resample the observed data
@@ -83,15 +84,16 @@ plus a few helpers used by the bootstrap code:
 
 * ``scenario_creator(scenario_name, ...)`` — build a Pyomo model for one
   (data) scenario, annotated as usual for mpi-sppy;
-* ``scenario_names_creator(num_scens, start=None)`` — the list of scenario
+* ``scenario_names_creator(num_scens, start=None)`` — the full list of scenario
   names;
 * ``kw_creator(cfg)`` — keyword arguments for the scenario creator;
 * ``inparser_adder(cfg)`` — add any model-specific options;
-* ``xhat_generator(scenario_names, solver_name=None, ...)`` — solve for a
-  candidate solution ``xhat`` when none is supplied. The bootstrap code looks
-  for this fixed name first and falls back to the legacy
-  ``xhat_generator_<module_name>``. If a precomputed ``xhat`` file is given
-  (``--xhat-fname``) the generator is not called.
+* ``xhat_generator(scenario_names, solver_name=None, ...)`` (optional and
+  seldom provided) — solve for a candidate solution ``xhat`` when none is
+  supplied. The bootstrap code looks for this fixed name first and falls back
+  to the legacy ``xhat_generator_<module_name>``. If a precomputed ``xhat``
+  file is given (``--xhat-fname``), the generator is not called. It is also
+  ignored by ``generic_cylinders``.
 * ``data_sampler(record_num, cfg)`` — return the data for one record (a scalar,
   or a dict keyed by variable name for multivariate data). This is used by the
   *smoothed* methods to build the sample that a distribution is fitted to; the
