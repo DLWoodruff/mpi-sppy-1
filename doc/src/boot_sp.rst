@@ -285,14 +285,14 @@ The ``--boot-*`` options are:
    * - ``--boot-seed-offset``
      - RNG offset for replication
    * - ``--boot-xhat-input-file-name``
-     - optional precomputed ``xhat`` (the no-wheel path)
+     - optional precomputed ``xhat`` supplied from a file (not found by a solve)
    * - ``--boot-batch-config-file``
      - **required**: a file of ``generic_cylinders`` flags configuring how each
        resampled batch is solved (see below)
    * - ``--boot-ranks-per-batch``
      - ``K``: MPI ranks cooperating on one batch solve. ``K = 1`` solves each
-       batch as a per-rank extensive form; ``K > 1`` runs a wheel per group of
-       ``K`` ranks. ``K`` must divide the rank count and, for ``K > 1``, be a
+       batch as a per-rank extensive form; ``K > 1`` solves it with cylinders on
+       a group of ``K`` ranks. ``K`` must divide the rank count and, for ``K > 1``, be a
        multiple of the number of cylinders in the batch config
 
 A batch solve is *different* from the ``xhat`` solve — a batch is a resample of
@@ -307,7 +307,7 @@ two cases below are alternatives — one file per run, not both together. A
 
    --solver-name gurobi
 
-while a ``K > 1`` file is the group's full wheel configuration — a hub and one or
+while a ``K > 1`` file is the group's full cylinder configuration — a hub and one or
 more spokes, e.g. a PH hub with a Lagrangian bounding spoke::
 
    --solver-name gurobi --lagrangian --default-rho 1.0 --max-iterations 50 --max-solver-threads 2
@@ -328,13 +328,13 @@ concurrently, each solving its share of the batches in sequence, with the
 results gathered to rank 0. The two endpoints are the same mechanism: ``K = 1``
 is ``G = R`` (each rank its own group, a direct extensive form per batch), and
 ``K = R`` is ``G = 1`` (one group of all ranks solving the batches in sequence,
-each by a full wheel). The xhat-evaluation solves are spread across the group's
+each solved with cylinders). The xhat-evaluation solves are spread across the group's
 ranks the same way.
 
 ``K`` obeys two divisibility rules: it must divide the rank count ``R`` (so the
 groups partition the ranks with none left idle), and for ``K > 1`` it must be a
 multiple of the number of cylinders in the batch config (so a group's ``K``
-ranks split evenly among that wheel's hub and spokes). A two-cylinder batch — a
+ranks split evenly among the batch's hub and spokes). A two-cylinder batch — a
 PH hub and one bounding spoke, as above — therefore needs an even ``K``.
 
 Because the ``G`` groups run at the same time, many batch solves are in flight
@@ -364,10 +364,11 @@ Here the main run finds ``xhat`` from the first 5 dataset records and the
 bootstrap resamples the next 100 (disjoint) records for the gap CI. The batch
 config file names the solver for the ``K = 1`` batch extensive forms; to solve
 each batch with cylinders instead, raise ``--boot-ranks-per-batch`` and give the
-group's wheel configuration in the batch config file.
+group's cylinder configuration in the batch config file.
 ``examples/bootsp/schultz_data/schultz_data_boot_cylinders.bash`` is a runnable
 ``K > 1`` demo: 6 ranks find ``xhat`` together, then re-form into two groups of
-three that solve the batches concurrently, each batch by a subgradient wheel
+three that solve the batches concurrently, each batch by a single-cylinder
+subgradient solve
 (configured in ``schultz_wheel_batch.txt``).
 
 Smoothed methods and statdist
