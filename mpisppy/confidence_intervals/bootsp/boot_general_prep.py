@@ -17,7 +17,6 @@
 import sys
 import json
 import numpy as np
-import pyomo.environ as pyo
 
 import mpisppy.utils.sputils as sputils
 import mpisppy.confidence_intervals.ciutils as ciutils
@@ -27,7 +26,12 @@ import mpisppy.confidence_intervals.bootsp.boot_sp as boot_sp
 
 def find_optimal(cfg, module):
     opt_ef = boot_sp.solve_routine(cfg, module, range(cfg.max_count), num_threads=16)
-    opt_obj = pyo.value(opt_ef.EF_Obj)
+    # Use the solver's outer bound (the lower bound for a minimization, the upper
+    # bound for a maximization), not the incumbent: a mixed-integer EF left at a
+    # nonzero MIP gap would understate the reference optimality gap. This matches
+    # the treatment of the batch optimals; solve_routine stashes the bound, and
+    # _ef_optimal_value falls back to the incumbent when the solver reports none.
+    opt_obj = boot_sp._ef_optimal_value(opt_ef)
     return opt_obj
 
 
