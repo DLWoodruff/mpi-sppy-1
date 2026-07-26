@@ -103,9 +103,14 @@ def _ef_optimal_value(ef):
     A mixed-integer EF is solved only to a MIP gap, so its incumbent
     (``pyo.value(EF_Obj)``) is an inner bound on the batch optimal; using it
     would make the optimality gap (value at xhat minus the optimal) read
-    optimistically. The solver's best bound is the correct, conservative choice
-    and unifies with the cylinders batch executor, whose decomposition bound
-    plays the same role.
+    optimistically. The best bound is the right choice, and it unifies with the
+    cylinders batch executor, whose decomposition bound plays the same role.
+
+    What that buys is conservatism in the *reported gap* only: the gap never
+    understates the one an exact solve would report. It buys no guarantee about
+    the endpoints of the interval built from those gaps -- see design 9.4.1,
+    which is explicit that the reported interval must not be described as
+    conservative.
     """
     val = getattr(ef, "_mpisppy_boot_optimal", None)
     return pyo.value(ef.EF_Obj) if val is None else val

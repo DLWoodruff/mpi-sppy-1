@@ -751,8 +751,9 @@ full-pool "`D`" quantity computed once, `ĝ_D = u_D − L_D = g_D + δ_D`.
    small relative gap `ε` (so `δ_b ≲ ε·|L_b|`), all residual slack terms are
    `O(ε)` and the exact-solve theory is recovered as `ε → 0`. The batch relative
    gap is set in the batch config file (§9.5, `--rel-gap` in the file); the CI is
-   documented as conservative and convergent to the exact-solve CI as that gap
-   tightens. Whether to additionally *de-bias* by estimating `δ` is left open.
+   documented as convergent to the exact-solve CI as that gap tightens — and,
+   per takeaway 2, *not* as conservative. Whether to additionally *de-bias* by
+   estimating `δ` is left open.
 
 **Done (`K = 1`).** The `K = 1` path now uses the solver's best bound (an outer
 bound on the batch optimal), not the incumbent `pyo.value(EF_Obj)`, so a MIP
