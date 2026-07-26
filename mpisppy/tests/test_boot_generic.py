@@ -57,18 +57,19 @@ MODULE_NAME = "schultz_data"
 XHAT = {"ROOT": [0.0, 3.0]}
 
 # do_boot ci_gap (Classical_quantile, seed_offset=100), keyed by number of ranks.
-# FILE path: M=0, pool = rows 0..99.  WHEEL path: M=5, disjoint pool = rows 5..104.
-locked_ci_gap_file = {
-    1: [0.5924999999999517, 3.396999999999958],
-    2: [1.0749999999999584, 2.919499999999952],
+# xhat-from-file path: M=0 (no candidate hold-out), pool = rows 0..99.
+# xhat-from-solve path: M=5, disjoint pool = rows 5..104.
+locked_ci_gap_xhat_from_file = {
+    1: [1.6504999999999874, 3.1604999999999763],
+    2: [1.2694999999999872, 2.760499999999967],
 }
-locked_ci_gap_wheel = {
-    1: [1.4749999999999504, 3.7364999999999475],
-    2: [1.4749999999999504, 3.2804999999999445],
+locked_ci_gap_xhat_from_solve = {
+    1: [1.1824999999999892, 3.6735000000000007],
+    2: [1.8954999999999917, 3.6735000000000007],
 }
 # center (point) estimate of the gap is rank-count independent
-locked_center_gap_file = 2.139999999999958
-locked_center_gap_wheel = 2.5799999999999557
+locked_center_gap_xhat_from_file = 2.139999999999972
+locked_center_gap_xhat_from_solve = 2.579999999999984
 
 
 class _FakeWheel:
@@ -119,8 +120,8 @@ class Test_boot_generic(unittest.TestCase):
             self.assertEqual(res, (None, None, None, None, None, None))
 
     @unittest.skipIf(not solver_available, "no solver is available")
-    def test_do_boot_file_value(self):
-        # xhat read from a file (the no-wheel path); pool = the first N records.
+    def test_do_boot_xhat_from_file(self):
+        # xhat read from a file (M=0, no candidate hold-out); pool = the first N records.
         xf = tempfile.mkstemp(prefix=f"xhat{my_rank}", suffix=".npy")[1]
         ciutils.write_xhat(XHAT, path=xf)
         try:
@@ -128,21 +129,21 @@ class Test_boot_generic(unittest.TestCase):
             cfg.boot_xhat_input_file_name = xf
             self.assertTrue(boot_requested(cfg))
             res = do_boot(MODULE_NAME, cfg)
-            self._assert_gap(res, locked_ci_gap_file, locked_center_gap_file)
+            self._assert_gap(res, locked_ci_gap_xhat_from_file, locked_center_gap_xhat_from_file)
         finally:
             if os.path.exists(xf):
                 os.remove(xf)
 
     @unittest.skipIf(not solver_available, "no solver is available")
-    def test_do_boot_wheel_disjoint(self):
-        # xhat from the (fake) wheel; the M candidate records are held disjoint
-        # from the N-record resampling pool, so the CI differs from the file
-        # path above (which pools rows 0..99).
+    def test_do_boot_xhat_from_solve(self):
+        # xhat from the solve (here a fake wheel); the M candidate records used
+        # to find it are held disjoint from the N-record resampling pool, so the
+        # CI differs from the xhat-from-file path above (which pools rows 0..99).
         cfg = _make_cfg("Classical_quantile")
         cfg.boot_candidate_sample_size = 5
         cfg.num_scens = 5
         res = do_boot(MODULE_NAME, cfg, wheel=_FakeWheel())
-        self._assert_gap(res, locked_ci_gap_wheel, locked_center_gap_wheel)
+        self._assert_gap(res, locked_ci_gap_xhat_from_solve, locked_center_gap_xhat_from_solve)
 
     def test_boot_solver_role_resolution(self):
         # the batch ("boot") solver role resolves its own name and options, and

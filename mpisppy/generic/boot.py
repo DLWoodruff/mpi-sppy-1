@@ -121,7 +121,13 @@ def _estimator_cfg(module_basename, module, cfg, N, M, pool_names):
     # translate the boot_* flags to the estimator's option names
     boot_cfg.boot_method = cfg.boot_method
     boot_cfg.max_count = N               # the estimator's address space = the pool
-    boot_cfg.candidate_sample_size = M   # informational (xhat is already in hand)
+    # Disjointness from the xhat records is already enforced positionally
+    # (pool_names = all_names[M:M+N]), so within the estimator's 0..N-1 space
+    # every record is an eligible pool record: no candidate block to reserve.
+    # (candidate_sample_size drives boot_sp.eligible_scenarios, which must be a
+    # no-op here; setting it to M would wrongly re-exclude N..N+M and trip the
+    # sample_size + candidate_sample_size <= max_count check.)
+    boot_cfg.candidate_sample_size = 0
     boot_cfg.sample_size = N
     boot_cfg.subsample_size = cfg.get("boot_subsample_size")
     boot_cfg.nB = cfg.get("boot_nB")
