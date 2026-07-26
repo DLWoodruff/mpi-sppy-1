@@ -746,9 +746,24 @@ batch solved to a nonzero gap is read conservatively rather than optimistically
 (`boot_sp.py`: `solve_routine` stashes the bound, `_ef_optimal_value` reads it,
 falling back to the incumbent when the solver reports no bound). This makes the
 inner/outer treatment uniform across `K`: the PR-4 cylinders executor supplies
-its decomposition (outer) bound as `L_b` the same way. The reference `z*` used
-by the coverage simulation (`process_optimal`) intentionally stays the incumbent
-— the best estimate of the true optimum, not a bound.
+its decomposition (outer) bound as `L_b` the same way.
+
+**The reference `z*` is the exception, and it is deliberate.** The reference the
+coverage simulation counts against stays the **incumbent** — the best estimate
+of the true optimum, not a bound — at *both* places that produce it:
+`boot_general_prep.find_optimal`, which writes the `optimal_fname` npy, and
+`boot_sp.process_optimal`, which reads that npy or else computes the reference
+itself. A batch optimal and the reference play opposite roles: the batch optimal
+feeds a reported gap that must not read optimistically, so it takes the
+conservative side, while the reference stands in for the truth a coverage rate
+is measured against, so it wants the best estimate available. Making the
+reference a bound too would shift it the same way the estimators are already
+shifted, so the intervals would cover the reference more often than they cover
+the true gap and the study would report a coverage rate higher than the method
+achieves — hiding the very bound-slack effect §9.4.1 exists to describe. When
+the reference solve has not converged neither side is right (the truth is
+between them), so `find_optimal` reports its residual gap and warns rather than
+silently picking a side.
 
 ### 9.5 Flag names
 

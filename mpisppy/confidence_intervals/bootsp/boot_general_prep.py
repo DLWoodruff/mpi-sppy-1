@@ -16,7 +16,9 @@
 
 import sys
 import json
+import warnings
 import numpy as np
+import pyomo.environ as pyo
 
 import mpisppy.utils.sputils as sputils
 import mpisppy.confidence_intervals.ciutils as ciutils
@@ -25,13 +27,37 @@ import mpisppy.confidence_intervals.bootsp.boot_sp as boot_sp
 
 
 def find_optimal(cfg, module):
+    """The reference optimal z* that a coverage study counts against.
+
+    This is the *incumbent*, deliberately not the outer bound the estimators
+    use for a batch optimal (boot_sp._ef_optimal_value). The two play opposite
+    roles: a batch optimal feeds a reported gap that must not read
+    optimistically, so it takes the conservative side, while the reference z*
+    stands in for the true optimum, so it wants the best available estimate of
+    that optimum. Biasing the reference either way biases the measured
+    coverage, and biasing it toward the bound is the worse of the two here.
+    The estimators already use an outer bound for every batch optimal, so the
+    gaps they report are shifted upward; a reference gap built from an outer
+    bound would be shifted upward too, and the two would move together. The
+    intervals would then cover the reference more often than they cover the
+    true gap, so the study would report a coverage rate higher than the one
+    the method actually achieves -- concealing the bound-slack effect that a
+    coverage study is run to expose.
+
+    Neither side is right when the reference solve has not converged: the truth
+    lies between the incumbent and the bound, so a study built on an unconverged
+    reference is not measuring coverage of anything in particular. Say so.
+    """
     opt_ef = boot_sp.solve_routine(cfg, module, range(cfg.max_count), num_threads=16)
-    # Use the solver's outer bound (the lower bound for a minimization, the upper
-    # bound for a maximization), not the incumbent: a mixed-integer EF left at a
-    # nonzero MIP gap would understate the reference optimality gap. This matches
-    # the treatment of the batch optimals; solve_routine stashes the bound, and
-    # _ef_optimal_value falls back to the incumbent when the solver reports none.
-    opt_obj = boot_sp._ef_optimal_value(opt_ef)
+    opt_obj = pyo.value(opt_ef.EF_Obj)
+    bound = boot_sp._ef_optimal_value(opt_ef)
+    slack = abs(opt_obj - bound)
+    if slack > 1e-6 * max(1.0, abs(opt_obj)) and boot_utils.my_rank == 0:
+        warnings.warn(
+            "the reference optimal solve did not converge: incumbent "
+            f"{opt_obj}, best bound {bound} (gap {slack}). z* lies between "
+            "them, so a coverage study against this reference is not measuring "
+            "coverage of the true optimum. Tighten the solver's gap.")
     return opt_obj
 
 
