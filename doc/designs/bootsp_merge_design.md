@@ -672,9 +672,23 @@ for the value at `xhat`, outer bound for the optimal — is the **reported** gap
 
     ĝ_b = u_b − L_b = (u_b − o_b) + (o_b − L_b) = g_b + δ_b,
 
-the true gap plus a non-negative bound slack. (Maximization mirrors: the value
-at `xhat` is a lower bound, the relaxation an upper bound; take the correct side
-so the reported gap still `≥` the true gap.)
+the true gap plus a non-negative bound slack.
+
+**Maximization is refused, not mirrored.** An earlier draft of this section said
+maximization "mirrors" so that the reported gap is "still `≥` the true gap".
+That is sign-wrong: for a maximization the value at `xhat` is a *lower* bound
+and the outer bound an *upper* one, so `ĝ_b = u_b − L_b ≤ g_b ≤ 0` — larger in
+magnitude, but smaller as a signed quantity. Nothing downstream expects that:
+the estimators report a gap that the drivers floor at 0 (`ci_gap[0] = max(0,
+…)`), which would turn a maximization interval into `[0, 0]`, and the coverage
+harness's one-sided check assumes the same orientation. Per the repo-wide rule
+that maximization either works or raises, this raises:
+`boot_sp._require_minimization` is called from `solve_routine`, which every
+batch goes through while every batch is an extensive form.
+Supporting it properly means choosing how the gap is *reported* — mpi-sppy's MMW
+estimator takes the magnitude, which would keep the gap non-negative in both
+senses and leave the floors and coverage checks untouched — and threading the
+sense through the estimators, `boot_general_prep`, and the smoothed code.
 
 **MIPs carry a slack even at `K = 1`.** It is tempting to treat the `K = 1`
 extensive-form solve as exact, but a mixed-integer EF is solved only to a MIP
