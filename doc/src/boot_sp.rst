@@ -155,10 +155,22 @@ its own bootstrap stream.
 The optimality gap of each batch is its value at ``xhat`` minus the batch's
 optimal. For the optimal the estimators use the solver's **best bound** (an
 outer bound), not the incumbent objective: a mixed-integer batch is solved only
-to a MIP gap, so its incumbent would understate the gap. Using the outer bound
-keeps the interval conservative — never optimistic — and a tighter solver gap
-makes it tighter. (The solver's incumbent is used only where no bound is
-reported.)
+to a MIP gap, so its incumbent would understate the gap. (The solver's
+incumbent is used only where no bound is reported.)
+
+What that buys is a *point* estimate that never understates: the reported gap,
+for each batch and for the pool as a whole, is at least the gap an exact solve
+would report. The interval **endpoints** carry no such guarantee. Each endpoint
+combines the point estimate with a width built from the *spread* of the batch
+gaps, and a bound slack perturbs that spread in either direction; the pivotal
+methods (``Classical_quantile``, ``Subsampling``, ``Extended``) reflect the
+bootstrap quantiles about the point estimate, so a batch slack can move both of
+their endpoints *down*. So do not read the reported interval as conservative.
+
+All of the methods converge to the exact-solve interval as the batch solves
+tighten, so when the interval itself matters, tighten the batch solves (e.g. a
+smaller ``mipgap`` via ``--boot-solver-options``) rather than relying on the
+outer bound to err in a safe direction.
 
 boot_general_prep
 -----------------

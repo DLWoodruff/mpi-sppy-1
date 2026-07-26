@@ -690,14 +690,21 @@ bound the same way an EF's best bound does.
 full-pool "`D`" quantity computed once, `ĝ_D = u_D − L_D = g_D + δ_D`.
 
 - **Classical, Gaussian** — `CI = ĝ_D ± z·std({ĝ_b})`. The center is shifted up
-  by `δ_D` and the spread is inflated by the variability of `δ_b`; both push the
-  same way, so the interval is **conservative** (its upper end over-states the
-  gap) for any `δ ≥ 0`. The clean case.
+  by `δ_D`, which is the safe direction. The half-width is not: `std(·)` is
+  shift-invariant, so it moves only with the *variation* in `δ_b` across
+  batches, and `std({g_b + δ_b})` can land either side of `std({g_b})` —
+  smaller whenever `δ_b` runs opposite to `g_b` (batches whose bound is loosest
+  are not generally the ones whose true gap is largest). So the center is
+  conservative and the endpoints are not guaranteed either way. The cleanest
+  case, but not a clean one.
 - **Classical, quantile (pivotal)** — `CI = quantile(2·ĝ_D − {ĝ_b}, …)`. Here
   `2ĝ_D − ĝ_b = (2g_D − g_b) + (2δ_D − δ_b)`; the slack enters as `2δ_D − δ_b`
   and does **not** cancel, since the full-pool slack `δ_D` and the per-batch
-  slack `δ_b` differ (batches are smaller, so typically `δ_b ≥ δ_D`). Coverage
-  is clean only as `δ → 0`.
+  slack `δ_b` differ (batches are smaller, so typically `δ_b ≥ δ_D`). Note the
+  sign: because the construction reflects the quantiles about the point
+  estimate, it is *decreasing* in the batch gaps, so in the regime this
+  paragraph describes (`δ_b ≥ 2δ_D`) both endpoints move **down** — the
+  optimistic direction. Coverage is clean only as `δ → 0`.
 - **Subsampling** — `CI = ĝ_D − √(m/N)·quantile({ĝ_b − ĝ_D}, …)`; the residual
   `δ_b − δ_D` again does not cancel, and subsample bounds (smaller `m`) are
   looser, so `δ_b` can exceed `δ_D` substantially.
@@ -710,14 +717,22 @@ full-pool "`D`" quantity computed once, `ĝ_D = u_D − L_D = g_D + δ_D`.
 
 **Takeaways.**
 
-1. Every method is **conservative in the point/center sense**: the outer bound
-   never understates the gap (`ĝ_b ≥ g_b`), so the reported gap and the upper end
-   of the interval over-state it — the safe direction for "is `xhat` good
-   enough?", and the code already floors the lower end at 0.
-2. The **Gaussian** method is cleanly conservative for any bound gap.
-3. The **pivotal methods** (classical quantile, subsampling, extended) do not
-   cancel the slack; they recover their coverage guarantee only as the bounds
-   tighten, so they want a controlled batch bound gap.
+1. What the outer bound buys is a conservative **point estimate**, and only
+   that: `ĝ_b ≥ g_b` for every batch and `ĝ_D ≥ g_D` over the pool, so the
+   reported gap never understates the gap an exact solve would report — the
+   safe direction for "is `xhat` good enough?". The code also floors the lower
+   end of the reported interval at 0.
+2. It buys **no guarantee about the interval endpoints**, for any of the
+   methods. Every endpoint is the point estimate combined with a width built
+   from the *spread* of the batch gaps, and the slack perturbs that spread
+   without a sign: `std(·)` and the infinitesimal-jackknife covariance are
+   shift-invariant, and the pivotal constructions are decreasing in the batch
+   gaps outright. Do not describe the reported interval as conservative or
+   "never optimistic".
+3. The **pivotal methods** (classical quantile, subsampling, extended) are the
+   ones that can move in the optimistic direction outright, because reflecting
+   the quantiles flips the sign; they recover their coverage guarantee only as
+   the bounds tighten, so they want a controlled batch bound gap.
 4. **Control the batch outer-bound gap.** If each batch optimal solve reaches a
    small relative gap `ε` (so `δ_b ≲ ε·|L_b|`), all residual slack terms are
    `O(ε)` and the exact-solve theory is recovered as `ε → 0`. The batch relative
