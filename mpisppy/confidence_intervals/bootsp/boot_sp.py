@@ -50,8 +50,10 @@ def _require_minimization(is_minimizing, what):
     """Refuse a maximization model instead of reporting a wrong interval.
 
     Per the repo-wide rule that maximization either works or raises, this is
-    the raise. It is checked in solve_routine, which every extensive form goes
-    through.
+    the raise. It is checked in solve_routine, which every extensive-form path
+    goes through, and once in generic_cylinders' do_boot, which also covers
+    K > 1 -- that path solves each batch with a wheel and so never builds an
+    extensive form for solve_routine to inspect.
     """
     if not is_minimizing:
         raise ValueError(_MAXIMIZATION_MSG.format(what=what))
@@ -82,6 +84,11 @@ def _best_bound(ef, results):
     objective value. That fallback makes the reported optimality gap read
     optimistically (design 9.4.1: the incumbent is an inner bound), which is the
     wrong direction, so warn rather than let it pass silently.
+
+    The K > 1 sibling, boot_batch._outer_bound_over_group, raises on the same
+    condition instead of falling back. The asymmetry is deliberate: an
+    extensive-form solve has an incumbent to fall back to, while a wheel run for
+    its outer bound has nothing to offer in its place.
     """
     try:
         prob = results.problem[0]

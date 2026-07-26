@@ -271,6 +271,15 @@ def do_boot(module_fname, cfg, wheel=None):
 
     boot_cfg = _estimator_cfg(module_basename, module, cfg, batch_cfg, N, M, pool_names)
 
+    # Refuse a maximization model before any batch is solved. boot_sp's
+    # solve_routine makes the same check, but only K=1 builds an extensive form
+    # for it to look at: a K>1 batch is solved by a wheel, so probe one scenario
+    # here instead. It is built exactly as the batches build theirs.
+    probe = module.scenario_creator(pool_names[0], **module.kw_creator(boot_cfg))
+    boot_sp._require_minimization(
+        sputils.find_active_objective(probe).is_minimizing(),
+        f"module {module_basename}")
+
     result = boot_sp.compute_ci(boot_cfg, module, xhat, executor=executor)
 
     if global_rank == 0:

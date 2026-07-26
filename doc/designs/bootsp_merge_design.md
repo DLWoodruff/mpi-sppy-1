@@ -284,11 +284,13 @@ Behavior-preserving unless noted.
     pool stream, and the sequential seed offsets used by the coverage
     simulation reuse batch streams across replications (replication k on
     rank r has the same stream as replication k+1 on rank r-1). The port
-    seeds every stream with a `(seed_offset, word)` pair
-    (`boot_sp._pool_rng` / `_batch_rng`), which numpy's `SeedSequence`
-    hashes into independent streams; no two streams coincide within a
-    run or across seed offsets, and `_extended_resample`'s special
-    `+ my_rank + 1` offset is retired.
+    seeds every stream with a `(seed_offset, word)` pair, which numpy's
+    `SeedSequence` hashes into independent streams; no two streams
+    coincide within a run or across seed offsets, and
+    `_extended_resample`'s special `+ my_rank + 1` offset is retired.
+    The pool/center stream is `boot_sp._pool_rng` (word 0) and the batch
+    streams come from `BatchExecutor.group_seed` (word `group_index + 1`,
+    which at `K = 1` is the rank, so the per-rank streams are unchanged).
 12. **Real json booleans.** boot-sp's `cfg_from_json` accepts only the
     strings `"True"`/`"False"` for bool options and crashes with an
     `AttributeError` on a real json `true`/`false`; a json missing
@@ -703,8 +705,10 @@ the estimators report a gap that the drivers floor at 0 (`ci_gap[0] = max(0,
 …)`), which would turn a maximization interval into `[0, 0]`, and the coverage
 harness's one-sided check assumes the same orientation. Per the repo-wide rule
 that maximization either works or raises, this raises:
-`boot_sp._require_minimization` is called from `solve_routine`, which every
-batch goes through while every batch is an extensive form.
+`boot_sp._require_minimization` is called from `solve_routine` (every extensive
+form) and once from `do_boot` on a probe scenario, which is what covers
+`K > 1`, where a batch is solved by a wheel and no extensive form is ever built
+for `solve_routine` to inspect.
 Supporting it properly means choosing how the gap is *reported* — mpi-sppy's MMW
 estimator takes the magnitude, which would keep the gap non-negative in both
 senses and leave the floors and coverage checks untouched — and threading the
