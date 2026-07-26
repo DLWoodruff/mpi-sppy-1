@@ -11,6 +11,8 @@
 # the smoothed methods arrive in a follow-on merge.
 
 import os
+import math
+import warnings
 from statistics import NormalDist
 import numpy as np
 from numpy.random import default_rng
@@ -67,19 +69,31 @@ def _name_of_position_fn(cfg):
 def _best_bound(ef, results):
     """The solver's outer bound on the EF objective.
 
-    Lower bound for a minimization, upper bound for a maximization; falls back
-    to the incumbent objective value when the solver reports no bound.
+    Lower bound for a minimization, upper bound for a maximization.
+
+    A solver that reports no bound and one that reports an infinite bound have
+    proved the same thing -- nothing -- so both fall back to the incumbent
+    objective value. That fallback makes the reported optimality gap read
+    optimistically (design 9.4.1: the incumbent is an inner bound), which is the
+    wrong direction, so warn rather than let it pass silently.
     """
-    bound = None
     try:
         prob = results.problem[0]
-        bound = prob.lower_bound if ef.EF_Obj.sense == pyo.minimize \
+        raw = prob.lower_bound if ef.EF_Obj.sense == pyo.minimize \
             else prob.upper_bound
-    except (AttributeError, IndexError, KeyError, TypeError):
+        bound = float(raw)
+    except (AttributeError, IndexError, KeyError, TypeError, ValueError):
         bound = None
-    if bound is None:
-        return pyo.value(ef.EF_Obj)
-    return float(bound)
+    if bound is not None and math.isfinite(bound):
+        return bound
+    if my_rank == 0:
+        # message kept constant so the default warning filter shows it once
+        warnings.warn(
+            "a bootstrap batch solve reported no usable outer bound (none, or "
+            "an infinite one); falling back to the incumbent objective, which "
+            "makes the reported optimality gap optimistic. Check the batch "
+            "solver settings -- e.g. a time limit reached before any bound.")
+    return pyo.value(ef.EF_Obj)
 
 
 def _ef_optimal_value(ef):

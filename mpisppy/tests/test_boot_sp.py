@@ -205,6 +205,35 @@ class Test_boot_sp(unittest.TestCase):
         self.assertIn("xhat_generator", msg)
         self.assertIn("xhat_generator_no_generator_module", msg)
 
+    def test_best_bound_falls_back_when_no_bound_is_proved(self):
+        # a solver reporting no bound and one reporting an infinite bound have
+        # proved the same thing, so both fall back to the incumbent -- and warn,
+        # because that fallback makes the reported gap optimistic
+        import warnings
+        import pyomo.environ as pyo
+
+        ef = pyo.ConcreteModel()
+        ef.x = pyo.Var(initialize=4.0)
+        ef.EF_Obj = pyo.Objective(expr=ef.x, sense=pyo.minimize)
+
+        def results(lb):
+            return types.SimpleNamespace(
+                problem=[types.SimpleNamespace(lower_bound=lb, upper_bound=lb)])
+
+        # a real bound is used as-is, with no warning
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            self.assertEqual(boot_sp._best_bound(ef, results(2.5)), 2.5)
+        self.assertEqual([x for x in w if "outer bound" in str(x.message)], [])
+
+        for missing in (None, float("-inf")):
+            with warnings.catch_warnings(record=True) as w:
+                warnings.simplefilter("always")
+                self.assertEqual(boot_sp._best_bound(ef, results(missing)), 4.0)
+            if boot_utils.my_rank == 0:
+                self.assertTrue(any("outer bound" in str(x.message) for x in w),
+                                msg=f"no warning for bound={missing}")
+
     def test_solve_routine_rejects_maximization(self):
         # The estimators form the gap as (value at xhat) - (optimal), which is
         # non-positive for a maximization, and the drivers floor the reported
