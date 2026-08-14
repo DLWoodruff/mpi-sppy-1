@@ -33,10 +33,9 @@ every extension a chance to change rho, fix variables, relax domains, or add
 cuts. Any list of things to rewind is a list of the extensions someone has
 thought about so far.
 
-Writing at ``enditer`` sidesteps all of it. ``enditer`` fires after the solve,
-so a checkpoint written there always describes a *completed* iteration, no
-matter which extensions are loaded or what they touched. The invariant is one
-sentence and it holds by construction.
+Writing after the solve sidesteps all of it: a checkpoint written there always
+describes a *completed* iteration, no matter which extensions are loaded or
+what they touched. The invariant is one sentence and it holds by construction.
 
 The cost is a model serialization per checkpoint rather than one per run. That
 is the deliberate trade: correctness that needs no knowledge of any extension.
@@ -61,25 +60,21 @@ objective after the last extension hook available to us, so a checkpoint taken
 during it would capture a model whose objective is not yet the one PH iterates
 on.
 
-**Extension order matters, and this one is attached first.**
-``MultiExtension`` dispatches ``enditer`` in the order extensions were
-attached, and ``add_checkpointing`` runs at the end of ``ph_hub`` -- before
-``configure_extensions`` appends anything else -- so the Checkpointer's
-``enditer`` fires before the others'. Any extension whose ``enditer`` *changes
-a scenario model* (rho, nonant fixedness, domains, cuts) therefore makes that
-change after the checkpoint for that iteration has been written: the change is
-absent from the checkpoint, and a resume from it never re-applies the change,
-because ``enditer`` for that iteration has already run.
+**The write does not depend on extension order.** It happens in
+``maybe_checkpoint``, a hook of this extension's own that ``iterk_loop`` calls
+directly once the iteration is over -- after every extension's ``enditer``,
+including those of user extensions supplied with
+``--user-defined-extensions``. So whatever an extension changes on a scenario
+model in its ``enditer`` (rho, nonant fixedness, domains, cuts) is part of the
+checkpoint for that iteration, and a resume picks it up. Dispatching the write
+from an ``enditer`` instead would have made that depend on the order
+extensions were attached in, and lost any change made by a later one: a resume
+starts at the next iteration, so the ``enditer`` that made the change never
+runs again.
 
-No shipped extension is affected -- every ``enditer`` in the tree is a no-op or
-read-only (the xhat evaluators do their work in ``post_everything``, which is
-also why an xhat evaluation cannot contaminate a checkpoint). The exposure is a
-user extension supplied with ``--user-defined-extensions``, which is appended
-after the Checkpointer: if its ``enditer`` mutates models, attach it *before*
-the Checkpointer so its changes land in the checkpoint. The durable fix is to
-stop depending on dispatch order at all, by writing from a dedicated hook in
-``iterk_loop``; that is scheduled with the cylinders work, which needs the same
-hook for the xhatter loop (design section 9, item 8, and section 11 phase 4).
+The same hook is what the xhatter spokes call once per pass through their main
+loops, which have no ``enditer`` to borrow: one Checkpointer serves the hub
+and the spokes.
 
 See ``doc/designs/checkpointing_design.md``.
 """
@@ -183,10 +178,10 @@ class Checkpointer(Extension):
         """True when the loop bound says this completed iteration is the last.
 
         ``iterk_loop`` runs ``range(_resume_iteration + 1, PHIterLimit + 1)``,
-        so at ``enditer`` of the limit iteration there is no next pass. Only
-        the iteration limit is knowable here: convergence, the user converger
-        and ``--time-limit`` are all decided in the *next* iteration's top
-        half, and the cylinder-convergence test fires after this hook.
+        so at the end of the limit iteration there is no next pass. Only the
+        iteration limit is knowable here: convergence, the user converger and
+        ``--time-limit`` are all decided in the *next* iteration's top half,
+        and the cylinder-convergence test fires after this hook.
         """
         limit = self.opt.options.get("PHIterLimit", None)
         if limit is None:
@@ -207,7 +202,7 @@ class Checkpointer(Extension):
         iteration = int(getattr(self.opt, "_PHIter", 0))
         return iteration % self.every == 0 or self._is_final_iteration()
 
-    def enditer(self):
+    def maybe_checkpoint(self):
         """Write the checkpoint if this iteration is a checkpoint point.
 
         See the module docstring for why the write lives here.

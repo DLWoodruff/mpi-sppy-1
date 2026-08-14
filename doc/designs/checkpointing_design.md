@@ -521,9 +521,11 @@ domains or add cuts, so any list of things to rewind is a list of the extensions
 someone has thought about so far — an implementation attempt unwound `W`, then
 needed `rho`, then nonant fixedness, with domains and cuts next.
 
-Writing at `enditer`, after the solve, sidesteps all of it: the checkpoint
-always describes a *completed* iteration, whatever extensions are loaded and
-whatever they touched. The invariant is one sentence and holds by construction.
+Writing after the solve — from `maybe_checkpoint`, the dedicated hook
+`iterk_loop` fires once every `enditer` has run — sidesteps all of it: the
+checkpoint always describes a *completed* iteration, whatever extensions are
+loaded and whatever they touched. The invariant is one sentence and holds by
+construction.
 
 Consequences, all deliberate:
 
@@ -549,7 +551,7 @@ Consequences, all deliberate:
   solving. A *transient* failure at an iteration boundary — disk full, an NFS
   hiccup — is different: the previously published generation is untouched and
   remains resumable, while the optimization progress a raise would destroy
-  lives only in memory. So `Checkpointer.enditer` catches the write error,
+  lives only in memory. So `Checkpointer.maybe_checkpoint` catches the write error,
   reports it loudly, and retries at the next iteration boundary.
 - The **incidental benefit**: because every write now precedes any
   `post_everything`, an xhat evaluation can no longer contaminate a checkpoint,
@@ -578,7 +580,7 @@ bound. Resuming with a raised `--max-iterations` is an explicitly supported
 workflow (`max_iterations` is non-structural), and that final iterate is
 coherent and already in memory; discarding it to save a single write would be
 a real loss for the most ordinary way a study gets extended. The limit is the
-only stop knowable at `enditer` — convergence, the user converger and
+only stop knowable at the hook — convergence, the user converger and
 `--time-limit` are all decided in the *next* iteration's top half, and the
 cylinder-convergence test fires after the hook.
 
@@ -781,31 +783,44 @@ Touch-points an implementation needs beyond the PoC's extension/subclass hacks:
    itself is the in-core resume branch (item 2), with extension
    `restore_state` hooks (item 3) fired from it before `iterk_loop`:
    - *periodic* (`--checkpoint-every-iterations` / `--checkpoint-every-seconds`) —
-     at `enditer`. The seconds trigger tests
+     at the checkpoint hook. The seconds trigger tests
      `allreduce_or(now − last_checkpoint ≥ S)` so all ranks decide together
      (mirroring the `time_limit` check in `phbase.py`), avoiding a rank-skew
      deadlock at the write barrier.
-   - *anticipated one-shot* (`--checkpoint-before-seconds`) — also at `enditer`,
+   - *anticipated one-shot* (`--checkpoint-before-seconds`) — also at the hook,
      testing `allreduce_or(elapsed + last_iteration_seconds ≥ S)` with the same
      collective pattern, then latching so it fires at most once (§8). It needs the
      most-recent iteration duration (item 9); everything else it shares with the
      periodic path.
-   - *at each completed iteration* — in `enditer`, which fires after the
-     subproblem solve and is therefore the only point in the loop where the
-     dual weights and the nonants describe the same iteration (§8). There is
-     no terminal trigger and no `--checkpoint-at-termination` flag: the flag
-     was removed when the write moved, having briefly survived as a registered,
-     documented option that nothing read.
+   - *at each completed iteration* — after the subproblem solve, the only point
+     in the loop where the dual weights and the nonants describe the same
+     iteration (§8). There is no terminal trigger and no
+     `--checkpoint-at-termination` flag: the flag was removed when the write
+     moved, having briefly survived as a registered, documented option that
+     nothing read.
 
-   For spokes, the xhatter `main()` loop calls no per-iteration extension hook —
-   add a single `self.opt.extobject.enditer()` (or a dedicated checkpoint hook)
-   inside it so **one `Checkpointer` serves hub and xhatter uniformly** (restore
-   already has a home: `pre_iter0`/`post_iter0` fire once in `xhat_prep` in
-   `xhatbase.py`).
+   **The write has its own hook, `maybe_checkpoint`** (*implemented*), rather
+   than riding on `enditer`. `iterk_loop` calls it directly, after every
+   extension's `enditer`, so what a checkpoint holds no longer depends on the
+   order extensions were attached in — including a model change a *user*
+   extension makes in its own `enditer`, which the earlier `enditer`-dispatched
+   write dropped for good (a resume starts at the next iteration, so that hook
+   never runs again). `enditer_after_sync` is not a substitute: it is skipped on
+   the cylinder-convergence break, so a run ending that way would write nothing.
+
+   The xhatter `main()` loops have no `enditer` to borrow, so they call the same
+   hook (via `XhatInnerBoundBase.maybe_checkpoint`) once per pass, at the bottom
+   — plus once on xhatshuffle's mid-pass kill-signal `return`, the one exit that
+   skips it. That is what makes **one `Checkpointer` serve hub and xhatter
+   uniformly** (restore already has a home: `pre_iter0`/`post_iter0` fire once
+   in `xhat_prep` in `xhatbase.py`). The other spokes have no checkpoint hook
+   yet: `slam_heuristic` is an inner-bound spoke that is not an xhatter, and the
+   lagrangian/lagranger loops call `enditer` per pass but nothing calls
+   `maybe_checkpoint` for them (§5.6 lists what they would carry).
 9. **Most-recent iteration duration kept on `self`.** `iterk_loop` (`phbase.py`)
    times each iteration into a *local* `iteration_start_time`, used only by the
    `display_progress` print. `--checkpoint-before-seconds` needs that duration at
-   `enditer`, so record it on the object (e.g. `self._last_iteration_seconds`) as
+   the checkpoint hook, so record it on the object (e.g. `self._last_iteration_seconds`) as
    each iteration completes — and record iteration 0's duration the same way, since
    it is the seed the first time the trigger is tested (§8). Nothing else in PH
    changes: no new hook, no change to the loop's control flow.
@@ -973,7 +988,7 @@ as a branch stacked on the 1a PR.
   attach disarmed, `saved_objectives` refreshed, and the warm start set (§5.1, §9
   item 2); restore of the initially-fixed-nonant baseline by name (§9 item 11);
   geometry+cfg fingerprint (§5.7); atomic per-rank writes + manifest publish (§9
-  item 7); the write at each completed iteration from `enditer` (§8); `toc` on
+  item 7); the write at each completed iteration (§8); `toc` on
   both ends of every write (§9 item 10); and setup-time refusal of every
   configuration not supported — a non-PH hub (APH inherits this wiring through
   `aph_hub`), more than one rank, an unimplemented backend, an unwritable
@@ -986,9 +1001,9 @@ as a branch stacked on the 1a PR.
 - **Phase 1b — The optional triggers and the harder instances.**
   `--checkpoint-every-iterations` / `--checkpoint-every-seconds` and the one-shot
   anticipated `--checkpoint-before-seconds` (§8), all decided collectively at
-  `enditer`, with the most-recent iteration duration hoisted onto `self` (§9 item
-  9). Tests: trigger semantics (fires once and latches; two triggers at one
-  `enditer` produce one write); **farmer + `--cvar`** bit-identical A vs B — the
+  the checkpoint hook, with the most-recent iteration duration hoisted onto
+  `self` (§9 item 9). Tests: trigger semantics (fires once and latches; two
+  triggers at one checkpoint point produce one write); **farmer + `--cvar`** bit-identical A vs B — the
   mutate-after-creation case, where the resume branch's `saved_objectives`
   refresh must resolve to `WITH_CVAR` and not the deactivated original;
   **`sizes`** (MIP) — bit-identical under deterministic solver settings, and
@@ -1009,23 +1024,26 @@ as a branch stacked on the 1a PR.
   (Model-attached `fixer` counter and nonant fixedness ride in the dill.) Test: PH
   + norm-rho-updater, PH + `fixer`, PH + `slammer` each resume with state intact
   and consistent with variable fixedness.
-- **Phase 4 — Cylinders / spokes.** One-line xhatter write hook; unified
-  `Checkpointer` on spoke opts; each spoke checkpoints its own **best xhat** (by
-  name) asynchronously on improvement — no hub↔spoke coordination (§9, item 6).
-  **Also move the hub write onto that same dedicated hook.** Phase 1a writes
-  from the `Checkpointer`'s `enditer`, and `MultiExtension` dispatches
-  `enditer` in attach order with the `Checkpointer` first (`add_checkpointing`
-  runs at the end of `ph_hub`, before `configure_extensions` appends the rest),
-  so a *user* extension whose `enditer` mutates models does so after that
-  iteration's checkpoint was written, and a resume never re-applies it. No
-  shipped extension is affected — every `enditer` in the tree is a no-op or
-  read-only — so phase 1a documents the constraint instead of reordering. A
-  dedicated call in `iterk_loop` removes the dispatch-order dependency for
-  every driver at once, not just the `do_decomp` path, and this phase is
-  already adding the equivalent hook to the xhatter loop, so the two land
-  together. Note `enditer_after_sync` is *not* a substitute: it fires after the
-  `spcomm.is_converged()` break, so a run ending on cylinder convergence would
-  write nothing.
+- **Phase 4 — Cylinders / spokes.**
+  - *The write hook — implemented.* `Extension.maybe_checkpoint`, called
+    directly by `iterk_loop` (after every `enditer`) and once per pass by each
+    xhatter's `main()` loop through `XhatInnerBoundBase.maybe_checkpoint`. The
+    hub write moved onto it, which is what removes the dispatch-order
+    dependency phase 1a had to document: `MultiExtension` dispatched `enditer`
+    in attach order with the `Checkpointer` first (`add_checkpointing` runs at
+    the end of `ph_hub`, before `configure_extensions` appends the rest), so a
+    *user* extension whose `enditer` mutated models did so after that
+    iteration's checkpoint was written, and a resume never re-applied it. No
+    shipped extension was affected — every `enditer` in the tree is a no-op or
+    read-only — so phase 1a documented the constraint instead of reordering.
+    The dedicated call fixes it for every driver at once, not just the
+    `do_decomp` path.
+  - *Still to do.* Unified `Checkpointer` on spoke opts (its `__init__`
+    currently refuses anything that is not a PH hub, so it cannot yet be
+    attached to a spoke); each spoke checkpoints its own **best xhat** (by
+    name) asynchronously on improvement — no hub↔spoke coordination (§9,
+    item 6) — and reloads it on resume.
+
   Tests (the §11.1 A/B harness on cylinders): farmer/`sizes`
   (hub+lagrangian+xhatshuffle) stop+resume — hub primal trajectory compared A
   vs B (bit-identical for farmer, per the §6 PoC), best xhat preserved, bounds

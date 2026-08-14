@@ -28,6 +28,7 @@ import json
 import os
 import shutil
 import tempfile
+import types
 import unittest
 from unittest import mock
 
@@ -134,6 +135,20 @@ class MidIterMutator(Extension):
                 first.fix(first._value)
 
 
+class EndIterMutator(Extension):
+    """Mutate model state in enditer, which a user extension is free to do.
+
+    Shipped extensions all keep enditer read-only, so this stands in for the
+    one supplied with --user-defined-extensions. It compounds, so a checkpoint
+    taken before this hook and one taken after are never equal.
+    """
+
+    def enditer(self):
+        for s in self.opt.local_scenarios.values():
+            for ndn_i in s._mpisppy_data.nonant_indices:
+                s._mpisppy_model.rho[ndn_i]._value *= 1.05
+
+
 class PreIter0Tagger(Extension):
     """Tag the models pre_iter0 sees, so a test can tell whether the hook ran
     on the models the run actually iterates or on fresh ones a resume splice
@@ -152,6 +167,8 @@ def _extension_class(name):
         return NormRhoUpdater
     if name == "miditer_mutator":
         return MidIterMutator
+    if name == "enditer_mutator":
+        return EndIterMutator
     if name == "recorder":
         return StateRecorder
     if name == "coeff_rho":
@@ -1276,6 +1293,194 @@ class TestResumeExtensionBehavior(unittest.TestCase):
         must not take the run down."""
         self._assert_write_failure_is_survived(
             OSError(errno.ENOSPC, "No space left on device"))
+
+
+class _HookRecorder(Extension):
+    """Counts maybe_checkpoint calls without writing anything."""
+
+    def __init__(self, opt=None):
+        self.opt = opt
+        self.calls = 0
+
+    def maybe_checkpoint(self):
+        self.calls += 1
+
+
+class TestCheckpointHookDispatch(unittest.TestCase):
+    """The dedicated hook exists on the extension interface and dispatches."""
+
+    def test_base_extension_hook_is_a_noop(self):
+        Extension(None).maybe_checkpoint()   # must not raise
+
+    def test_multiextension_dispatches_to_every_extension(self):
+        from mpisppy.extensions.extension import MultiExtension
+        multi = MultiExtension(None, [])
+        recorders = [_HookRecorder(), _HookRecorder()]
+        multi.extdict = {"a": recorders[0], "b": recorders[1]}
+        multi.maybe_checkpoint()
+        self.assertEqual([r.calls for r in recorders], [1, 1])
+
+    def _spoke_stub(self, extensions):
+        from mpisppy.cylinders.xhatbase import XhatInnerBoundBase
+        recorder = _HookRecorder()
+        stub = types.SimpleNamespace(
+            opt=types.SimpleNamespace(extensions=extensions,
+                                      extobject=recorder))
+        XhatInnerBoundBase.maybe_checkpoint(stub)
+        return recorder
+
+    def test_spoke_hook_fires_when_extensions_are_attached(self):
+        self.assertEqual(self._spoke_stub(Extension).calls, 1)
+
+    def test_spoke_hook_is_silent_without_extensions(self):
+        # A spoke with no extensions is the common case; it must not blow up
+        # on the extobject that does not exist.
+        self.assertEqual(self._spoke_stub(None).calls, 0)
+
+
+class TestXhatterLoopsOfferCheckpointPoints(unittest.TestCase):
+    """Every xhatter spoke loop reaches the hook on every pass.
+
+    The hub gets its checkpoint points from iterk_loop; the xhatter loops are
+    not PH iterations and had no hook at all, so these pin the calls that give
+    a spoke somewhere to write its incumbent from. The loops are driven
+    against stubs -- a real spoke needs MPI windows and a hub to talk to --
+    but the loop bodies themselves are the shipped ones.
+    """
+
+    def _drive(self, cls, options, kill_after, prep=None, extra=None):
+        """Run cls.main() for kill_after passes; return the hook recorder."""
+        spoke = object.__new__(cls)
+        recorder = _HookRecorder()
+        spoke.opt = types.SimpleNamespace(
+            options=options, extensions=Extension, extobject=recorder)
+        spoke.global_rank = 0
+        spoke.cylinder_rank = 0
+        spoke.verbose = False
+        # False for kill_after passes, then True to end the loop.
+        kills = [False] * kill_after + [True]
+        spoke.got_kill_signal = lambda: kills.pop(0)
+        spoke.update_nonants = lambda: False
+        spoke.xhat_prep = lambda: (prep if prep is not None
+                                   else types.SimpleNamespace())
+        spoke._try_average_scenario_xhat = lambda: None
+        spoke._try_feasible_xhat = lambda: None
+        if extra is not None:
+            extra(spoke)
+        cls.main(spoke)
+        return recorder
+
+    def test_xhatlooper(self):
+        from mpisppy.cylinders.xhatlooper_bounder import XhatLooperInnerBound
+        recorder = self._drive(
+            XhatLooperInnerBound,
+            {"xhat_looper_options": {"scen_limit": 1}}, kill_after=3)
+        self.assertEqual(recorder.calls, 3)
+
+    def test_xhatxbar(self):
+        from mpisppy.cylinders.xhatxbar_bounder import XhatXbarInnerBound
+        recorder = self._drive(XhatXbarInnerBound, {}, kill_after=3)
+        self.assertEqual(recorder.calls, 3)
+
+    def test_xhatspecific(self):
+        from mpisppy.cylinders.xhatspecific_bounder import (
+            XhatSpecificInnerBound)
+        recorder = self._drive(
+            XhatSpecificInnerBound,
+            {"xhat_specific_options": {"xhat_scenario_dict": {"ROOT": "s0"}}},
+            kill_after=3)
+        self.assertEqual(recorder.calls, 3)
+
+    def _shuffle_options(self):
+        return {"xhat_looper_options": {"reverse": True, "iter_step": None,
+                                        "xhat_solver_options": None}}
+
+    def _shuffle_extra(self, spoke, kills=None):
+        import random
+        spoke.random_seed = 42
+        spoke.random_stream = random.Random()
+        spoke.opt.all_scenario_names = ["s0", "s1", "s2"]
+        # A two-stage tree: ROOT's kids are leaves, so ScenarioCycler stays in
+        # its non-multistage branch and needs nothing else from the tree.
+        spoke.opt.nonleaves = {"ROOT": types.SimpleNamespace(kids=[])}
+        spoke._nonant_len_receive_buffer = types.SimpleNamespace(
+            id=lambda: 1)
+        spoke.try_scenario_dict = lambda _: False
+
+    def test_xhatshuffle(self):
+        from mpisppy.cylinders.xhatshufflelooper_bounder import (
+            XhatShuffleInnerBound)
+        recorder = self._drive(
+            XhatShuffleInnerBound, self._shuffle_options(), kill_after=3,
+            extra=self._shuffle_extra)
+        self.assertEqual(recorder.calls, 3)
+
+    def test_xhatshuffle_kill_between_tries_still_offers_a_point(self):
+        """The one exit that skips the bottom of the loop.
+
+        xhatshuffle re-checks the kill signal between its two tries and
+        returns from the middle of the pass. The try just above it may have
+        improved the incumbent, so that improvement would never be offered a
+        write.
+        """
+        from mpisppy.cylinders.xhatshufflelooper_bounder import (
+            XhatShuffleInnerBound)
+
+        def extra(spoke):
+            self._shuffle_extra(spoke)
+            spoke.update_nonants = lambda: True
+            # localnonants is a read-only property over this buffer.
+            spoke._nonant_len_receive_buffer = types.SimpleNamespace(
+                id=lambda: 1, value_array=lambda: None)
+            spoke.opt._put_nonant_cache = lambda _: None
+            spoke.opt._restore_nonants = lambda **kwargs: None
+            # while-condition, then the mid-pass re-check.
+            kills = [False, True]
+            spoke.got_kill_signal = lambda: kills.pop(0)
+
+        recorder = self._drive(
+            XhatShuffleInnerBound, self._shuffle_options(), kill_after=0,
+            extra=extra)
+        self.assertEqual(recorder.calls, 1)
+
+
+@unittest.skipIf(not solver_available,
+                 "no solver is available for the hook placement test")
+class TestCheckpointHookPlacement(unittest.TestCase):
+    """What the hub writes does not depend on extension attach order."""
+
+    STOP = 3
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.ckpt_dir = os.path.join(self._tmp.name, "ckpt")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_enditer_model_changes_are_in_the_checkpoint(self):
+        """An extension that changes a model in enditer is checkpointed.
+
+        The Checkpointer is attached first, so dispatching the write from an
+        enditer would put it ahead of this extension's: the checkpoint would
+        hold the rho of the iteration before, and because a resume starts at
+        the *next* iteration, the scaling of the last one would be lost for
+        good.
+        """
+        stopped = _make_ph(_options(self.STOP, ckpt_dir=self.ckpt_dir),
+                           extension_name="enditer_mutator")
+        stopped.ph_main()
+
+        # max_iterations == STOP: the loop body never runs, so the resumed
+        # state is exactly what the checkpoint held.
+        resumed = _make_ph(_options(self.STOP, resume_from=self.ckpt_dir),
+                           extension_name="enditer_mutator")
+        resumed.ph_main()
+
+        self.assertEqual(
+            _primal_snapshot(resumed), _primal_snapshot(stopped),
+            msg="the checkpoint was written before the last enditer, so the "
+                "model change that hook made is missing from it")
 
 
 class TestUnknownBackend(unittest.TestCase):
