@@ -11,10 +11,11 @@ Checkpointing is entirely opt-in. With no ``--checkpoint-dir`` the machinery is
 not attached at all, and a run that does not ask for it pays nothing.
 
 .. note::
-   The current implementation covers a **serial PH hub**. Multi-rank runs,
-   bundles, and cylinder (hub-and-spoke) runs are planned but not yet
-   supported. See ``doc/designs/checkpointing_design.md`` for the full design
-   and the phased rollout.
+   The current implementation covers a **PH hub with one rank per cylinder**,
+   run on its own or with spokes. Giving any cylinder more than one rank is
+   refused at startup, and bundles and stoch-ADMM are not yet validated. See
+   ``doc/designs/checkpointing_design.md`` for the full design and the phased
+   rollout.
 
 Writing a checkpoint
 --------------------
@@ -158,6 +159,19 @@ bug.
 Bounds and the incumbent are carried forward as valid best-so-far values. A
 resumed run never reports a worse best-so-far than its checkpoint.
 
+In a cylinders run the best solution does not live on the hub: the xhat spoke
+that found it holds it. So each xhat spoke keeps its own small file under
+``spokes/`` in the checkpoint directory, holding the best solution it has
+found, written by variable name whenever that solution improves. A resumed
+spoke reads it back and reports it to the hub, which is why a resumed
+cylinders run starts from the answer it already had rather than from nothing.
+
+Those files are deliberately not synchronised with the hub's: a spoke writes
+when it improves, the hub writes at iteration boundaries, and neither waits
+for the other. A spoke whose file is missing -- because the earlier run
+stopped before it found anything, or because you resumed with a different set
+of spokes -- simply starts without an incumbent and says so in the log.
+
 On a deterministic LP or QP solve the primal trajectory can come back
 bit-identical, but that is a bonus rather than the guarantee.
 
@@ -224,7 +238,7 @@ names the offending rule.
 
 **The synchronous PH hub only.** ``--APH`` and the other hub types are refused
 at startup when either ``--checkpoint-dir`` or ``--resume-from`` is given, as
-is a hub with more than one rank, an unwritable directory, an unimplemented
+is any cylinder with more than one rank, an unwritable directory, an unimplemented
 backend, scenario names that would collide once made filename-safe, and any
 configuration where the checkpointing extension would not actually be
 attached. The intent is that checkpointing either works or says so at startup,

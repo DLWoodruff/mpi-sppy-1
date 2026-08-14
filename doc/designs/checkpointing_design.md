@@ -1038,11 +1038,21 @@ as a branch stacked on the 1a PR.
     read-only — so phase 1a documented the constraint instead of reordering.
     The dedicated call fixes it for every driver at once, not just the
     `do_decomp` path.
-  - *Still to do.* Unified `Checkpointer` on spoke opts (its `__init__`
-    currently refuses anything that is not a PH hub, so it cannot yet be
-    attached to a spoke); each spoke checkpoints its own **best xhat** (by
-    name) asynchronously on improvement — no hub↔spoke coordination (§9,
-    item 6) — and reloads it on resume.
+  - *The spoke incumbent — implemented.* One `Checkpointer` now attaches to
+    an xhat spoke's `Xhat_Eval` as well as to the PH hub. On a spoke it writes
+    `spokes/spoke_<cylinder>_strata_<II>_rank_<RRRR>.pkl` — the best solution
+    by variable name, per-scenario inner bounds, and the two incumbent
+    objectives — whenever the incumbent improves, latest-wins, with no
+    hub↔spoke coordination (§9, item 6). It restores in `pre_iter0` (which
+    `xhat_prep` calls once) and publishes the restored bound to the hub at the
+    first checkpoint point, so the hub's inner bound and gap reflect the
+    answer the run already had. `--resume-from` without `--checkpoint-dir`
+    attaches the extension with writing switched off, since on a spoke the
+    restore *is* the extension's job.
+  - *Still to do.* The cylinders A/B tests (§11.1 harness), including a
+    stoch-ADMM configuration, and the strata-rank filename means two spokes of
+    the same class no longer collide — but nothing yet checkpoints the
+    non-xhat inner bounder (`slam_heuristic`) or the outer-bound spokes.
 
   Tests (the §11.1 A/B harness on cylinders): farmer/`sizes`
   (hub+lagrangian+xhatshuffle) stop+resume — hub primal trajectory compared A

@@ -8,12 +8,28 @@
 ###############################################################################
 """Write checkpoints so a run can be stopped and resumed later.
 
-Attached only when ``--checkpoint-dir`` is given, so a run that does not ask
-for checkpointing pays nothing at all -- the extension is never constructed and
-none of its hooks exist. This extension decides *when* to write;
-``mpisppy/utils/checkpointing.py`` owns the on-disk format, and the resume
-branch lives in ``PHBase.Iter0`` (restoring has to happen mid-startup, before
-solvers are created).
+Attached only when ``--checkpoint-dir`` or ``--resume-from`` is given, so a run
+that does not ask for checkpointing pays nothing at all -- the extension is
+never constructed and none of its hooks exist. This extension decides *when*
+to write; ``mpisppy/utils/checkpointing.py`` owns the on-disk format.
+
+One class serves two cylinders, because they hold different halves of the
+answer:
+
+* **On the PH hub** it writes the iterate -- the scenario models and the
+  non-model state around them -- at completed iterations. The hub's *restore*
+  is not here: it lives in ``PHBase.Iter0``, because splicing reloaded models
+  in has to happen mid-startup, before solvers are created.
+* **On an xhat spoke** it writes that spoke's best incumbent, by variable
+  name, whenever the incumbent improves, and restores it in ``pre_iter0``
+  (which ``xhat_prep`` calls once before the spoke's loop starts). The hub's
+  checkpoint does not carry the best solution -- that lives in
+  ``best_solution_cache`` on the spoke -- so without this a resumed cylinders
+  run would restore its iterate perfectly and still throw away the answer it
+  had found.
+
+A run that gives ``--resume-from`` without ``--checkpoint-dir`` still gets the
+extension, with writing switched off: reading is a spoke's whole job here.
 
 **A checkpoint is only ever written at an iteration boundary.** That is the
 whole design, and it is worth being explicit about why, because the obvious
@@ -104,10 +120,18 @@ class Checkpointer(Extension):
                 f"writes; 1 writes at every iteration."
             )
 
-        if self.ckpt_dir is None:
+        # Restore-only: --resume-from without --checkpoint-dir. The hub does
+        # not need the extension for that (its resume branch is in Iter0), but
+        # a spoke does -- restoring its incumbent is this extension's job --
+        # and cfg_vanilla attaches it to every cylinder rather than reasoning
+        # about which ones. So a run that only reads is a supported state, and
+        # writing is what gets switched off.
+        self.write_enabled = self.ckpt_dir is not None
+        if not self.write_enabled and not options.get("resume_from", None):
             raise RuntimeError(
                 "Checkpointer was attached without a checkpoint directory. "
-                "It should only be attached when --checkpoint-dir is set."
+                "It should only be attached when --checkpoint-dir or "
+                "--resume-from is set."
             )
         # Everything below fails at setup rather than after a multi-hour run
         # reaches its first write and discovers it cannot finish one.
@@ -117,24 +141,44 @@ class Checkpointer(Extension):
                 f"The only supported backend is "
                 f"'{ckpt.DILL_RELOAD_BACKEND}'."
             )
-        ckpt.require_dill(self.backend)
 
-        # The invariant this design rests on -- enditer fires after the solve,
-        # so W and the nonants agree -- is a property of the *synchronous*
-        # iterk_loop. APH inherits this wiring because aph_hub is built by
-        # calling ph_hub, but its loop dispatches a fraction of the scenarios
-        # per pass, keeps its own hardcoded iteration range that no resume
-        # offset touches, and runs on a worker thread under the listener. A
-        # checkpoint written there would not describe a completed iteration
-        # and a resumed run would renumber from 1, overwriting the checkpoint
-        # it resumed from.
+        # One class, two jobs. On the hub it writes the PH iterate, models and
+        # all. On an xhat spoke it writes only that spoke's best incumbent, by
+        # variable name -- no models, no generations, no dill (which is why
+        # the dill checks below are hub-only).
+        #
+        # The invariant the hub write rests on -- the write happens after the
+        # solve, so W and the nonants agree -- is a property of the
+        # *synchronous* iterk_loop. APH inherits this wiring because aph_hub
+        # is built by calling ph_hub, but its loop dispatches a fraction of
+        # the scenarios per pass, keeps its own hardcoded iteration range that
+        # no resume offset touches, and runs on a worker thread under the
+        # listener. A checkpoint written there would not describe a completed
+        # iteration and a resumed run would renumber from 1, overwriting the
+        # checkpoint it resumed from.
         from mpisppy.opt.ph import PH
-        if not isinstance(opt, PH):
+        from mpisppy.utils.xhat_eval import Xhat_Eval
+        self.spoke_mode = not isinstance(opt, PH)
+        if self.spoke_mode and not isinstance(opt, Xhat_Eval):
             raise RuntimeError(
-                f"Checkpointing currently supports the synchronous PH hub "
-                f"only, but this hub is {type(opt).__name__}. Remove "
+                f"Checkpointing supports the synchronous PH hub and the xhat "
+                f"spokes, but this cylinder is {type(opt).__name__}. Remove "
                 f"--checkpoint-dir, or run PH."
             )
+
+        #: Set once a restored incumbent still needs publishing to the hub.
+        self._publish_restored_bound = None
+        #: The incumbent objective the last write recorded, so an unchanged
+        #: incumbent is not rewritten on every pass of a loop that spins.
+        self._last_written_obj = None
+
+        if not self.spoke_mode and self.write_enabled:
+            ckpt.require_dill(self.backend)
+
+        if not self.write_enabled:
+            # Nothing below is about reading, and a restore-only run must not
+            # inherit refusals that only protect a write.
+            return
 
         # Multi-rank writing is not implemented: every rank would compute the
         # same staging and generation directory and race to create, replace and
@@ -142,11 +186,12 @@ class Checkpointer(Extension):
         # abort the job at its very end with a half-published generation.
         n_proc = getattr(opt, "n_proc", 1)
         if n_proc > 1:
+            what = "spoke" if self.spoke_mode else "hub"
             raise RuntimeError(
-                f"Checkpointing currently supports a single rank per hub, but "
-                f"this hub has {n_proc}. Multi-rank checkpointing is planned; "
-                f"until then, either drop --checkpoint-dir or give the hub a "
-                f"single rank."
+                f"Checkpointing currently supports a single rank per "
+                f"cylinder, but this {what} has {n_proc}. Multi-rank "
+                f"checkpointing is planned; until then, either drop "
+                f"--checkpoint-dir or give every cylinder a single rank."
             )
 
         # Two scenario names that sanitize to the same file name would
@@ -169,10 +214,61 @@ class Checkpointer(Extension):
             ) from exc
 
     def pre_iter0(self):
+        if self.spoke_mode:
+            # xhat_prep calls this once, before the spoke's loop starts, which
+            # is the spoke's equivalent of the hub's resume branch in Iter0.
+            self._restore_incumbent()
+            return
+        if not self.write_enabled:
+            return
         # Prove now that this run's models can actually be checkpointed. A run
         # that only found out at its first write would lose exactly the state
         # checkpointing exists to preserve.
         ckpt.probe_model_is_dillable(self.opt)
+
+    def _spoke_identity(self):
+        """(cylinder name, strata rank) -- what names this spoke's file."""
+        spoke = self.opt.spcomm
+        if spoke is None:
+            raise RuntimeError(
+                "The Checkpointer was attached to a spoke's opt object that "
+                "has no spcomm, so there is no cylinder to write for. This "
+                "extension is attached by cfg_vanilla to cylinders run by "
+                "WheelSpinner."
+            )
+        return type(spoke).__name__, getattr(spoke, "strata_rank", 0)
+
+    def _restore_incumbent(self):
+        """Load this spoke's checkpointed incumbent, if a resume asked for one.
+
+        A missing file is normal and says so once: the run being resumed may
+        have stopped before this spoke found anything. A file that exists but
+        does not match this run raises, exactly as the hub's does.
+        """
+        resume_from = self.opt.options.get("resume_from", None)
+        if not resume_from:
+            return
+        cylinder, strata_rank = self._spoke_identity()
+        rank0 = self.opt.cylinder_rank == 0
+        state = ckpt.load_spoke_incumbent(self.opt, resume_from, cylinder,
+                                          strata_rank)
+        if state is None:
+            global_toc(f"No checkpointed incumbent for {cylinder} in "
+                       f"{resume_from}; this spoke starts without one", rank0)
+            return
+        obj = ckpt.restore_spoke_incumbent(self.opt, state)
+        self.opt.spcomm.best_inner_bound = state["best_inner_bound"]
+        self._last_written_obj = obj
+        # The hub learns bounds only from what a spoke sends, so a restored
+        # incumbent that is never published leaves the hub reporting an
+        # infinite inner bound -- and its gap and convergence tests reading
+        # from it -- until this spoke happens to improve on the answer it
+        # already has. Publishing needs the send buffers, which exist by the
+        # time the loop runs but not necessarily here, so it is deferred to
+        # the first checkpoint point.
+        self._publish_restored_bound = state["best_inner_bound"]
+        global_toc(f"Restored the checkpointed incumbent for {cylinder} "
+                   f"(objective {obj})", rank0)
 
     def _is_final_iteration(self):
         """True when the loop bound says this completed iteration is the last.
@@ -225,6 +321,11 @@ class Checkpointer(Extension):
         names the previous generation, which is intact) or the atomic
         manifest flip itself.
         """
+        if self.spoke_mode:
+            self._spoke_checkpoint()
+            return
+        if not self.write_enabled:
+            return
         if not self._should_write():
             return
         try:
@@ -252,3 +353,48 @@ class Checkpointer(Extension):
         ckpt.write_checkpoint(self.opt, self.ckpt_dir, generation,
                               backend=self.backend)
         global_toc(f"Checkpoint written at iteration {generation}", rank0)
+
+    def _spoke_checkpoint(self):
+        """Publish a restored bound, then write the incumbent if it improved.
+
+        Called once per pass of a loop that spins while it waits on the hub,
+        so the common case has to be cheap: comparing two floats and
+        returning. A write happens only when the incumbent objective differs
+        from the one already on disk.
+
+        Failures warn rather than raise, for the hub's reason and one more:
+        this file is an optimization. Losing it costs a resumed run the
+        answer it had found, which is worth a loud warning and not worth
+        killing a running spoke over.
+        """
+        spoke = self.opt.spcomm
+        if self._publish_restored_bound is not None:
+            bound, self._publish_restored_bound = \
+                self._publish_restored_bound, None
+            if bound is not None:
+                spoke.send_bound(bound)
+                spoke.send_best_xhat()
+
+        obj = getattr(self.opt, "best_solution_obj_val", None)
+        if obj is None or obj == self._last_written_obj:
+            return
+        try:
+            cylinder, strata_rank = self._spoke_identity()
+            path = ckpt.write_spoke_incumbent(
+                self.opt, self.ckpt_dir, cylinder, strata_rank,
+                best_inner_bound=getattr(spoke, "best_inner_bound", None))
+        except Exception as exc:
+            global_toc(
+                f"WARNING: this spoke could not write its incumbent "
+                f"({type(exc).__name__}); the run continues and the next "
+                f"improvement will try again.\n{exc}",
+                self.opt.cylinder_rank == 0)
+            return
+        if path is None:
+            return
+        self._last_written_obj = obj
+        # One line, not the pair the hub prints. The pair exists to measure a
+        # write whose cost a user has to trade off against checkpoint
+        # frequency; this write has no frequency knob and costs a rename.
+        global_toc(f"Checkpointed incumbent (objective {obj})",
+                   self.opt.cylinder_rank == 0)
