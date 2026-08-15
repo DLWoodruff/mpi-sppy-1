@@ -1854,6 +1854,28 @@ class TestCheckpointerSpokeMode(unittest.TestCase):
         self.assertEqual(opt.best_solution_obj_val, 11.0)
         self.assertEqual(spoke.best_inner_bound, 11.0)
 
+    def test_restore_only_run_attempts_no_write(self):
+        """--resume-from with no --checkpoint-dir has nowhere to write.
+
+        The write failure path warns rather than raises, so attempting the
+        write anyway does not fail a run -- it just warns on every
+        improvement for the rest of it, which is how this went unnoticed in a
+        cylinders run until the log was read.
+        """
+        writer = _xhat_eval(ckpt_dir=self.ckpt_dir)
+        _set_and_cache_solution(writer, 17.0)
+        checkpointing.write_spoke_incumbent(
+            writer, self.ckpt_dir, "_SpokeStub", 2, best_inner_bound=17.0)
+
+        opt = _xhat_eval(resume_from=self.ckpt_dir)
+        ext, _ = self._attach(opt)
+        ext.pre_iter0()
+        with mock.patch.object(checkpointing, "write_spoke_incumbent") as write:
+            ext.maybe_checkpoint()
+            _set_and_cache_solution(opt, 3.0)
+            ext.maybe_checkpoint()
+        write.assert_not_called()
+
     def test_restored_bound_is_published_to_the_hub_once(self):
         """The hub learns bounds only from what a spoke sends, so a restored
         incumbent that is never published leaves the hub reporting an

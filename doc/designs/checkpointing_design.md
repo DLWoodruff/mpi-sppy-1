@@ -1054,10 +1054,17 @@ as a branch stacked on the 1a PR.
     answer the run already had. `--resume-from` without `--checkpoint-dir`
     attaches the extension with writing switched off, since on a spoke the
     restore *is* the extension's job.
-  - *Still to do.* The cylinders A/B tests (§11.1 harness), including a
-    stoch-ADMM configuration, and the strata-rank filename means two spokes of
-    the same class no longer collide — but nothing yet checkpoints the
-    non-xhat inner bounder (`slam_heuristic`) or the outer-bound spokes.
+  - *The A/B tests — implemented.* `test_checkpoint_cylinders.py` runs each
+    leg as its own `mpiexec` job (§11.1 asks for a fresh process, and a
+    stopped study really does resume as a new job), driven through
+    `generic_cylinders` by `cylinders_ab_driver.py`. Two configurations:
+    farmer with hub+lagrangian+xhatshuffle, and **stoch-ADMM** (`--stoch-admm`
+    with `xhatxbar`; no FWPH, which does not support variable probability).
+    Both resume bit-identically on the hub's primal state. The spoke reports
+    what it restored, because comparing incumbents alone cannot distinguish a
+    restored one from one the spoke re-found — farmer is deterministic.
+  - *Still to do.* Nothing checkpoints the non-xhat inner bounder
+    (`slam_heuristic`) or the outer-bound spokes.
 
   Tests (the §11.1 A/B harness on cylinders): farmer/`sizes`
   (hub+lagrangian+xhatshuffle) stop+resume — hub primal trajectory compared A

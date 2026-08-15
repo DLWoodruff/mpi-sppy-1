@@ -168,6 +168,10 @@ class Checkpointer(Extension):
 
         #: Set once a restored incumbent still needs publishing to the hub.
         self._publish_restored_bound = None
+        #: The incumbent objective this spoke restored from disk, or None if
+        #: it started without one. Read by tests, which otherwise cannot tell
+        #: a restored incumbent from one the spoke happened to re-find.
+        self.restored_incumbent_obj = None
         #: The incumbent objective the last write recorded, so an unchanged
         #: incumbent is not rewritten on every pass of a loop that spins.
         self._last_written_obj = None
@@ -257,6 +261,7 @@ class Checkpointer(Extension):
                        f"{resume_from}; this spoke starts without one", rank0)
             return
         obj = ckpt.restore_spoke_incumbent(self.opt, state)
+        self.restored_incumbent_obj = obj
         self.opt.spcomm.best_inner_bound = state["best_inner_bound"]
         self._last_written_obj = obj
         # The hub learns bounds only from what a spoke sends, so a restored
@@ -374,6 +379,14 @@ class Checkpointer(Extension):
             if bound is not None:
                 spoke.send_bound(bound)
                 spoke.send_best_xhat()
+
+        if not self.write_enabled:
+            # --resume-from with no --checkpoint-dir. Publishing the restored
+            # bound above is this spoke's whole job; there is nowhere to
+            # write. Without this the write below is attempted with
+            # ckpt_dir=None on every improvement, and only the warning path
+            # keeps that from ending the run.
+            return
 
         obj = getattr(self.opt, "best_solution_obj_val", None)
         if obj is None or obj == self._last_written_obj:
