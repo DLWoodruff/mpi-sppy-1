@@ -5,7 +5,13 @@ Checkpointing and Resuming a Run
 
 A long Progressive Hedging run can be stopped and picked up later. The intended
 use is a planned stop: a multi-day study that ends each day and resumes the next
-morning on the same cluster, without losing the work done so far.
+morning on the same cluster, losing at most the work done since the last
+checkpoint.
+
+A resumed run picks up from the last checkpoint that was **published**, which is
+not always the iteration at which the run stopped. How far back that can be is
+set by ``--checkpoint-every-iterations``; read `Choosing K`_ before relying on
+this for anything expensive.
 
 Checkpointing is entirely opt-in. With no ``--checkpoint-dir`` the machinery is
 not attached at all, and a run that does not ask for it pays nothing.
@@ -27,14 +33,50 @@ Give a directory and the run keeps a checkpoint up to date as it goes::
       --time-limit 28800 \
       --checkpoint-dir ./ckpt
 
-A checkpoint is written at the end of every completed PH iteration, and only
-one is kept, so the file on disk always describes the most recent *completed*
-iteration. Pairing ``--checkpoint-dir`` with ``--time-limit`` is the
-planned-stop recipe -- set the day's budget and the run stops itself with a
-resumable checkpoint in place.
+A checkpoint always describes a **completed** PH iteration -- never a partial
+one -- and only one is kept at a time, so the directory holds the most recent
+iteration that was both completed and due a write. By default every completed
+iteration is due one; ``--checkpoint-every-iterations`` changes that, and on a
+real model you will want it to (`Choosing K`_).
 
-Checkpointing less often
-~~~~~~~~~~~~~~~~~~~~~~~~
+Pairing ``--checkpoint-dir`` with ``--time-limit`` is the planned-stop recipe:
+set the day's budget and the run stops itself at an iteration boundary rather
+than being killed partway through a solve.
+
+The options
+~~~~~~~~~~~
+
+There are four, and they are the whole interface:
+
+``--checkpoint-dir DIR``
+   Where checkpoints are written. Giving it is what turns checkpointing on;
+   without it none of this machinery is attached.
+
+``--checkpoint-every-iterations K``
+   Write at every K-th completed iteration instead of every one. The default is
+   ``1``, but on a real model you will want it higher -- see `Choosing K`_,
+   which is the one decision here that repays some thought.
+
+``--resume-from DIR``
+   Start from the checkpoint in ``DIR`` instead of from scratch.
+
+``--checkpoint-backend``
+   How model state is stored. ``dill-reload`` is the default and currently the
+   only implemented value, so there is no reason to set it.
+
+``--max-iterations`` is not a checkpoint option, but it interacts with them and
+is the one people trip over: it bounds the **study**, not the leg. See
+`Resuming`_.
+
+.. warning::
+   **Nothing is published until the first iteration completes.** A run killed
+   during startup, or during the iteration-0 solve, leaves no checkpoint at all
+   -- not an empty one, nothing to resume from. For the case this feature exists
+   for, large MIP subproblems, that iteration-0 solve is often the longest in
+   the whole run, so the window is not small.
+
+Choosing K
+~~~~~~~~~~
 
 Serializing every scenario every iteration costs roughly 7--25 ms per scenario
 per iteration. Against a MIP whose solves take minutes that is noise, but on
@@ -64,6 +106,14 @@ checkpoint of iteration 30, and iterations 31 through 34 are lost. Resuming
 picks up at 31 and the next checkpoint is iteration 40 -- not 41, because the
 count follows the study, not the resumed leg.
 
+**How to size it.** "At most K-1 iterations" assumes you reach a multiple of K
+at all. If you never do, you lose everything: with ``K = 50`` and a run that
+only ever completes 30 iterations, no checkpoint is written and there is
+nothing to resume from. So pick K against the number of iterations you expect
+to **complete**, not against the iteration limit you set -- and leave enough
+margin that the run passes several multiples of K before any plausible
+stopping point.
+
 **The one exception.** The final iteration of an exhausted ``--max-iterations``
 budget is always written, whatever K is. With ``--max-iterations 100`` and
 ``K = 30`` the checkpoints are iterations 30, 60, 90 and 100. Raising the limit
@@ -78,6 +128,53 @@ it describes how the run is managed rather than what problem is being solved,
 so it is not part of the check that decides whether a checkpoint may be
 resumed.
 
+Two cases worth calling out
+"""""""""""""""""""""""""""
+
+**Setting K equal to the iteration limit.** With ``--max-iterations 40
+--checkpoint-every-iterations 40`` you get exactly one checkpoint, at iteration
+40, and pay for exactly one write. If all you want is the option of extending
+the study later by raising the limit, that is the cheapest way to get it.
+
+The catch is that it only works when the iteration limit is what stops the run.
+Anything else -- ``--rel-gap``, ``--abs-gap``, the convergence threshold, a user
+converger, ``--time-limit``, a crash -- stops it before iteration 40, no write
+has happened, and **there is nothing to resume from**. That failure does not
+announce itself. The checkpoint directory exists, and in a cylinders run it
+already holds a ``spokes/`` subdirectory, because the xhat spokes write their
+incumbents on a different trigger. So it looks like checkpointing worked, and
+you find out the next day::
+
+  CheckpointMismatch: No checkpoint manifest at './ckpt/manifest.json'.
+
+If you want the cheap single checkpoint, either turn the other stopping
+criteria off (``--rel-gap 0.0 --abs-gap 0.0``) or accept that an early
+convergence may leave you nothing.
+
+**Guarding against a scheduler timeout.** On a batch system the thing to avoid
+is the scheduler killing the job partway through a solve. Give the run a
+``--time-limit`` comfortably below your wall-clock allocation and it stops
+itself at an iteration boundary instead::
+
+  ... --max-iterations 500 --time-limit 28800 \
+      --checkpoint-dir ./ckpt --checkpoint-every-iterations 10
+
+``--time-limit`` is tested at the top of each iteration, so it ends the run
+cleanly -- but it does not *force* a write. What you resume from is the last
+multiple of K, exactly as for any other stop. Sizing K matters more here than
+anywhere else, because you cannot predict which iteration the limit will fall
+on.
+
+.. note::
+   There is no option to write a checkpoint a fixed number of seconds before a
+   deadline, and none to write one every N seconds. Both were designed and then
+   deliberately dropped: writing at every completed iteration already leaves a
+   recent checkpoint on disk, so an anticipatory trigger had no gap left to
+   fill. That argument gets weaker the larger K is. If you are running with a
+   large K against a hard wall-clock deadline and want an anticipatory write,
+   it is a reasonable thing to ask for -- the hook it would attach to already
+   exists -- so raise it rather than assuming it was ruled out on merit.
+
 Writing only at iteration boundaries is deliberate. PH computes xbar, updates
 the dual weights, gives extensions their mid-iteration hook, and only then
 solves; a run that stops on ``--time-limit`` or on convergence stops *before*
@@ -86,9 +183,9 @@ unwind that -- an open-ended problem, since any extension may have changed rho,
 fixed variables or added cuts -- the checkpoint is simply taken at the last
 point where everything agrees.
 
-One consequence: **a run that ends before finishing iteration 1 publishes no
-checkpoint at all.** No iteration completed, so there is no iterate to resume
-from.
+It is also why a run that ends before finishing iteration 1 publishes nothing,
+as `The options`_ warns: no iteration completed, so there is no iterate to
+write.
 
 Each write is bracketed by a pair of timestamped ``toc`` lines, so the log shows
 how long it took::
@@ -343,7 +440,7 @@ The bracketing ``toc`` lines are an honest report of it: their difference is
 essentially the whole overhead, so a calibration run tells you the cost on your
 own models. If that cost is too high, ``--checkpoint-every-iterations`` buys
 most of it back in exchange for repeating some iterations after a stop; see
-`Checkpointing less often`_ above.
+`Choosing K`_ above.
 
 Requirements and limitations
 ----------------------------
