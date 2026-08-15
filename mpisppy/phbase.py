@@ -1193,6 +1193,30 @@ class PHBase(mpisppy.spopt.SPOpt):
         # of the y-coordinate tolerance the user supplied.
         self.prox_approx_tol = math.sqrt(self.prox_approx_tol)
 
+    def _release_scenario_creator_held_models(self, models):
+        """Tell whoever built the scenarios that a resume replaced them.
+
+        Most ``scenario_creator``s are plain functions that hand a model over
+        and forget it, so this does nothing. The ADMM paths are the exception
+        (design section 8.2, item 2): their creator is a bound method of a
+        wrapper or bundler that keeps its own references to every model it
+        built. Those references outlive the swap, so without this a resumed
+        ADMM run holds two copies of every local scenario -- the reloaded ones
+        it iterates and the fresh ones it does not -- for the rest of the run,
+        which on large MIPs is precisely the memory a checkpoint exists to
+        save.
+
+        Duck-typed on purpose: the holder knows which of its attributes point
+        at models, and asking it is what keeps that knowledge in one place
+        instead of spreading a list of wrapper internals through the resume
+        branch.
+        """
+        holder = getattr(getattr(self, "scenario_creator", None),
+                         "__self__", None)
+        release = getattr(holder, "release_scenario_models", None)
+        if release is not None:
+            release(models)
+
     def _restore_from_checkpoint_if_resuming(self):
         """Splice a checkpoint's scenario models into this run, if resuming.
 
@@ -1236,6 +1260,8 @@ class PHBase(mpisppy.spopt.SPOpt):
         # iterates it; a plain PH has no such attribute.
         if getattr(self, "local_subproblems", None) is not None:
             self.local_subproblems = self.local_scenarios
+
+        self._release_scenario_creator_held_models(models)
 
         # _initial_fixed_varibles is a ComponentSet of vardata belonging to the
         # models we just discarded, so every reloaded nonant would look

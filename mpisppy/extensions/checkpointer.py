@@ -92,6 +92,22 @@ The same hook is what the xhatter spokes call once per pass through their main
 loops, which have no ``enditer`` to borrow: one Checkpointer serves the hub
 and the spokes.
 
+**Multi-rank cylinders.** A hub spread over several ranks holds its scenarios
+in slices, so one checkpoint generation spans all of them and is published only
+once every rank's files are on disk. The write is therefore collective (see
+``mpisppy/utils/checkpointing.py``), and what makes that safe is that the
+trigger below is a pure function of the absolute iteration number and the
+iteration limit -- identical on every rank of a synchronous PH cylinder, so the
+ranks reach the write together without being asked. A trigger that depended on
+anything rank-local (elapsed wall-clock, say) would have to be put through
+``allreduce_or`` first or it would deadlock the write.
+
+The *spoke* incumbent write needs none of that. Each rank writes only its own
+file, and the incumbent objective that gates the write comes from an
+all-reduced objective evaluation, so the ranks are already in step; the design
+deliberately keeps spokes uncoordinated with the hub and with each other
+(section 9, item 6).
+
 See ``doc/designs/checkpointing_design.md``.
 """
 
@@ -184,37 +200,32 @@ class Checkpointer(Extension):
             # inherit refusals that only protect a write.
             return
 
-        # Multi-rank writing is not implemented: every rank would compute the
-        # same staging and generation directory and race to create, replace and
-        # delete it, so ranks destroy each other's files. Refuse rather than
-        # abort the job at its very end with a half-published generation.
-        n_proc = getattr(opt, "n_proc", 1)
-        if n_proc > 1:
-            what = "spoke" if self.spoke_mode else "hub"
-            raise RuntimeError(
-                f"Checkpointing currently supports a single rank per "
-                f"cylinder, but this {what} has {n_proc}. Multi-rank "
-                f"checkpointing is planned; until then, either drop "
-                f"--checkpoint-dir or give every cylinder a single rank."
-            )
-
         # Two scenario names that sanitize to the same file name would
         # silently overwrite each other's model files; refuse now rather than
-        # at the first write.
+        # at the first write. Per rank, which is the right scope: file names
+        # carry the rank, so only names sharing a rank can collide.
         ckpt.check_filename_collisions(opt.local_scenarios)
 
         # Create and probe the directory now. Discovering only at write time
         # that the path is unwritable would mean the run never checkpoints.
+        # Every rank probes, with a rank-tagged probe file so the ranks do not
+        # remove each other's: on a cluster the checkpoint directory can be
+        # unwritable from some nodes and not others, and that is exactly the
+        # failure worth catching before a multi-hour run rather than at its
+        # first write.
         try:
             os.makedirs(self.ckpt_dir, exist_ok=True)
-            probe = os.path.join(self.ckpt_dir, ".mpisppy_write_probe")
+            probe = os.path.join(
+                self.ckpt_dir,
+                f".mpisppy_write_probe_{int(opt.cylinder_rank):04d}")
             with open(probe, "w"):
                 pass
             os.remove(probe)
         except OSError as exc:
             raise RuntimeError(
                 f"Cannot write to the checkpoint directory "
-                f"'{self.ckpt_dir}' ({type(exc).__name__}: {exc})."
+                f"'{self.ckpt_dir}' from rank {opt.cylinder_rank} "
+                f"({type(exc).__name__}: {exc})."
             ) from exc
 
     def pre_iter0(self):
@@ -325,6 +336,13 @@ class Checkpointer(Extension):
         of those points -- each is either pre-commit (the manifest still
         names the previous generation, which is intact) or the atomic
         manifest flip itself.
+
+        On a multi-rank cylinder the ranks agree on failure inside
+        ``write_checkpoint``, so either all of them raise here and warn, or
+        none does. Catching independently per rank would be the deadlock this
+        is written to avoid: the run continues on every rank or on none, and
+        no rank is left waiting at the next write's barrier for one that
+        already gave up.
         """
         if self.spoke_mode:
             self._spoke_checkpoint()
@@ -336,13 +354,19 @@ class Checkpointer(Extension):
         try:
             self._write()
         except Exception as exc:
+            # Rank 0 reports because a multi-rank cylinder should print one
+            # summary, and the rank that actually failed reports because it
+            # is the only one holding the cause -- gating on rank 0 alone
+            # silences the diagnosis and leaves a bare "some rank failed".
+            rank = int(self.opt.cylinder_rank)
+            mine = getattr(exc, "mpisppy_failed_locally", True)
             global_toc(
                 f"WARNING: checkpoint write failed at iteration "
-                f"{int(getattr(self.opt, '_PHIter', 0))} "
+                f"{int(getattr(self.opt, '_PHIter', 0))} on rank {rank} "
                 f"({type(exc).__name__}); the run continues, the previously "
                 f"published checkpoint (if any) is intact, and the next "
                 f"checkpoint point will try again.\n{exc}",
-                self.opt.cylinder_rank == 0)
+                rank == 0 or mine)
 
     def _write(self):
         """Write one generation, bracketed by toc so the cost is legible.
