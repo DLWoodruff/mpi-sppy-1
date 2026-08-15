@@ -118,6 +118,97 @@ that solve is often the most expensive in the run, and its answer would be
 thrown away. Iteration numbering continues where it left off, so
 ``--max-iterations`` bounds the run as a whole rather than each leg of it.
 
+.. warning::
+   That last point is the one thing people get wrong. To resume a run that
+   stopped at iteration 4 and take it to 6, pass ``--max-iterations 6``, not
+   ``--max-iterations 2``. Passing 2 says the budget was already spent at
+   iteration 4, and the resumed run does nothing.
+
+Trying it out
+-------------
+
+The quickest way to convince yourself is to run the same problem twice -- once
+straight through, once stopped and resumed -- and compare. On ``farmer``, a
+deterministic LP, the two should agree exactly.
+
+All three runs below share the same options; only the last line of each
+differs::
+
+  GC="mpiexec -np 3 python -m mpi4py -m mpisppy.generic_cylinders \
+      --module-name farmer --num-scens 3 --default-rho 1 \
+      --solver-name cplex --lagrangian --xhatshuffle \
+      --rel-gap 0.0 --abs-gap 0.0"
+
+Run them from ``examples/farmer``, or use ``--module-name
+mpisppy.tests.examples.farmer`` from anywhere.
+
+The two gap options are there because this example is small enough to converge
+on the inter-cylinder gap at iteration **1**, which would leave nothing to stop
+and resume. Turning them off makes the iteration limit the thing that ends the
+run. That is a property of the example, not of checkpointing.
+
+**1. A reference run** of six iterations, with no checkpointing at all -- this
+is the answer to compare against::
+
+  $GC --max-iterations 6 --solution-base-name ref_soln
+
+**2. The same run, stopped after four iterations**, leaving a checkpoint::
+
+  $GC --max-iterations 4 --checkpoint-dir ./ckpt
+
+**3. Resume it** and let it finish the remaining two iterations::
+
+  $GC --max-iterations 6 --resume-from ./ckpt --solution-base-name resumed_soln
+
+What you should see
+~~~~~~~~~~~~~~~~~~~
+
+The resumed run reports what it restored -- the hub's iterate, the spoke's best
+solution, and the spoke's place in its own scenario walk::
+
+  Restored the checkpointed incumbent for XhatShuffleInnerBound (objective -108382.2222...)
+  Resuming from checkpoint in ./ckpt (iteration 4)
+  Restored the checkpointed xhatshuffle cursor (pass 250, next scenario scen0)
+
+It then starts at iteration 5 -- there is no iteration-0 solve and no repeat of
+iterations 1 through 4 -- and ends on the same numbers the reference run did:
+
+=====================  ==============  ================  ==========  ==========
+run                        Best Bound    Best Incumbent    Rel. Gap    Abs. Gap
+=====================  ==============  ================  ==========  ==========
+reference (6)            -108931.8045      -108382.2222      0.505%    549.5823
+resumed (4 then 2)       -108931.8045      -108382.2222      0.505%    549.5823
+=====================  ==============  ================  ==========  ==========
+
+The written solutions match too::
+
+  diff ref_soln.csv resumed_soln.csv
+  diff -r ref_soln_soldir resumed_soln_soldir
+
+Both are clean. Farmer is a deterministic LP, so here "very close" is in fact
+"identical"; on a MIP under default solver settings expect agreement to a
+tolerance instead, since a resumed run can land on a different optimal solution
+(see `What resume guarantees`_).
+
+.. note::
+   In the resumed run the *Best Incumbent* column reads ``inf`` for an
+   iteration or two before the restored value reappears. The spoke restores its
+   incumbent immediately but publishes it to the hub at its first checkpoint
+   point, so the hub's display lags briefly. Nothing is lost -- the column
+   settles back to the restored value, and the final answer is unaffected.
+
+To exercise the multi-rank path as well, give each cylinder more than one rank
+-- ``-np 6`` with three cylinders gives each of them two::
+
+  GC="mpiexec -np 6 python -m mpi4py -m mpisppy.generic_cylinders \
+      --module-name farmer --num-scens 6 --default-rho 1 \
+      --solver-name cplex --lagrangian --xhatshuffle \
+      --rel-gap 0.0 --abs-gap 0.0"
+
+``./ckpt/hub/gen_0004/`` then holds a ``hub_rank_NNNN.pkl`` and one ``.dill``
+per scenario **for every rank**, and the manifest that publishes the generation
+is written only once all of them have finished.
+
 What must match, and what may change
 ------------------------------------
 
