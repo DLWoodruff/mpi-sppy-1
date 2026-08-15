@@ -39,9 +39,15 @@ iteration that was both completed and due a write. By default every completed
 iteration is due one; ``--checkpoint-every-iterations`` changes that, and on a
 real model you will want it to (`Choosing K`_).
 
-Pairing ``--checkpoint-dir`` with ``--time-limit`` is the planned-stop recipe:
-set the day's budget and the run stops itself at an iteration boundary rather
-than being killed partway through a solve.
+``--time-limit`` is how you get a run to stop on its own before a scheduler
+kills it, but be clear about what it does: the elapsed time is compared against
+the limit **once per iteration, at the top**, and nowhere else. It is not
+checked during a solve. So a run whose iterations take an hour can overshoot the
+limit by nearly an hour, and you have to set the limit below your wall-clock
+allocation by at least one iteration's worth of solve time for it to help at
+all.
+
+It also does not force a checkpoint to be written -- see `Choosing K`_.
 
 The options
 ~~~~~~~~~~~
@@ -78,9 +84,14 @@ is the one people trip over: it bounds the **study**, not the leg. See
 Choosing K
 ~~~~~~~~~~
 
-Serializing every scenario every iteration costs roughly 7--25 ms per scenario
-per iteration. Against a MIP whose solves take minutes that is noise, but on
-many cheap scenarios it can dominate the run.
+A checkpoint serializes every scenario model this rank owns. That cost scales
+with the size of your models, and the only number that matters is how it
+compares with a solve: if serializing a scenario takes a small fraction of the
+time to solve it, checkpointing every iteration is free in practice, and if it
+does not, it is not. Measure it on your own model rather than guessing -- the
+bracketing ``toc`` lines around each write report it directly (`What it
+costs`_).
+
 ``--checkpoint-every-iterations K`` writes less often::
 
   python -m mpisppy.generic_cylinders --module-name farmer --num-scens 50 \
@@ -159,11 +170,9 @@ itself at an iteration boundary instead::
   ... --max-iterations 500 --time-limit 28800 \
       --checkpoint-dir ./ckpt --checkpoint-every-iterations 10
 
-``--time-limit`` is tested at the top of each iteration, so it ends the run
-cleanly -- but it does not *force* a write. What you resume from is the last
-multiple of K, exactly as for any other stop. Sizing K matters more here than
-anywhere else, because you cannot predict which iteration the limit will fall
-on.
+``--time-limit`` does not *force* a write. What you resume from is the last
+multiple of K, exactly as for any other stop, so sizing K matters more here than
+anywhere else: you cannot predict which iteration the limit will fall on.
 
 .. note::
    There is no option to write a checkpoint a fixed number of seconds before a
@@ -431,16 +440,25 @@ sizes, 3 scenarios (MIP)       2.28 s        3.15 s        38%
 sizes, 10 scenarios (MIP)      5.05 s        7.46 s        48%
 ===========================  ==========  ============  ==========
 
-Roughly 7-25 ms per scenario per iteration. For the case this is designed for
--- large MIP subproblems where a single solve takes minutes -- that is
-negligible. For many cheap scenarios it dominates, and the 50-scenario farmer
-run above takes over three times as long.
+.. warning::
+   **These are toy models, and the percentages do not carry over.** Farmer has
+   three first-stage variables; ``sizes`` is a small MIP. Serializing one of
+   their scenarios takes milliseconds, and a real model's can take seconds. Do
+   not scale these figures by your scenario count to predict your own overhead
+   -- the per-scenario cost is the part that changes, and it changes by orders
+   of magnitude.
 
-The bracketing ``toc`` lines are an honest report of it: their difference is
-essentially the whole overhead, so a calibration run tells you the cost on your
-own models. If that cost is too high, ``--checkpoint-every-iterations`` buys
-most of it back in exchange for repeating some iterations after a stop; see
-`Choosing K`_ above.
+   What does carry over is the *shape* of the result: the overhead is
+   serialization time against solve time. The 50-scenario farmer run is the
+   pathological end -- solves so cheap that writing dominates and the run takes
+   three times as long. A large MIP whose solves take minutes is the other end,
+   where even a slow serialization is a small share.
+
+The bracketing ``toc`` lines are what you should actually go by: their
+difference is essentially the whole overhead, so one calibration run on your own
+model tells you the cost directly. If it is too high,
+``--checkpoint-every-iterations`` buys most of it back in exchange for repeating
+some iterations after a stop; see `Choosing K`_.
 
 Requirements and limitations
 ----------------------------
