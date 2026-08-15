@@ -175,14 +175,21 @@ def _spoke_marker(wheel):
 
     A test cannot otherwise tell a restored incumbent from one the spoke
     re-found on its own: farmer is deterministic, so the resumed spoke
-    converges on the same answer either way.
+    converges on the same answer either way. The same goes for the loop
+    cursor, which leaves no trace in the answer at all.
     """
     ext = _checkpointer(wheel.spcomm.opt)
     if ext is None:
         return None
+    spoke = wheel.spcomm
     return {
-        "cylinder": type(wheel.spcomm).__name__,
+        "cylinder": type(spoke).__name__,
         "restored_incumbent_obj": ext.restored_incumbent_obj,
+        # What the loop actually *adopted*, not what the Checkpointer read.
+        # The two differ whenever a cursor is read and then refused, and a
+        # test that watched the read would score that as a success.
+        "applied_loop_state": getattr(spoke, "applied_loop_state", None),
+        "final_loop_state": spoke.checkpoint_loop_state(),
     }
 
 

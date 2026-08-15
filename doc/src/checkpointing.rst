@@ -172,10 +172,21 @@ spoke reads it back and reports it to the hub, which is why a resumed
 cylinders run starts from the answer it already had rather than from nothing.
 
 Those files are deliberately not synchronised with the hub's: a spoke writes
-when it improves, the hub writes at iteration boundaries, and neither waits
-for the other. A spoke whose file is missing -- because the earlier run
-stopped before it found anything, or because you resumed with a different set
-of spokes -- simply starts without an incumbent and says so in the log.
+when it has something new to record, the hub writes at iteration boundaries,
+and neither waits for the other. A spoke whose file is missing -- because the
+earlier run stopped before it found anything, or because you resumed with a
+different set of spokes -- simply starts without an incumbent and says so in
+the log.
+
+An ``xhatshuffle`` spoke also records **where it had got to** in its walk
+through the scenarios, so a resumed spoke carries on exploring rather than
+re-trying candidates it has already tried. Each re-try it avoids is a
+subproblem solve. The scenario order itself is not stored -- the shuffle is
+seeded to a fixed value, so a resumed spoke reproduces it exactly -- only the
+position in it, which is why a run whose scenario list has changed discards the
+position (with a warning) and explores from the start again. The other xhat
+spokes re-evaluate from scratch whenever the hub sends new values, so they have
+no such position and store none.
 
 On a deterministic LP or QP solve the primal trajectory can come back
 bit-identical, but that is a bonus rather than the guarantee.

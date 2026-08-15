@@ -6,10 +6,12 @@
 # All rights reserved. Please see the files COPYRIGHT.md and LICENSE.md for
 # full copyright and license information.
 ###############################################################################
+import hashlib
 import logging
 import random
 import mpisppy.log
 
+from mpisppy import global_toc
 from mpisppy.extensions.xhatbase import XhatBase
 from mpisppy.cylinders.xhatbase import XhatInnerBoundBase
 from mpisppy.cylinders._preloop_xhat_mixin import _PreLoopXhatMixin
@@ -94,17 +96,35 @@ class XhatShuffleInnerBound(_PreLoopXhatMixin, XhatInnerBoundBase):
         shuffled_scenarios = self.random_stream.sample(scen_names,
                                                        len(scen_names))
 
-        scenario_cycler = ScenarioCycler(shuffled_scenarios,
-                                         self.opt.nonleaves,
-                                         self.reverse,
-                                         self.iter_step)
+        # On self rather than local, so a checkpoint can reach them. The
+        # cursor is where this spoke had got to in its exploration of the
+        # scenarios; a resumed spoke that started it over would re-try
+        # scenarios it has already tried, which costs a subproblem solve
+        # each. See doc/designs/checkpointing_design.md section 5.6.
+        self.scenario_cycler = ScenarioCycler(shuffled_scenarios,
+                                              self.opt.nonleaves,
+                                              self.reverse,
+                                              self.iter_step)
+        scenario_cycler = self.scenario_cycler
+        self.xh_iter = 1
+        #: The cursor this loop actually adopted, or None if it started fresh.
+        #: Distinct from what the Checkpointer *read*: a cursor can be read
+        #: and then refused (wrong scenario order), and a test that looked at
+        #: the read would call that a success.
+        self.applied_loop_state = None
 
         def _vb(msg):
             if self.verbose and self.opt.cylinder_rank == 0:
                 print("(rank0) " + msg)
 
-        xh_iter = 1
+        # A resume hands back the cursor this spoke last checkpointed. It has
+        # to happen here rather than in the Checkpointer's own restore hook:
+        # that hook runs in pre_iter0, and the cycler does not exist until the
+        # lines above. Same ordering as the hub's extension state.
+        self._restore_loop_state_if_resuming()
+
         while not self.got_kill_signal():
+            xh_iter = self.xh_iter
             # (unrelated: uncomment the next line to see the source of delay getting an xhat)
             if (xh_iter-1) % 100 == 0:
                 logger.debug(f'   Xhatshuffle loop iter={xh_iter} on rank {self.global_rank}')
@@ -167,7 +187,58 @@ class XhatShuffleInnerBound(_PreLoopXhatMixin, XhatInnerBoundBase):
 
             self.maybe_checkpoint()
 
-            xh_iter += 1
+            self.xh_iter += 1
+
+    def checkpoint_loop_state(self):
+        """This spoke's place in its own loop, for the checkpoint file.
+
+        The scenario order itself is not carried: the shuffle is seeded to a
+        fixed value and drawn once, so a resumed spoke reproduces it exactly.
+        What cannot be reproduced is how far through it this spoke had got --
+        that depends on how many passes it managed before the stop, which
+        depends on the hub.
+        """
+        cycler = getattr(self, "scenario_cycler", None)
+        if cycler is None:
+            # Asked before main() built the loop -- there is no position yet.
+            return None
+        # Written from the bottom of the pass, so this is the pass that just
+        # completed -- the same thing the hub's generation number means.
+        return {"xh_iter": int(self.xh_iter),
+                "cursor": cycler.checkpoint_state()}
+
+    def restore_loop_state(self, state):
+        """Put the cursor back where the checkpoint left it.
+
+        Returns a list of warnings rather than raising: a cursor that no
+        longer fits the run is a reason to explore from the start again, not
+        a reason to throw away the incumbent in the same file and refuse the
+        resume.
+        """
+        warnings = self.scenario_cycler.restore_state(state["cursor"])
+        if not warnings:
+            # The file records the pass that completed, so the resumed loop
+            # starts at the next one -- the same convention the hub uses for
+            # its iteration counter, and it keeps pass numbers in the log
+            # unique across a stop.
+            self.xh_iter = int(state["xh_iter"]) + 1
+        return warnings
+
+    def _restore_loop_state_if_resuming(self):
+        """Ask the Checkpointer for a restored cursor, if this is a resume."""
+        state = self._checkpointed_loop_state()
+        if state is None:
+            return
+        warnings = self.restore_loop_state(state)
+        for message in warnings:
+            global_toc(f"WARNING: {message}", self.opt.cylinder_rank == 0)
+        if not warnings:
+            self.applied_loop_state = state
+            global_toc(
+                f"Restored the checkpointed xhatshuffle cursor "
+                f"(pass {self.xh_iter}, next scenario "
+                f"{self.scenario_cycler.nodescen_dict.get('ROOT')})",
+                self.opt.cylinder_rank == 0)
 
 
 class ScenarioCycler:
@@ -203,6 +274,74 @@ class ScenarioCycler:
     @best.setter
     def best(self, value):
         self._best = value
+
+    def _order_fingerprint(self):
+        """Identify the scenario order these indices are indices *into*.
+
+        The cursor is an index, so it only means anything against the order it
+        was taken from. That order is deterministic -- the shuffle is seeded to
+        a fixed value and drawn once from ``all_scenario_names`` -- so a resumed
+        spoke reproduces it, and this is what proves it did. If the model's
+        scenario list changed, index 7 is a different scenario and restoring it
+        would silently send the spoke somewhere else.
+
+        A hash rather than the list itself: this rides in a file that is
+        rewritten whenever the cursor moves, and a run with many thousands of
+        scenarios should not pay for a copy of every name each time.
+        """
+        blob = "\n".join(f"{i}:{name}" for i, name in self._shuffled_scenarios)
+        return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+    def checkpoint_state(self):
+        """Where this cycler has got to, as plain data.
+
+        Everything derived from ``_shuffled_scenarios`` is left out and
+        rebuilt on restore, because the scenario order is reproduced exactly
+        rather than carried.
+        """
+        return {
+            "order_fingerprint": self._order_fingerprint(),
+            "cycle_idx": self._cycle_idx,
+            "best": self._best,
+            "cur_root_scen": self._cur_ROOTscen,
+            # A set is not worth the round trip; order does not matter to the
+            # membership tests that read it.
+            "scenarios_this_epoch": sorted(self._scenarios_this_epoch),
+            "reversed": getattr(self, "_reversed", False),
+            "nodescen_dict": dict(self.nodescen_dict),
+        }
+
+    def restore_state(self, state):
+        """Put the cursor back. Returns a list of warnings; [] on success.
+
+        A cursor that does not fit this run is discarded rather than raising:
+        the same file carries the incumbent, which is the part worth keeping,
+        and exploring from the start again is a cost rather than an error.
+        """
+        if state.get("order_fingerprint") != self._order_fingerprint():
+            return ["the checkpointed xhatshuffle cursor was taken against a "
+                    "different scenario order, so its position means nothing "
+                    "here; this spoke explores from the start again."]
+
+        # `best` first: the epoch rebuild below reads it to decide where the
+        # epoch starts. The position is overwritten afterwards either way, but
+        # having the rebuild see the real value keeps this a restore rather
+        # than a sequence of corrections.
+        self._best = state["best"]
+
+        # Then re-derive the epoch's view of the order: _begin_*_epoch is what
+        # sets _shuffled_snames/_original_order, and the two differ by
+        # direction, so the direction has to be applied before the position.
+        if state["reversed"]:
+            self._begin_reverse_epoch()
+        else:
+            self._begin_normal_epoch()
+
+        self._cycle_idx = state["cycle_idx"]
+        self._cur_ROOTscen = state["cur_root_scen"]
+        self._scenarios_this_epoch = set(state["scenarios_this_epoch"])
+        self.nodescen_dict = dict(state["nodescen_dict"])
+        return []
 
     def _fill_nodescen_dict(self,empty_nodes):
         filling_idx = self._cycle_idx

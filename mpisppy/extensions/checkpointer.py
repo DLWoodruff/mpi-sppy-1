@@ -188,9 +188,19 @@ class Checkpointer(Extension):
         #: it started without one. Read by tests, which otherwise cannot tell
         #: a restored incumbent from one the spoke happened to re-find.
         self.restored_incumbent_obj = None
+        #: The loop cursor this spoke restored, held until the loop exists to
+        #: receive it (the restore runs in pre_iter0, the loop is built after).
+        #: Collected by XhatInnerBoundBase._checkpointed_loop_state.
+        self.restored_loop_state = None
+        #: Likewise this spoke's extension state, handed over at the end of
+        #: xhat_prep so post_iter0 cannot overwrite it.
+        self.restored_extension_state = None
         #: The incumbent objective the last write recorded, so an unchanged
         #: incumbent is not rewritten on every pass of a loop that spins.
         self._last_written_obj = None
+        #: Likewise for the loop cursor, which moves independently of the
+        #: incumbent -- most cursor moves do not improve on the best xhat.
+        self._last_written_loop_state = None
 
         if not self.spoke_mode and self.write_enabled:
             ckpt.require_dill(self.backend)
@@ -275,6 +285,15 @@ class Checkpointer(Extension):
         self.restored_incumbent_obj = obj
         self.opt.spcomm.best_inner_bound = state["best_inner_bound"]
         self._last_written_obj = obj
+        # Held rather than applied: the spoke's loop -- and the cursor this
+        # describes -- is built after pre_iter0, so it collects this itself
+        # once it exists. Older files have no such key.
+        self.restored_loop_state = state.get("loop_state")
+        self._last_written_loop_state = self.restored_loop_state
+        # Held for the same reason, and handed over at the end of xhat_prep:
+        # post_iter0 has not run yet, and it is where an extension rebuilds
+        # its bookkeeping from the models.
+        self.restored_extension_state = state.get("extension_state")
         # The hub learns bounds only from what a spoke sends, so a restored
         # incumbent that is never published leaves the hub reporting an
         # infinite inner bound -- and its gap and convergence tests reading
@@ -384,12 +403,18 @@ class Checkpointer(Extension):
         global_toc(f"Checkpoint written at iteration {generation}", rank0)
 
     def _spoke_checkpoint(self):
-        """Publish a restored bound, then write the incumbent if it improved.
+        """Publish a restored bound, then write if anything worth keeping moved.
 
         Called once per pass of a loop that spins while it waits on the hub,
-        so the common case has to be cheap: comparing two floats and
-        returning. A write happens only when the incumbent objective differs
-        from the one already on disk.
+        so the common case has to be cheap: comparing a float and a small dict
+        and returning.
+
+        Two things can move. The incumbent improves rarely. The **loop cursor**
+        moves whenever the spoke tries another scenario, which is more often --
+        but every cursor move is the result of a subproblem solve, so a small
+        pickle and a rename per move is negligible against what caused it. A
+        pass that solves nothing writes nothing, which is the case that has to
+        stay cheap and does.
 
         Failures warn rather than raise, for the hub's reason and one more:
         this file is an optimization. Losing it costs a resumed run the
@@ -413,13 +438,20 @@ class Checkpointer(Extension):
             return
 
         obj = getattr(self.opt, "best_solution_obj_val", None)
-        if obj is None or obj == self._last_written_obj:
+        if obj is None:
+            # Nothing to write yet: the file carries a solution, and the
+            # cursor rides along with it rather than on its own.
+            return
+        loop_state = spoke.checkpoint_loop_state()
+        if (obj == self._last_written_obj
+                and loop_state == self._last_written_loop_state):
             return
         try:
             cylinder, strata_rank = self._spoke_identity()
             path = ckpt.write_spoke_incumbent(
                 self.opt, self.ckpt_dir, cylinder, strata_rank,
-                best_inner_bound=getattr(spoke, "best_inner_bound", None))
+                best_inner_bound=getattr(spoke, "best_inner_bound", None),
+                loop_state=loop_state)
         except Exception as exc:
             global_toc(
                 f"WARNING: this spoke could not write its incumbent "
@@ -429,7 +461,13 @@ class Checkpointer(Extension):
             return
         if path is None:
             return
+        improved = obj != self._last_written_obj
         self._last_written_obj = obj
+        self._last_written_loop_state = loop_state
+        if not improved:
+            # The cursor moved but the answer did not. Worth writing, not
+            # worth a line in the log every time the spoke tries a scenario.
+            return
         # One line, not the pair the hub prints. The pair exists to measure a
         # write whose cost a user has to trade off against checkpoint
         # frequency; this write has no frequency knob and costs a rename.

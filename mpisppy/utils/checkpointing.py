@@ -939,7 +939,8 @@ def load_checkpoint(opt, ckpt_dir):
 ###############################################################################
 
 
-def spoke_incumbent_state(opt, cylinder, strata_rank, best_inner_bound=None):
+def spoke_incumbent_state(opt, cylinder, strata_rank, best_inner_bound=None,
+                          loop_state=None):
     """The dict written by ``write_spoke_incumbent``, or None if there is
     nothing to write yet (no scenario has an incumbent cached)."""
     solutions = {}
@@ -973,11 +974,18 @@ def spoke_incumbent_state(opt, cylinder, strata_rank, best_inner_bound=None):
         "best_solution_obj_val": _as_float_or_none(
             getattr(opt, "best_solution_obj_val", None)),
         "solutions": solutions,
+        # Where the spoke's own loop had got to. Only xhatshuffle has such a
+        # place; every other xhatter re-evaluates from scratch when new
+        # nonants arrive, so it says None and this stays None.
+        "loop_state": loop_state,
+        # Same contract as the hub's, for extensions attached to the spoke's
+        # Xhat_Eval rather than to the PH hub.
+        "extension_state": gather_extension_state(opt),
     }
 
 
 def write_spoke_incumbent(opt, ckpt_dir, cylinder, strata_rank,
-                          best_inner_bound=None):
+                          best_inner_bound=None, loop_state=None):
     """Write this spoke's best incumbent, latest-wins. Returns the path, or
     None when there is no incumbent to write.
 
@@ -988,7 +996,8 @@ def write_spoke_incumbent(opt, ckpt_dir, cylinder, strata_rank,
     involved.
     """
     state = spoke_incumbent_state(opt, cylinder, strata_rank,
-                                  best_inner_bound=best_inner_bound)
+                                  best_inner_bound=best_inner_bound,
+                                  loop_state=loop_state)
     if state is None:
         return None
     spokes_dir = os.path.join(ckpt_dir, SPOKES_SUBDIR)

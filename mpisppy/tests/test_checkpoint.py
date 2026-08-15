@@ -1702,17 +1702,24 @@ class TestCheckpointHookPlacement(unittest.TestCase):
 class _SpokeStub:
     """Stands in for the spoke communicator the Checkpointer reads."""
 
-    def __init__(self, strata_rank=2, best_inner_bound=None):
+    def __init__(self, strata_rank=2, best_inner_bound=None, loop_state=None):
         self.strata_rank = strata_rank
         self.best_inner_bound = best_inner_bound
         self.sent_bounds = []
         self.sent_xhats = 0
+        #: What checkpoint_loop_state() reports. None is what every xhatter
+        #: but xhatshuffle says: they re-evaluate from scratch when new
+        #: nonants arrive, so there is no cursor to carry.
+        self.loop_state = loop_state
 
     def send_bound(self, value):
         self.sent_bounds.append(value)
 
     def send_best_xhat(self):
         self.sent_xhats += 1
+
+    def checkpoint_loop_state(self):
+        return self.loop_state
 
 
 def _xhat_eval(ckpt_dir=None, resume_from=None, **overrides):

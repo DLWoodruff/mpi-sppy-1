@@ -1,11 +1,13 @@
 # Checkpoint / Resume for mpi-sppy — Design
 
-Status: **phases 1a, 4, 2 and 3 implemented** — a synchronous PH hub, on any
-number of ranks per cylinder, alone or in a wheel with spokes, over plain
-scenarios, proper bundles or stoch-ADMM, with stateful extensions and
-convergers carrying their own state across the stop. Phase 1b is retired (its
-two test instances landed in phase 2). Phase 5 remains design; phase 6 is
-unplanned. See §11. Where this document and the shipped code have disagreed,
+Status: **every planned phase is implemented** — 1a, 4, 2, 3 and 5. A
+synchronous PH hub, on any number of ranks per cylinder, alone or in a wheel
+with spokes, over plain scenarios, proper bundles or stoch-ADMM, with stateful
+extensions and convergers carrying their own state across the stop and the xhat
+spoke resuming its own exploration where it left off. Phase 1b is retired (its
+two test instances landed in phase 2). Phase 6 (the leaf-rebuild backend)
+remains deliberately unplanned — the primary use case is fully served without
+it. See §11. Where this document and the shipped code have disagreed,
 the code is authoritative and this document has been corrected — §8 in
 particular records a design that was tried, failed, and was replaced. Scope:
 checkpoint a running mpi-sppy job so it can be stopped and resumed later. Must
@@ -416,10 +418,11 @@ Consequences:
 
 - xhatshuffle seeds its stream to a fixed `42` and samples **once**
   (`main()` in `xhatshufflelooper_bounder.py`) — deterministic, no RNG state to save.
-- The `ScenarioCycler` cursor and `xh_iter` are **local variables inside `main()`**
-  — unreachable. Exact spoke-cursor resume needs them hoisted onto `self` (Phase
-  5). Without it the spoke restarts its cursor; this only changes *which* scenario
-  it tries next, not the preserved best (restored from §5.4).
+- The `ScenarioCycler` cursor and `xh_iter` were **local variables inside
+  `main()`** — unreachable. **Phase 5 hoisted them onto `self`** and carries the
+  cursor in the spoke's file. Without it the spoke restarted its cursor; that
+  only changes *which* scenario it tries next, not the preserved best (restored
+  from §5.4) — but each re-try it avoids is a subproblem solve.
 - lagrangian / lagranger spokes use **no RNG**; their bound is deterministic given
   the hub's `W`. State to carry: `_PHIter`, `trivial_bound`, last `bound`, received
   `localWs`.
@@ -1242,8 +1245,42 @@ as a branch stacked on the 1a PR.
   valid best-so-far — **plus a stoch-ADMM cylinders configuration** (§8.2,
   item 6: no FWPH; `xhatshuffle` with `--stage2-ef-solver-name`, or
   `xhatxbar`).
-- **Phase 5 — Exact spoke continuity (optional).** Hoist `ScenarioCycler`/`xh_iter`
-  onto `self`; checkpoint the cursor (+ RNG getstate if a stream becomes stateful).
+- **Phase 5 — Exact spoke continuity. Implemented.** `ScenarioCycler` and
+  `xh_iter` are on `self`, and the cursor rides in the spoke's own file
+  alongside the incumbent.
+
+  **No RNG state is carried, and none is needed** (§5.6): xhatshuffle seeds its
+  stream to a fixed `42` and samples once, so a resumed spoke reproduces the
+  shuffled order exactly. Only the *position* in that order is checkpointed —
+  and a position means nothing against a different list, so the file carries a
+  SHA-256 fingerprint of the order it was taken against. A cursor whose
+  fingerprint no longer matches is discarded with a warning rather than raising:
+  the same file carries the incumbent, which is the part worth keeping, and
+  re-exploring from the start is a cost rather than an error.
+
+  **The write gate changed**, and the cost argument is what justifies it. Before
+  this phase a spoke wrote only when its incumbent improved, which is rare. The
+  cursor moves far more often — but *every cursor move is the result of a
+  subproblem solve*, so a small pickle and a rename per move is negligible
+  against what caused it, while a pass that solves nothing still writes nothing.
+  That last case is the one that has to stay cheap, since the loop spins while
+  it waits on the hub.
+
+  **Only xhatshuffle has a cursor.** `xhatlooper`, `xhatxbar` and
+  `xhatspecific` re-evaluate from scratch whenever new nonants arrive, so their
+  loop counters describe nothing a resume could use; `checkpoint_loop_state`
+  returns None on the base class and they inherit it.
+
+  **The spoke-side extension state phase 3 deferred landed here too**, restored
+  at the end of `xhat_prep` — after `post_iter0`, for exactly the reason the hub
+  restores at the end of `Iter0`.
+
+  Tests: `test_checkpoint_spoke_cursor.py` (the cursor round trip, that a
+  restored cycler offers the same scenarios next as one that never stopped, that
+  an exhausted epoch is not re-offered, and the changed-order refusal), plus two
+  cases in `test_checkpoint_cylinders.py` under `mpiexec`. The cylinders test
+  asserts what the loop **adopted**, not what the Checkpointer read — the first
+  version watched the read, and disabling the restore entirely still passed it.
 - **Phase 6 — Leaf-rebuild backend + broader coverage (not currently planned).**
   A possible future phase, deferred: the primary use case is fully served by the
   dill-reload backend (Phases 1–4), so this is recorded for when a lighter,
