@@ -435,6 +435,141 @@ def initially_fixed_nonant_names(opt):
     }
 
 
+###############################################################################
+# Extension and converger object state (design section 5.5, section 9 item 3).
+#
+# The dilled models bring back everything that lives *on a model*. What they
+# cannot bring back is state an extension keeps on itself, and several
+# extensions keep exactly the state that decides what they do next: the
+# previous xbar a rho updater compares against, how many iterations a fixer has
+# watched a variable hold still, which nonants a slammer has already pinned. An
+# extension that starts fresh on a resumed run takes a different action at the
+# next iteration than the uninterrupted run would have, so the runs diverge --
+# quietly, since nothing is missing and nothing raises.
+#
+# The contract is two no-op methods on ``Extension`` and ``Converger``. This
+# module aggregates them, keyed by class name, because names are what survives
+# a resume: object identity does not, and attach order is not stable enough to
+# index by. Name keying is also what lets a resume with a *different* extension
+# set do something sensible -- entries with no matching extension are reported
+# rather than silently dropped.
+###############################################################################
+
+
+def _extension_objects(opt):
+    """Yield ``(class name, extension)`` for every attached extension.
+
+    ``MultiExtension`` is a container, not an extension with state of its own,
+    so it is flattened away -- and flattened recursively, since nothing stops
+    one from holding another. Two extensions of the same class would collide
+    on the name key, but ``MultiExtension.extdict`` is itself keyed by class
+    name, so they cannot both be attached in the first place.
+    """
+    ext = getattr(opt, "extobject", None)
+    if ext is None:
+        return
+    stack = [ext]
+    while stack:
+        obj = stack.pop()
+        extdict = getattr(obj, "extdict", None)
+        if extdict:
+            stack.extend(extdict.values())
+        else:
+            yield type(obj).__name__, obj
+
+
+def gather_extension_state(opt):
+    """Collect the extension and converger state to write into a checkpoint.
+
+    Extensions that have no state say so by returning None and are left out
+    entirely, so the common case adds nothing to the file.
+
+    An extension whose state cannot be pickled will fail the write, loudly and
+    at every checkpoint point. That is deliberate: dropping just that
+    extension's state would produce checkpoints that look complete and resume
+    into a run that silently diverges, which is the failure this whole
+    contract exists to prevent.
+    """
+    extensions = {}
+    for name, ext in _extension_objects(opt):
+        state = ext.checkpoint_state()
+        if state is not None:
+            extensions[name] = state
+
+    converger = None
+    convobject = getattr(opt, "convobject", None)
+    if convobject is not None:
+        state = convobject.checkpoint_state()
+        if state is not None:
+            converger = {"class": type(convobject).__name__, "state": state}
+
+    if not extensions and converger is None:
+        return None
+    return {"extensions": extensions, "converger": converger}
+
+
+def restore_extension_state(opt, state):
+    """Hand each extension its own state back. Returns a list of warnings.
+
+    Warnings rather than errors: a resume with a different extension set is
+    something a user may legitimately do (the checkpoint's *hub iterate* is
+    still valid), so it should say clearly what it could not restore instead
+    of refusing the whole checkpoint. The caller prints them.
+
+    Only entries the checkpoint actually holds are reported. An extension
+    added *since* the checkpoint has nothing to restore and nothing to warn
+    about -- it is starting fresh because it never ran, which is correct.
+    """
+    warnings = []
+    if not state:
+        return warnings
+
+    attached = dict(_extension_objects(opt))
+    for name, ext_state in state.get("extensions", {}).items():
+        ext = attached.get(name)
+        if ext is None:
+            warnings.append(
+                f"the checkpoint holds state for the extension '{name}', "
+                f"which is not attached to this run; it was dropped. If this "
+                f"run was meant to continue the earlier one, attach it.")
+            continue
+        ext.restore_state(ext_state)
+
+    saved = state.get("converger")
+    convobject = getattr(opt, "convobject", None)
+    if saved is not None:
+        if convobject is None:
+            warnings.append(
+                f"the checkpoint holds state for the converger "
+                f"'{saved['class']}', but this run has no converger.")
+        elif type(convobject).__name__ != saved["class"]:
+            warnings.append(
+                f"the checkpoint's converger was '{saved['class']}' but this "
+                f"run uses '{type(convobject).__name__}'; the checkpointed "
+                f"converger state was dropped and this converger starts "
+                f"fresh.")
+        else:
+            convobject.restore_state(saved["state"])
+    return warnings
+
+
+def converger_state_is_carried(opt, state):
+    """Whether the run's converger (if any) had its state restored.
+
+    The resume warns when a converger starts fresh, because one that
+    accumulates history can then terminate the run at a different iteration
+    than an uninterrupted run would. That warning is right for a converger
+    that does not implement the contract and wrong for one that does, so the
+    resume asks here rather than warning unconditionally.
+    """
+    convobject = getattr(opt, "convobject", None)
+    if convobject is None:
+        return True
+    saved = (state or {}).get("converger")
+    return (saved is not None
+            and saved["class"] == type(convobject).__name__)
+
+
 def write_checkpoint(opt, ckpt_dir, generation, backend=DILL_RELOAD_BACKEND):
     """Write and atomically publish one checkpoint generation.
 
@@ -502,6 +637,7 @@ def write_checkpoint(opt, ckpt_dir, generation, backend=DILL_RELOAD_BACKEND):
             "structural_fingerprint": structural_fingerprint(opt.options),
             "model_files": model_files,
             "initially_fixed_nonants": initially_fixed_nonant_names(opt),
+            "extension_state": gather_extension_state(opt),
             "trivial_bound": _as_float_or_none(
                 getattr(opt, "trivial_bound", None)),
             "best_bound_obj_val": _as_float_or_none(
