@@ -574,10 +574,9 @@ Consequences, all deliberate:
 the terminal-checkpoint model. Writing at completed iterations subsumes most of
 what they were for — a checkpoint from a recent completed iteration always
 exists, so `--checkpoint-every-seconds` and the anticipatory
-`--checkpoint-before-seconds` have no gap left to fill, and neither is
-implemented. What remained genuinely useful was the opposite of insurance: a
-way to write **less** often, to buy back the per-iteration cost on models with
-many cheap scenarios.
+`--checkpoint-before-seconds` looked to have no gap left to fill. What remained
+genuinely useful was the opposite of insurance: a way to write **less** often,
+to buy back the per-iteration cost on models with many cheap scenarios.
 
 `--checkpoint-every-iterations K` **is implemented** and is that control; its
 meaning inverted along the way — it is a cost control, not a safety net. Writes
@@ -597,8 +596,45 @@ only stop knowable at the hook — convergence, the user converger and
 `--time-limit` are all decided in the *next* iteration's top half, and the
 cylinder-convergence test fires after the hook.
 
-The original rationale for the other two triggers is preserved below for the
-record.
+**`--checkpoint-before-seconds S` is implemented**, and it is there because the
+"no gap left to fill" argument above quietly assumed `K = 1`. Nobody runs K = 1
+on the models this feature is for — serializing every scenario every iteration
+is the cost K exists to avoid — and at K > 1 a run against a wall clock stops
+*between* multiples of K. It can also stop before the first one, in which case
+there is no checkpoint at all, and the directory still holds `spokes/`, so it
+looks like checkpointing worked. `--time-limit` does not help: it is compared
+against elapsed time in exactly one place, at the top of an iteration
+(`phbase.py`), never during a solve, so it overshoots by up to a full iteration
+and forces no write.
+
+So at each completed iteration that is not already a checkpoint point,
+`Checkpointer._deadline_is_near` asks whether *another* iteration would carry
+the run past S seconds of elapsed wall clock — `elapsed +
+_last_iteration_seconds >= S` — and writes if it would. Three properties are
+load-bearing:
+
+- **The test goes through `allreduce_or`.** Elapsed wall clock is rank-local,
+  and the hub write is a collective bracketed by barriers, so a rank that
+  believed its own clock alone would hang the cylinder for the rest of the job.
+  The iteration-count tests are evaluated *first*, so the ranks either all
+  reach the collective or all skip it. `TestDeadlineOnOneRankDoesNotHangTheOthers`
+  (`test_checkpoint_multirank.py`, driver `multirank_deadline_driver.py`) skews
+  the clock on one rank of two and asserts the job returns; without the
+  `allreduce_or` it hangs.
+- **It latches.** Past the deadline every later iteration also qualifies, and
+  writing at all of them is the per-iteration cost K was set to avoid, at the
+  point in the run where the user has said time is short.
+- **Nothing is added to S.** The estimate is the plain measured duration of the
+  most recent iteration (item 9), and no margin is added for the write the
+  trigger itself causes. That cost is legible in the log from the bracketing
+  `toc` (item 10), and sizing S around it is the user's to do — mpi-sppy does
+  not estimate a user's number for them.
+
+`--checkpoint-every-seconds` is still not implemented and still has no case:
+between K and the deadline trigger, the stops that come up are covered.
+
+The original rationale for the two seconds-based triggers is preserved below
+for the record.
 
 **Other options**
 
@@ -877,11 +913,13 @@ Touch-points an implementation needs beyond the PoC's extension/subclass hacks:
      `allreduce_or(now − last_checkpoint ≥ S)` so all ranks decide together
      (mirroring the `time_limit` check in `phbase.py`), avoiding a rank-skew
      deadlock at the write barrier.
-   - *anticipated one-shot* (`--checkpoint-before-seconds`) — also at the hook,
-     testing `allreduce_or(elapsed + last_iteration_seconds ≥ S)` with the same
-     collective pattern, then latching so it fires at most once (§8). It needs the
-     most-recent iteration duration (item 9); everything else it shares with the
-     periodic path.
+   - *anticipated one-shot* (`--checkpoint-before-seconds`) — **implemented**,
+     at the hook, testing `allreduce_or(elapsed + last_iteration_seconds ≥ S)`
+     with the same collective pattern, then latching so it fires at most once
+     (§8). It needs the most-recent iteration duration (item 9); everything
+     else it shares with the periodic path. The iteration-count tests run
+     ahead of it so that the ranks agree on whether the collective is reached
+     at all.
    - *at each completed iteration* — after the subproblem solve, the only point
      in the loop where the dual weights and the nonants describe the same
      iteration (§8). There is no terminal trigger and no
@@ -907,13 +945,23 @@ Touch-points an implementation needs beyond the PoC's extension/subclass hacks:
    yet: `slam_heuristic` is an inner-bound spoke that is not an xhatter, and the
    lagrangian/lagranger loops call `enditer` per pass but nothing calls
    `maybe_checkpoint` for them (§5.6 lists what they would carry).
-9. **Most-recent iteration duration kept on `self`.** `iterk_loop` (`phbase.py`)
-   times each iteration into a *local* `iteration_start_time`, used only by the
-   `display_progress` print. `--checkpoint-before-seconds` needs that duration at
-   the checkpoint hook, so record it on the object (e.g. `self._last_iteration_seconds`) as
-   each iteration completes — and record iteration 0's duration the same way, since
-   it is the seed the first time the trigger is tested (§8). Nothing else in PH
-   changes: no new hook, no change to the loop's control flow.
+9. **Most-recent iteration duration kept on `self`. Implemented.** `iterk_loop`
+   (`phbase.py`) timed each iteration into a *local* `iteration_start_time`, used
+   only by the `display_progress` print. `--checkpoint-before-seconds` needs that
+   duration at the checkpoint hook, so it is recorded on the object as
+   `self._last_iteration_seconds` as each iteration completes — and iteration 0's
+   the same way, since it is the seed the first time the trigger is tested (§8).
+   Nothing else in PH changed: no new hook, no change to the loop's control flow.
+
+   Two details the implementation had to settle. The duration covers the *whole*
+   iteration, including any checkpoint written inside it, because the question
+   being asked is whether there is room for another whole iteration. And the
+   value **rides in the checkpoint**, so a resume seeds from a measured PH
+   iteration: a resumed run's own iteration 0 reloads models instead of solving
+   them, so timing it would describe a reload and hand the trigger an
+   underestimate on the first iteration of exactly the leg — the second day of a
+   two-day study — that the option exists for. A checkpoint written before that
+   key existed simply falls back to iteration 0.
 10. **`toc` on both ends of every checkpoint write.** The `Checkpointer` emits a
     `global_toc` when a write begins and another when it completes — on every
     trigger, hub and spokes alike, gated on `cylinder_rank == 0` so a multi-rank
@@ -1104,10 +1152,10 @@ as a branch stacked on the 1a PR.
   §11.1 A/B harness, serial): **farmer** bit-identical A vs B; no iter-0
   subproblem solve occurs on resume; geometry/cfg mismatch refused.
 - **Phase 1b — Retired; its instances landed in Phase 2.**
-  `--checkpoint-every-iterations` shipped in 1a, and `--checkpoint-every-seconds`
-  and the anticipated one-shot `--checkpoint-before-seconds` are **not
-  implemented and not planned**: §8 records why writing at every completed
-  iteration subsumes them. All that was left of this phase was the harder test
+  `--checkpoint-every-iterations` shipped in 1a and the anticipated one-shot
+  `--checkpoint-before-seconds` shipped later (§8, once the K = 1 assumption
+  behind dropping it was seen to be wrong); `--checkpoint-every-seconds` is
+  **not implemented and not planned**. All that was left of this phase was the harder test
   instances, and Phase 2 absorbed both rather than leaving a phase standing
   that adds no machinery: **farmer + `--cvar`** and **`sizes`** are cases in
   `test_checkpoint_multirank.py`. Nothing is outstanding here; the bullet

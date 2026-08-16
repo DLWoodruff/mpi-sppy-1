@@ -68,6 +68,12 @@ untouched. The last iteration of an exhausted iteration limit is always
 written, because raising ``--max-iterations`` and resuming is a supported
 workflow and that iterate is known-good and already in memory.
 
+``--checkpoint-before-seconds S`` covers the stop K does not: a run that ends
+against a wall clock rather than at an iteration limit, at an iteration that
+is not a multiple of K. It adds one extra checkpoint point, at the end of the
+last iteration that is expected to finish before S seconds have elapsed. See
+``_deadline_is_near``.
+
 A checkpoint therefore describes a *completed PH iteration*. A run that ends
 before finishing iteration 1 publishes nothing: no iteration completed, so
 there is no iterate to resume from. Iteration 0 is deliberately not a
@@ -95,23 +101,31 @@ and the spokes.
 **Multi-rank cylinders.** A hub spread over several ranks holds its scenarios
 in slices, so one checkpoint generation spans all of them and is published only
 once every rank's files are on disk. The write is therefore collective (see
-``mpisppy/utils/checkpointing.py``), and what makes that safe is that the
-trigger below is a pure function of the absolute iteration number and the
-iteration limit -- identical on every rank of a synchronous PH cylinder, so the
-ranks reach the write together without being asked. A trigger that depended on
-anything rank-local (elapsed wall-clock, say) would have to be put through
-``allreduce_or`` first or it would deadlock the write.
+``mpisppy/utils/checkpointing.py``), and the iteration-count triggers below are
+safe in it because they are pure functions of the absolute iteration number and
+the iteration limit -- identical on every rank of a synchronous PH cylinder, so
+the ranks reach the write together without being asked.
+
+The deadline trigger is not: elapsed wall clock is rank-local, and a rank that
+decided to write alone would hang the cylinder at the write barrier for the
+rest of the job. So it is put through ``allreduce_or`` before it is believed,
+and the cheap iteration-count tests are evaluated *first* so that the ranks
+either all skip that collective or all reach it. Any trigger added later has
+to do the same.
 
 The *spoke* incumbent write needs none of that. Each rank writes only its own
 file, and the incumbent objective that gates the write comes from an
 all-reduced objective evaluation, so the ranks are already in step; the design
 deliberately keeps spokes uncoordinated with the hub and with each other
-(section 9, item 6).
+(section 9, item 6). A spoke has no use for the cadence or deadline triggers
+either -- it already writes whenever it has something new to write -- so both
+are hub-only and a spoke simply ignores them.
 
 See ``doc/designs/checkpointing_design.md``.
 """
 
 import os
+import time
 
 from mpisppy import global_toc
 from mpisppy.extensions.extension import Extension
@@ -135,6 +149,18 @@ class Checkpointer(Extension):
                 f"{self.every}. It counts completed iterations between "
                 f"writes; 1 writes at every iteration."
             )
+
+        #: --checkpoint-before-seconds S, or None. See _deadline_is_near.
+        before = options.get("checkpoint_before_seconds", None)
+        self.before_seconds = None if before is None else float(before)
+        if self.before_seconds is not None and self.before_seconds <= 0:
+            raise RuntimeError(
+                f"--checkpoint-before-seconds must be positive, got "
+                f"{self.before_seconds}. It is a wall-clock deadline measured "
+                f"from the start of this run."
+            )
+        #: Set once the deadline trigger has fired, so it fires at most once.
+        self._before_seconds_fired = False
 
         # Restore-only: --resume-from without --checkpoint-dir. The hub does
         # not need the extension for that (its resume branch is in Iter0), but
@@ -329,9 +355,65 @@ class Checkpointer(Extension):
         workflow, and dropping the last K-1 iterations of a run that ended by
         finishing its budget would lose work that is known to be coherent and
         is sitting in memory.
+
+        Failing all that, the deadline trigger gets a look. The order matters
+        for more than speed: everything above is a pure function of the
+        iteration number, so every rank of a multi-rank cylinder answers it
+        the same way, and the ranks either all skip the collective below or
+        all reach it.
         """
         iteration = int(getattr(self.opt, "_PHIter", 0))
-        return iteration % self.every == 0 or self._is_final_iteration()
+        if iteration % self.every == 0 or self._is_final_iteration():
+            return True
+        return self._deadline_is_near()
+
+    def _deadline_is_near(self):
+        """``--checkpoint-before-seconds S``: is there time for another one?
+
+        The gap this closes is the one ``--checkpoint-every-iterations K``
+        opens. At K > 1 a run against a hard wall clock -- a scheduler slot, a
+        ``--time-limit`` -- can stop at an iteration that is not a multiple of
+        K, and then the newest checkpoint is up to K-1 iterations old. If K is
+        larger than the number of iterations the run ever completes, there is
+        no checkpoint at all. So at the end of each completed iteration this
+        asks whether *another* iteration would carry the run past S seconds of
+        elapsed wall clock, and writes now if it would.
+
+        The estimate of "another iteration" is the last one measured
+        (``PHBase._last_iteration_seconds``), seeded by iteration 0. That is
+        the whole model: mpi-sppy does not pad it, and S is not adjusted for
+        the write it triggers. The write's own cost is bracketed by ``toc`` in
+        ``_write`` so it can be read off a log rather than guessed at, and
+        leaving room for it is the user's to do when choosing S.
+
+        **The test goes through allreduce_or**, because elapsed wall clock is
+        rank-local and the hub write is a collective bracketed by barriers: a
+        rank that decided to write while another decided not to would hang the
+        cylinder for the rest of the job. Everything that could return early
+        here is identical on every rank -- the option itself, and a latch set
+        only from the all-reduced answer -- so the ranks arrive at the
+        collective together.
+
+        Latched afterwards because the deadline passes only once. Without it
+        every subsequent iteration would also be past S and would write, which
+        is the per-iteration cost K was set to avoid, at the point in the run
+        where the user has said time is short.
+        """
+        if self.before_seconds is None or self._before_seconds_fired:
+            return False
+        last = getattr(self.opt, "_last_iteration_seconds", None)
+        elapsed = time.perf_counter() - self.opt.start_time
+        near = self.opt.allreduce_or(
+            elapsed + (0.0 if last is None else last) >= self.before_seconds)
+        if near:
+            self._before_seconds_fired = True
+            global_toc(
+                f"Within one iteration of --checkpoint-before-seconds "
+                f"{self.before_seconds} ({elapsed:.1f} seconds elapsed, last "
+                f"iteration {0.0 if last is None else last:.1f}); "
+                f"checkpointing now",
+                self.opt.cylinder_rank == 0)
+        return near
 
     def maybe_checkpoint(self):
         """Write the checkpoint if this iteration is a checkpoint point.

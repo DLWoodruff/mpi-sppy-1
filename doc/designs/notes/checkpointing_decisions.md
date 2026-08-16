@@ -95,6 +95,12 @@ Writing every iteration **subsumes** `--checkpoint-every-seconds` and the
 anticipatory `--checkpoint-before-seconds`: a checkpoint from the last
 completed iteration always exists, so neither has a gap left to fill.
 
+*(Half of that held. The argument assumes K = 1, which is not what anyone runs
+— K > 1 is the whole reason the option exists — and at K > 1 a run stopped by
+a wall clock stops between multiples of K, or before the first one. So
+`--checkpoint-before-seconds` was implemented after all; see §8 of the design.
+`--checkpoint-every-seconds` still has no case.)*
+
 The trigger still worth building was `--checkpoint-every-iterations K`, and its
 meaning had **inverted**. It was designed as insurance — write *more* often. It
 is now a cost control — write *less* often, to buy back the overhead above on

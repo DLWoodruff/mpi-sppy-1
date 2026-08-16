@@ -84,7 +84,7 @@ NON_STRUCTURAL_CFG_KEYS = frozenset({
     # cadence knob like the iteration limit: it changes what a stop costs, not
     # what problem the checkpoint describes.
     "checkpoint_dir", "checkpoint_backend", "checkpoint_every_iterations",
-    "resume_from",
+    "checkpoint_before_seconds", "resume_from",
     # Display, logging and output destinations.
     "verbose", "display_progress", "display_timing",
     "display_convergence_detail", "tee_rank0_solves", "trace_prefix",
@@ -644,6 +644,14 @@ def write_checkpoint(opt, ckpt_dir, generation, backend=DILL_RELOAD_BACKEND):
                 getattr(opt, "best_bound_obj_val", None)),
             "best_solution_obj_val": _as_float_or_none(
                 getattr(opt, "best_solution_obj_val", None)),
+            # How long a PH iteration of this run takes, so a resume can seed
+            # --checkpoint-before-seconds with a measurement instead of with
+            # its own iteration 0, which on a resume reloads models rather
+            # than solving them. This is the iteration *before* the one being
+            # written -- the current one is not over until after this write --
+            # which is the recent iteration the trigger wants either way.
+            "last_iteration_seconds": _as_float_or_none(
+                getattr(opt, "_last_iteration_seconds", None)),
         }
         _atomic_write_bytes(
             os.path.join(staging_dir, _leaf_filename(rank)),

@@ -47,12 +47,14 @@ limit by nearly an hour, and you have to set the limit below your wall-clock
 allocation by at least one iteration's worth of solve time for it to help at
 all.
 
-It also does not force a checkpoint to be written -- see `Choosing K`_.
+It also does not force a checkpoint to be written. That is what
+``--checkpoint-before-seconds`` is for (`Guarding against a scheduler
+timeout`_).
 
 The options
 ~~~~~~~~~~~
 
-There are four, and they are the whole interface:
+There are five, and they are the whole interface:
 
 ``--checkpoint-dir DIR``
    Where checkpoints are written. Giving it is what turns checkpointing on;
@@ -62,6 +64,12 @@ There are four, and they are the whole interface:
    Write at every K-th completed iteration instead of every one. The default is
    ``1``, but on a real model you will want it higher -- see `Choosing K`_,
    which is the one decision here that repays some thought.
+
+``--checkpoint-before-seconds S``
+   Also write once, at the last iteration boundary expected to arrive within S
+   seconds of the start of the run. For a run that will be stopped by a clock
+   rather than by its iteration limit -- see `Guarding against a scheduler
+   timeout`_.
 
 ``--resume-from DIR``
    Start from the checkpoint in ``DIR`` instead of from scratch.
@@ -160,7 +168,8 @@ you find out the next day::
 
 If you want the cheap single checkpoint, either turn the other stopping
 criteria off (``--rel-gap 0.0 --abs-gap 0.0``) or accept that an early
-convergence may leave you nothing.
+convergence may leave you nothing. ``--time-limit`` is the one of them you can
+cover outright -- see below.
 
 **Guarding against a scheduler timeout.** On a batch system the thing to avoid
 is the scheduler killing the job partway through a solve. Give the run a
@@ -170,19 +179,37 @@ itself at an iteration boundary instead::
   ... --max-iterations 500 --time-limit 28800 \
       --checkpoint-dir ./ckpt --checkpoint-every-iterations 10
 
-``--time-limit`` does not *force* a write. What you resume from is the last
-multiple of K, exactly as for any other stop, so sizing K matters more here than
-anywhere else: you cannot predict which iteration the limit will fall on.
+``--time-limit`` does not *force* a write. On its own, what you resume from is
+the last multiple of K, exactly as for any other stop -- and you cannot predict
+which iteration the limit will fall on, so at ``K = 10`` a run stopped this way
+loses up to nine iterations, or all of them if it never reached a multiple of K.
+
+``--checkpoint-before-seconds S`` closes that gap::
+
+  ... --max-iterations 500 --time-limit 28800 \
+      --checkpoint-dir ./ckpt --checkpoint-every-iterations 10 \
+      --checkpoint-before-seconds 28800
+
+At the end of each completed iteration it asks whether *another* iteration
+would take the run past S seconds since it started, and writes now if it would.
+The estimate is simply how long the last iteration took, so the option is worth
+most when your iterations take similar amounts of time; where they vary wildly,
+a short iteration followed by a long one can still overrun S.
+
+It writes at most once. Past the deadline every later iteration would qualify
+too, and writing at all of them is the cost K was set to avoid.
+
+**S is yours to size, and nothing is added to it.** In particular the write
+itself is not: it takes as long as any other checkpoint of your models, and it
+starts when S has all but arrived. Read a write's cost off the ``toc`` lines in
+your own log (`What it costs`_) and leave room for it, along with anything else
+that must happen before the scheduler's axe falls. Setting S equal to
+``--time-limit``, as above, is the usual choice: the write then lands at the
+last iteration boundary before the time limit stops the run.
 
 .. note::
-   There is no option to write a checkpoint a fixed number of seconds before a
-   deadline, and none to write one every N seconds. Both were designed and then
-   deliberately dropped: writing at every completed iteration already leaves a
-   recent checkpoint on disk, so an anticipatory trigger had no gap left to
-   fill. That argument gets weaker the larger K is. If you are running with a
-   large K against a hard wall-clock deadline and want an anticipatory write,
-   it is a reasonable thing to ask for -- the hook it would attach to already
-   exists -- so raise it rather than assuming it was ruled out on merit.
+   There is still no option to write a checkpoint every N seconds. Between K
+   and this one, the cases that came up are covered.
 
 Writing only at iteration boundaries is deliberate. PH computes xbar, updates
 the dual weights, gives extensions their mid-iteration hook, and only then

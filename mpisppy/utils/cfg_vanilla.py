@@ -966,6 +966,11 @@ def add_checkpointing(cylinder_dict, cfg):
             {"checkpoint_dir": cfg.get("checkpoint_dir", None),
              "checkpoint_backend": cfg.checkpoint_backend,
              "checkpoint_every_iterations": cfg.checkpoint_every_iterations,
+             # Forwarded to the spokes too, which ignore it: they write
+             # whenever they have something new, so there is nothing for a
+             # deadline to anticipate.
+             "checkpoint_before_seconds":
+                 cfg.get("checkpoint_before_seconds", None),
             })
 
     if _hasit(cfg, 'resume_from'):
