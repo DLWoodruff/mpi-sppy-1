@@ -8,8 +8,16 @@ use is a planned stop: a multi-day study that ends each day and resumes the next
 morning on the same cluster, losing at most the work done since the last
 checkpoint.
 
+Two words are used precisely throughout this page. A **run** is one execution of
+the software. A **study** is the whole piece of work: one run, or several linked
+by checkpoints. Iteration *numbers* belong to the study and carry across a
+resume, while the two ways to bound the work are named for what each one
+counts: ``--max-iterations`` bounds the run being started, and
+``--stop-at-iteration-number`` bounds the study. A run ends at whichever of
+them arrives first.
+
 A resumed run picks up from the last checkpoint that was **published**, which is
-not always the iteration at which the run stopped. How far back that can be is
+not always the iteration at which the previous run stopped. How far back that is
 set by ``--checkpoint-every-iterations``; read `Choosing K`_ before relying on
 this for anything expensive.
 
@@ -31,16 +39,20 @@ Give a directory and the run keeps a checkpoint up to date as it goes::
   python -m mpisppy.generic_cylinders --module-name farmer --num-scens 3 \
       --solver-name cplex --max-iterations 100 --default-rho 1.0 \
       --time-limit 28800 \
-      --checkpoint-dir ./ckpt
+      --checkpoint-dir ./ckpt --checkpoint-every-iterations 10
 
 A checkpoint always describes a **completed** PH iteration -- never a partial
 one -- and only one is kept at a time, so the directory holds the most recent
-iteration that was both completed and due a write. By default every completed
-iteration is due one; ``--checkpoint-every-iterations`` changes that, and on a
-real model you will want it to (`Choosing K`_).
+iteration that was both completed and due a write. Leaving
+``--checkpoint-every-iterations`` off makes every completed iteration due one,
+which is rarely what you want on a real model -- hence the ``10`` above, and
+`Choosing K`_.
 
-``--time-limit`` is how you get a run to stop on its own before a scheduler
-kills it, but be clear about what it does: the elapsed time is compared against
+``--time-limit`` is one way to end a run without counting iterations, and the
+easiest to schedule a day around; ``--rel-gap``, ``--abs-gap``, the convergence
+threshold and a user converger all end one just as cleanly. It is how you get a
+run to stop on its own before a scheduler kills it, but be clear about what it
+does: the elapsed time is compared against
 the limit **once per iteration, at the top**, and nowhere else. It is not
 checked during a solve. So a run whose iterations take an hour can overshoot the
 limit by nearly an hour, and you have to set the limit below your wall-clock
@@ -54,7 +66,7 @@ timeout`_).
 The options
 ~~~~~~~~~~~
 
-There are five, and they are the whole interface:
+There are six, and they are the whole interface:
 
 ``--checkpoint-dir DIR``
    Where checkpoints are written. Giving it is what turns checkpointing on;
@@ -63,24 +75,31 @@ There are five, and they are the whole interface:
 ``--checkpoint-every-iterations K``
    Write at every K-th completed iteration instead of every one. The default is
    ``1``, but on a real model you will want it higher -- see `Choosing K`_,
-   which is the one decision here that repays some thought.
+   which is the one decision here that repays some thought. Leaving it off does
+   not turn iteration-driven writes off: it writes at every iteration, which is
+   the safest cadence and the most expensive one.
 
 ``--checkpoint-before-seconds S``
-   Also write once, at the last iteration boundary expected to arrive within S
+   Write once, at the last iteration boundary expected to arrive within S
    seconds of the start of the run. For a run that will be stopped by a clock
    rather than by its iteration limit -- see `Guarding against a scheduler
    timeout`_.
 
+``--stop-at-iteration-number T``
+   End the study at iteration ``T``, counted across every run linked by
+   checkpoints. Unset by default, which leaves ``--max-iterations`` -- the
+   bound on this run alone -- as the only thing that ends a run. Setting it is
+   how you say "finish at 500 however many mornings that takes"; see
+   `Resuming`_.
+
 ``--resume-from DIR``
-   Start from the checkpoint in ``DIR`` instead of from scratch.
+   Start from the checkpoint in ``DIR`` instead of from scratch. Iteration
+   numbering carries on from there rather than restarting, because the numbers
+   count the study rather than this run.
 
 ``--checkpoint-backend``
    How model state is stored. ``dill-reload`` is the default and currently the
    only implemented value, so there is no reason to set it.
-
-``--max-iterations`` is not a checkpoint option, but it interacts with them and
-is the one people trip over: it bounds the **study**, not the leg. See
-`Resuming`_.
 
 .. warning::
    **Nothing is published until the first iteration completes.** A run killed
@@ -113,32 +132,20 @@ checkpoints are iterations 10, 20, 30, and so on. K is not a countdown from
 whenever the current run happened to begin: it does not restart at a resume,
 and there is no drift. The default is ``1``, which writes at every iteration.
 
-**What it costs you.** Only one checkpoint is kept, so at any moment the
-directory holds the most recent multiple of K that completed. If the run stops
-anywhere else -- a time limit, convergence, a crash -- the iterations after
-that point are gone and the resumed run redoes them. That is at most K-1
-iterations, and it is the whole trade: you are buying back write time with
-work you are willing to repeat.
+For example, with ``K = 10`` a run stopped by ``--time-limit`` after 34
+completed iterations leaves a checkpoint of iteration 30, and iterations 31
+through 34 are lost. Resuming picks up at 31 and the next checkpoint is
+iteration 40 -- not 41, because the count follows the study, not the run that
+resumes it. Had that run instead stopped at 34 by exhausting ``--max-iterations``,
+iteration 34 would have been written as well, for the reason in the next
+paragraph.
 
-For example, with ``K = 10`` a run that stops at iteration 34 leaves a
-checkpoint of iteration 30, and iterations 31 through 34 are lost. Resuming
-picks up at 31 and the next checkpoint is iteration 40 -- not 41, because the
-count follows the study, not the resumed leg.
-
-**How to size it.** "At most K-1 iterations" assumes you reach a multiple of K
-at all. If you never do, you lose everything: with ``K = 50`` and a run that
-only ever completes 30 iterations, no checkpoint is written and there is
-nothing to resume from. So pick K against the number of iterations you expect
-to **complete**, not against the iteration limit you set -- and leave enough
-margin that the run passes several multiples of K before any plausible
-stopping point.
-
-**The one exception.** The final iteration of an exhausted ``--max-iterations``
-budget is always written, whatever K is. With ``--max-iterations 100`` and
-``K = 30`` the checkpoints are iterations 30, 60, 90 and 100. Raising the limit
-and resuming is a normal way to extend a study, and that last iterate is
-known-good and already in memory, so it is not worth discarding to save one
-write. No other kind of stop can be caught this way: a time limit, the
+**The one exception.** The final iteration of an exhausted iteration budget is
+always written, whatever K is -- either budget, whichever ended the run. With
+``--max-iterations 100`` and ``K = 30`` the checkpoints are iterations 30, 60,
+90 and 100. Resuming to carry a study further is ordinary, and that last
+iterate is known-good and already in memory, so it is not worth discarding to
+save one write. No other kind of stop can be caught this way: a time limit, the
 convergence threshold and a user converger are all tested partway through the
 *next* iteration, by which point there is nothing coherent left to write.
 
@@ -153,7 +160,8 @@ Two cases worth calling out
 **Setting K equal to the iteration limit.** With ``--max-iterations 40
 --checkpoint-every-iterations 40`` you get exactly one checkpoint, at iteration
 40, and pay for exactly one write. If all you want is the option of extending
-the study later by raising the limit, that is the cheapest way to get it.
+the study later by resuming for more iterations, that is the cheapest way to
+get it.
 
 The catch is that it only works when the iteration limit is what stops the run.
 Anything else -- ``--rel-gap``, ``--abs-gap``, the convergence threshold, a user
@@ -170,6 +178,8 @@ If you want the cheap single checkpoint, either turn the other stopping
 criteria off (``--rel-gap 0.0 --abs-gap 0.0``) or accept that an early
 convergence may leave you nothing. ``--time-limit`` is the one of them you can
 cover outright -- see below.
+
+.. _Guarding against a scheduler timeout:
 
 **Guarding against a scheduler timeout.** On a batch system the thing to avoid
 is the scheduler killing the job partway through a solve. Give the run a
@@ -206,10 +216,6 @@ your own log (`What it costs`_) and leave room for it, along with anything else
 that must happen before the scheduler's axe falls. Setting S equal to
 ``--time-limit``, as above, is the usual choice: the write then lands at the
 last iteration boundary before the time limit stops the run.
-
-.. note::
-   There is still no option to write a checkpoint every N seconds. Between K
-   and this one, the cases that came up are covered.
 
 Writing only at iteration boundaries is deliberate. PH computes xbar, updates
 the dual weights, gives extensions their mid-iteration hook, and only then
@@ -248,14 +254,22 @@ Point a new run at the directory::
 The resumed run continues from the checkpointed iterate rather than starting
 over. It does **not** re-solve the subproblems at iteration 0 -- for large MIPs
 that solve is often the most expensive in the run, and its answer would be
-thrown away. Iteration numbering continues where it left off, so
-``--max-iterations`` bounds the run as a whole rather than each leg of it.
+thrown away. Iteration numbering continues where it left off, but the budget
+does not: ``--max-iterations`` bounds the run you are starting. To resume a run
+that stopped at iteration 4 and do two more, pass ``--max-iterations 2``, and
+the study ends at iteration 6.
 
-.. warning::
-   That last point is the one thing people get wrong. To resume a run that
-   stopped at iteration 4 and take it to 6, pass ``--max-iterations 6``, not
-   ``--max-iterations 2``. Passing 2 says the budget was already spent at
-   iteration 4, and the resumed run does nothing.
+Say where the *study* should end and mpi-sppy will work the rest out::
+
+  python -m mpisppy.generic_cylinders --module-name farmer --num-scens 3 \
+      --solver-name cplex --max-iterations 100 --default-rho 1.0 \
+      --stop-at-iteration-number 500 --resume-from ./ckpt
+
+That run does at most 100 iterations, and stops earlier if it reaches
+iteration 500 of the study. Submitting the same command each morning walks a
+500-iteration study forward in 100-iteration days without anyone having to
+subtract. A run that starts from a checkpoint at or past 500 reports that the
+study is already finished and does nothing, rather than quietly running on.
 
 Trying it out
 -------------
@@ -289,9 +303,13 @@ is the answer to compare against::
 
   $GC --max-iterations 4 --checkpoint-dir ./ckpt
 
-**3. Resume it** and let it finish the remaining two iterations::
+**3. Resume it** and let it finish the remaining two iterations -- two, not
+six, because the limit is this run's::
 
-  $GC --max-iterations 6 --resume-from ./ckpt --solution-base-name resumed_soln
+  $GC --max-iterations 2 --resume-from ./ckpt --solution-base-name resumed_soln
+
+``--max-iterations 6 --stop-at-iteration-number 6`` would do the same thing
+without the subtraction: six iterations offered, the study ending at 6.
 
 What you should see
 ~~~~~~~~~~~~~~~~~~~
@@ -325,10 +343,14 @@ tolerance instead, since a resumed run can land on a different optimal solution
 
 .. note::
    In the resumed run the *Best Incumbent* column reads ``inf`` for an
-   iteration or two before the restored value reappears. The spoke restores its
-   incumbent immediately but publishes it to the hub at its first checkpoint
-   point, so the hub's display lags briefly. Nothing is lost -- the column
-   settles back to the restored value, and the final answer is unaffected.
+   iteration or two before the restored value reappears. The spoke restores
+   its incumbent in ``pre_iter0`` but cannot send it from there -- the send
+   buffers do not exist yet -- so it publishes on the next pass of its own
+   loop, which is also where it offers to write. That pass costs no solve and
+   is not gated by ``--checkpoint-every-iterations`` or by having a
+   ``--checkpoint-dir`` at all, so the lag is the hub's display catching up
+   and nothing more. The column settles back to the restored value, and the
+   final answer is unaffected.
 
 To exercise the multi-rank path as well, give each cylinder more than one rank
 -- ``-np 6`` with three cylinders gives each of them two::
@@ -351,8 +373,13 @@ requires the same number of MPI ranks with the same scenarios on each, and a
 configuration that matches everywhere except a short list of settings a resume
 may legitimately change:
 
-* **the budget** -- ``--max-iterations``, ``--time-limit``, the gap and
-  stalling thresholds;
+* **the budget, and every termination criterion** -- ``--max-iterations``,
+  ``--stop-at-iteration-number``, ``--time-limit``, ``--rel-gap``,
+  ``--abs-gap``, ``--intra-hub-conv-thresh`` and ``--max-stalled-iters``.
+  All of them say when to stop rather than what is being solved, so all of
+  them may differ: deciding over breakfast that the study should end at 500
+  rather than 400, or that a 1% gap is close enough after all, continues the
+  same problem;
 * **solver choice and how it is driven** -- ``--solver-name``, solver options
   and thread counts, mipgaps, and every per-cylinder solver setting. Tightening
   a mipgap on day two continues the same problem rather than redefining it;
