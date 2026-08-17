@@ -124,7 +124,9 @@ class _ResumeABMixin:
         reference = self._leg("A", "--max-iterations", str(self.N))
         stopped = self._leg("B1", "--max-iterations", str(self.STOP),
                             "--checkpoint-dir", self.ckpt_dir)
-        resumed = self._leg("B2", "--max-iterations", str(self.N),
+        # --max-iterations bounds this run, so leg B2 asks for the iterations
+        # B1 did not do rather than for the study total.
+        resumed = self._leg("B2", "--max-iterations", str(self.N - self.STOP),
                             "--resume-from", self.ckpt_dir)
         return reference, stopped, resumed
 
