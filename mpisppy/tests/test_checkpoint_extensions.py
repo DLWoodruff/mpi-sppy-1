@@ -164,7 +164,9 @@ class _ABMixin:
         reference.ph_main()
         stopped = self._ph(self.STOP, ckpt_dir=self.ckpt_dir)
         stopped.ph_main()
-        resumed = self._ph(self.N, resume_from=self.ckpt_dir)
+        # --max-iterations counts this run's iterations, so the resumed leg
+        # asks for the ones that are left rather than for the study total.
+        resumed = self._ph(self.N - self.STOP, resume_from=self.ckpt_dir)
         resumed.ph_main()
         self.assertTrue(resumed._resumed_from_checkpoint,
                         msg="the third leg started from scratch")
