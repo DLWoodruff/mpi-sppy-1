@@ -197,6 +197,9 @@ run_phase "test_checkpoint (serial)" \
 run_phase "test_checkpoint_extensions (serial)" \
     coverage run --rcfile=.coveragerc -m pytest mpisppy/tests/test_checkpoint_extensions.py -v
 
+run_phase "test_checkpoint_spoke_cursor (serial)" \
+    coverage run --rcfile=.coveragerc -m pytest mpisppy/tests/test_checkpoint_spoke_cursor.py -v
+
 # The cylinders and multi-rank checkpoint harnesses spawn their own mpiexec
 # jobs (one per A/B leg, in a fresh process, as the design's acceptance gate
 # asks), so they are launched serially here rather than under mpiexec.

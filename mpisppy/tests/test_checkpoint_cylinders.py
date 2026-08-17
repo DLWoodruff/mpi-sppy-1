@@ -31,6 +31,7 @@ Three properties, and they are different claims:
 
 import json
 import os
+import pickle
 import shutil
 import subprocess
 import sys
@@ -204,6 +205,55 @@ class TestFarmerCylindersResumeAB(_ResumeABMixin, unittest.TestCase):
     MODEL_ARGS = ("--num-scens", "3", "--default-rho", "1")
     SPOKE_ARGS = ("--lagrangian", "--xhatshuffle")
     INCUMBENT_SPOKE = "XhatShuffleInnerBound"
+
+    def test_the_xhatshuffle_cursor_survives_the_stop(self):
+        """The spoke picks its exploration up rather than starting over.
+
+        This leaves no trace in the answer -- farmer is deterministic, so the
+        resumed spoke reaches the same incumbent whether or not it re-walks
+        scenarios it had already tried -- so the only way to see it is to ask
+        the spoke what it was handed. Every re-try it avoids is a subproblem
+        solve it does not pay for.
+        """
+        _, stopped, resumed = self._run_ab()
+
+        self.assertTrue(
+            any(s["final_loop_state"] for s in stopped["spokes"]),
+            msg=f"the xhatshuffle spoke tracked no cursor: "
+                f"{stopped['spokes']}")
+
+        # "applied", not "read": the Checkpointer reads the file in pre_iter0
+        # whether or not the loop ever adopts what it found, so watching the
+        # read would score a discarded cursor as a success.
+        applied = [s for s in resumed["spokes"] if s["applied_loop_state"]]
+        self.assertTrue(
+            applied,
+            msg=f"no spoke adopted a restored cursor: {resumed['spokes']}")
+        # Against the file rather than the stopped run's final counter: the
+        # write happens at the bottom of a pass and the counter advances
+        # afterwards, so the two legitimately differ by one pass.
+        self.assertEqual(applied[0]["applied_loop_state"],
+                         self._checkpointed_loop_state(),
+                         msg="the spoke restored something other than the "
+                             "cursor its own checkpoint held")
+
+    def _checkpointed_loop_state(self):
+        """The loop state sitting in the xhat spoke's checkpoint file."""
+        spokes_dir = os.path.join(self.ckpt_dir, "spokes")
+        for fname in sorted(os.listdir(spokes_dir)):
+            if fname.startswith(f"spoke_{self.INCUMBENT_SPOKE}"):
+                with open(os.path.join(spokes_dir, fname), "rb") as f:
+                    return pickle.load(f)["loop_state"]
+        raise AssertionError(f"no {self.INCUMBENT_SPOKE} file in {spokes_dir}")
+
+    def test_spokes_without_a_cursor_carry_none(self):
+        """lagrangian has no loop position worth resuming; it says so."""
+        _, stopped, _ = self._run_ab()
+        by_cylinder = {s["cylinder"]: s for s in stopped["spokes"]}
+        self.assertIn("XhatShuffleInnerBound", by_cylinder)
+        for name, marker in by_cylinder.items():
+            if name != "XhatShuffleInnerBound":
+                self.assertIsNone(marker["final_loop_state"])
 
 
 @unittest.skipIf(not solver_available, "no solver is available")

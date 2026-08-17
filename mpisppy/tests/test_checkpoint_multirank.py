@@ -55,6 +55,7 @@ solver_available, solver_name, persistent_available, persistent_solver_name = \
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _DRIVER = os.path.join(_HERE, "cylinders_ab_driver.py")
 _FAILURE_DRIVER = os.path.join(_HERE, "multirank_failure_driver.py")
+_DEADLINE_DRIVER = os.path.join(_HERE, "multirank_deadline_driver.py")
 #: generic_cylinders resolves --module-name with importlib, so these are dotted
 #: names rather than paths -- which also makes the legs independent of the
 #: directory mpiexec starts in.
@@ -679,6 +680,131 @@ class TestOneRankFailingDoesNotHangTheOthers(unittest.TestCase):
         for snap in _hub_ranks(out_path):
             self.assertTrue(snap["resumed"])
             self.assertEqual(snap["resume_iteration"], self.FAIL_AT - 1)
+
+
+@unittest.skipIf(not solver_available, "no solver is available")
+@unittest.skipIf(not mpiexec_available, "mpiexec is not available")
+class TestDeadlineOnOneRankDoesNotHangTheOthers(unittest.TestCase):
+    """``--checkpoint-before-seconds`` is the one trigger that is rank-local.
+
+    Every other checkpoint point is a pure function of the iteration number, so
+    the ranks arrive at the write together without being asked. Elapsed wall
+    clock is not, and the ranks of a cylinder do not share a clock: a rank that
+    believed its own and started writing would wait in the write's barrier for
+    ranks that went on with the iteration, and the job would burn its
+    allocation with nothing in the log.
+
+    So the driver puts one rank a year past the deadline and leaves the other
+    where it was. The run either agrees -- through ``allreduce_or`` -- and
+    writes on both ranks, or it hangs; there is no third outcome, which is what
+    makes the timeout below an assertion rather than a guess.
+
+    The cadence is set past the iteration count so that nothing but the
+    deadline (and the final iteration, which is always written) can produce a
+    write, and the deadline is set to an hour that a farmer LP has no other way
+    of reaching.
+    """
+
+    N = 4
+    SKEW_AT = 2
+    SKEW_RANK = 1
+    DEADLINE = 3600.0
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.ckpt_dir = os.path.join(self._tmp.name, "ckpt")
+        cmd = [
+            "mpiexec", "-np", "2",
+            sys.executable, "-m", "mpi4py", _DEADLINE_DRIVER,
+            "--skew-on-rank", str(self.SKEW_RANK),
+            "--skew-at-generation", str(self.SKEW_AT),
+            "--module-name", _FARMER, "--num-scens", "6",
+            "--default-rho", "1", "--solver-name", solver_name,
+            "--max-iterations", str(self.N),
+            "--intra-hub-conv-thresh", "-1",
+            "--rel-gap", "0.0", "--abs-gap", "0.0",
+            "--checkpoint-dir", self.ckpt_dir,
+            "--checkpoint-every-iterations", "100",
+            "--checkpoint-before-seconds", str(self.DEADLINE),
+        ]
+        # Generous, but it is a timeout on a farmer LP that finishes in under a
+        # second when it finishes at all: what this is really measuring is
+        # whether the job returns.
+        self.result = subprocess.run(cmd, capture_output=True, text=True,
+                                     timeout=600, check=False)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_the_run_finishes(self):
+        self.assertEqual(
+            self.result.returncode, 0,
+            msg=f"the run did not survive a one-rank deadline:\n"
+                f"{self.result.stdout[-4000:]}\n{self.result.stderr[-4000:]}")
+        self.assertIn("Reached user-specified limit", self.result.stdout,
+                      msg="the run did not reach its iteration limit")
+
+    def test_the_deadline_wrote_the_skewed_generation(self):
+        """Off cadence and not the last iteration, so the deadline is the only
+        thing that could have written it -- and one rank's clock was enough."""
+        self.assertIn(f"Checkpoint written at iteration {self.SKEW_AT}",
+                      self.result.stdout)
+        self.assertIn("--checkpoint-before-seconds", self.result.stdout)
+
+    def test_every_rank_wrote_its_slice(self):
+        """A generation spans the ranks, so a write that only the skewed rank
+        joined would leave a generation that cannot be resumed."""
+        gen_dir = os.path.join(self.ckpt_dir, "hub",
+                               f"gen_{self.SKEW_AT:04d}")
+        # gen_0002 is retired by the final iteration's write, so the run's own
+        # log is what says both ranks were in it; what remains checkable here
+        # is that the generation that replaced it is whole.
+        final_dir = os.path.join(self.ckpt_dir, "hub", f"gen_{self.N:04d}")
+        self.assertFalse(os.path.isdir(gen_dir))
+        leaves = sorted(f for f in os.listdir(final_dir)
+                        if f.startswith("hub_rank_") and f.endswith(".pkl"))
+        self.assertEqual(leaves,
+                         ["hub_rank_0000.pkl", "hub_rank_0001.pkl"])
+
+    def test_it_fires_once_and_not_on_every_later_iteration(self):
+        """The skewed rank stays past the deadline for the rest of the run.
+        Without the latch, every iteration after it would write."""
+        written = [line for line in self.result.stdout.splitlines()
+                   if "Checkpoint written at iteration" in line]
+        self.assertEqual(len(written), 2, msg=f"expected the deadline write "
+                                              f"and the final one: {written}")
+
+    def test_the_deadline_checkpoint_is_resumable(self):
+        """Resume from the deadline's own generation, not the one that
+        replaced it: rerun with the iteration limit at the skew point so the
+        final-iteration rule cannot write anything later."""
+        cmd = [
+            "mpiexec", "-np", "2",
+            sys.executable, "-m", "mpi4py", _DEADLINE_DRIVER,
+            "--skew-on-rank", str(self.SKEW_RANK),
+            "--skew-at-generation", str(self.SKEW_AT),
+            "--module-name", _FARMER, "--num-scens", "6",
+            "--default-rho", "1", "--solver-name", solver_name,
+            "--max-iterations", str(self.SKEW_AT),
+            "--intra-hub-conv-thresh", "-1",
+            "--rel-gap", "0.0", "--abs-gap", "0.0",
+            "--checkpoint-dir", self.ckpt_dir,
+            "--checkpoint-every-iterations", "100",
+            "--checkpoint-before-seconds", str(self.DEADLINE),
+        ]
+        subprocess.run(cmd, capture_output=True, text=True, timeout=600,
+                       check=True)
+        self.assertEqual(_published_generation(self.ckpt_dir)["generation"],
+                         self.SKEW_AT)
+
+        _, out_path = _run_leg(
+            self._tmp.name, "resume", 2, _FARMER,
+            ("--num-scens", "6", "--default-rho", "1"), (),
+            ("--max-iterations", str(self.N),
+             "--resume-from", self.ckpt_dir))
+        for snap in _hub_ranks(out_path):
+            self.assertTrue(snap["resumed"])
+            self.assertEqual(snap["resume_iteration"], self.SKEW_AT)
 
 
 if __name__ == "__main__":

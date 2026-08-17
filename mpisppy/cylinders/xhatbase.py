@@ -12,6 +12,8 @@ import os
 import math
 
 import mpisppy.cylinders.spoke as spoke
+import mpisppy.utils.checkpointing as ckpt
+from mpisppy import global_toc
 from mpisppy.cylinders.spwindow import Field
 from mpisppy.utils.xhat_eval import Xhat_Eval
 
@@ -58,11 +60,33 @@ class XhatInnerBoundBase(spoke.InnerBoundNonantSpoke):
 
         self.opt._save_nonants() # make the cache
 
+        # Extension state last, after post_iter0 -- the same ordering the hub
+        # needs at the end of Iter0, and for the same reason: post_iter0 is
+        # where an extension rebuilds its bookkeeping from the models, so
+        # restoring before it is restoring into something about to be
+        # overwritten. The Checkpointer read the file back in pre_iter0 and
+        # has been holding this since.
+        self._restore_extension_state_if_resuming()
+
         # Optional: try an xhat loaded from a file before the normal
         # xhatter main loop. See doc/src/xhat_from_file.rst.
         self._try_file_xhat()
 
         return xhatter
+
+    def _restore_extension_state_if_resuming(self):
+        """Hand this spoke's extensions the state a resume read for them."""
+        ext = getattr(self.opt, "extobject", None)
+        if ext is None:
+            return
+        candidates = list(getattr(ext, "extdict", {}).values()) + [ext]
+        for candidate in candidates:
+            state = getattr(candidate, "restored_extension_state", None)
+            if state is None:
+                continue
+            for message in ckpt.restore_extension_state(self.opt, state):
+                global_toc(f"WARNING: {message}", self.cylinder_rank == 0)
+            return
 
     def maybe_checkpoint(self):
         """Offer the extensions a checkpoint point, once per loop pass.
@@ -71,20 +95,52 @@ class XhatInnerBoundBase(spoke.InnerBoundNonantSpoke):
         to hang a write off, so they call this instead: it is the spoke's
         half of the hook the hub fires at the end of every iteration, and it
         is what lets one Checkpointer serve both. The extension decides
-        whether the pass is worth a write -- for a spoke that will mean "has
-        my incumbent improved since the last one" -- so a loop spinning while
-        it waits on the hub costs nothing but the call.
+        whether the pass is worth a write -- for a spoke that means "has my
+        incumbent improved, or has my loop cursor moved, since the last one"
+        -- so a loop spinning while it waits on the hub costs nothing but the
+        call.
 
         Call it at the *bottom* of a pass: what a spoke checkpoints is the
         best xhat it has found, so the pass that finds one has to finish
         before the write is worth making.
 
-        Nothing writes from here yet -- the Checkpointer still refuses to
-        attach to anything but a PH hub. See section 9, items 6 and 8 of
+        See section 9, items 6 and 8 of
         doc/designs/checkpointing_design.md.
         """
         if self.opt.extensions is not None:
             self.opt.extobject.maybe_checkpoint()
+
+    def checkpoint_loop_state(self):
+        """This spoke's place in its own loop, or None if it has none.
+
+        Duck-typed, and None is the honest answer for most xhatters: only
+        xhatshuffle walks a cursor across the scenarios that a resume could
+        pick up. The others re-evaluate from scratch whenever new nonants
+        arrive, so their loop counters describe nothing worth carrying.
+        """
+        return None
+
+    def restore_loop_state(self, state):
+        """Accept what checkpoint_loop_state() returned. Returns warnings."""
+        return []
+
+    def _checkpointed_loop_state(self):
+        """The loop state a resume read for this spoke, or None.
+
+        The Checkpointer reads the spoke's file in ``pre_iter0``, which is
+        before the loop -- and its cursor -- exists, so it holds what it read
+        until the loop asks for it here. A spoke that is not resuming, or has
+        no Checkpointer attached, gets None.
+        """
+        ext = getattr(self.opt, "extobject", None)
+        if ext is None:
+            return None
+        candidates = list(getattr(ext, "extdict", {}).values()) + [ext]
+        for candidate in candidates:
+            state = getattr(candidate, "restored_loop_state", None)
+            if state is not None:
+                return state
+        return None
 
     def _try_file_xhat(self):
         """Evaluate a file-supplied xhat once, before the main loop.
