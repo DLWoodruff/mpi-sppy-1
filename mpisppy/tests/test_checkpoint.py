@@ -26,10 +26,12 @@ model swap -- without it a resumed run silently stops updating its best bound.
 import errno
 import json
 import os
+import pickle
 import shutil
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
 from unittest import mock
 
@@ -135,6 +137,19 @@ class MidIterMutator(Extension):
                 first.fix(first._value)
 
 
+class EndIterMutator(Extension):
+    """Mutate model state in enditer, which a user extension is free to do.
+
+    Shipped extensions all keep enditer read-only, so this stands in for the
+    one supplied with --user-defined-extensions. It compounds, so a checkpoint
+    taken before this hook and one taken after are never equal.
+    """
+
+    def enditer(self):
+        for s in self.opt.local_scenarios.values():
+            for ndn_i in s._mpisppy_data.nonant_indices:
+                s._mpisppy_model.rho[ndn_i]._value *= 1.05
+
 class ClockRewinder(Extension):
     """Trip the --time-limit break at a chosen iteration, without a clock race.
 
@@ -175,6 +190,8 @@ def _extension_class(name):
         return NormRhoUpdater
     if name == "miditer_mutator":
         return MidIterMutator
+    if name == "enditer_mutator":
+        return EndIterMutator
     if name == "recorder":
         return StateRecorder
     if name == "coeff_rho":
@@ -1544,6 +1561,447 @@ class TestResumeExtensionBehavior(unittest.TestCase):
         must not take the run down."""
         self._assert_write_failure_is_survived(
             OSError(errno.ENOSPC, "No space left on device"))
+
+
+class _HookRecorder(Extension):
+    """Counts maybe_checkpoint calls without writing anything."""
+
+    def __init__(self, opt=None):
+        self.opt = opt
+        self.calls = 0
+
+    def maybe_checkpoint(self):
+        self.calls += 1
+
+
+class TestCheckpointHookDispatch(unittest.TestCase):
+    """The dedicated hook exists on the extension interface and dispatches."""
+
+    def test_base_extension_hook_is_a_noop(self):
+        Extension(None).maybe_checkpoint()   # must not raise
+
+    def test_multiextension_dispatches_to_every_extension(self):
+        from mpisppy.extensions.extension import MultiExtension
+        multi = MultiExtension(None, [])
+        recorders = [_HookRecorder(), _HookRecorder()]
+        multi.extdict = {"a": recorders[0], "b": recorders[1]}
+        multi.maybe_checkpoint()
+        self.assertEqual([r.calls for r in recorders], [1, 1])
+
+    def _spoke_stub(self, extensions):
+        from mpisppy.cylinders.xhatbase import XhatInnerBoundBase
+        recorder = _HookRecorder()
+        stub = types.SimpleNamespace(
+            opt=types.SimpleNamespace(extensions=extensions,
+                                      extobject=recorder))
+        XhatInnerBoundBase.maybe_checkpoint(stub)
+        return recorder
+
+    def test_spoke_hook_fires_when_extensions_are_attached(self):
+        self.assertEqual(self._spoke_stub(Extension).calls, 1)
+
+    def test_spoke_hook_is_silent_without_extensions(self):
+        # A spoke with no extensions is the common case; it must not blow up
+        # on the extobject that does not exist.
+        self.assertEqual(self._spoke_stub(None).calls, 0)
+
+
+class TestXhatterLoopsOfferCheckpointPoints(unittest.TestCase):
+    """Every xhatter spoke loop reaches the hook on every pass.
+
+    The hub gets its checkpoint points from iterk_loop; the xhatter loops are
+    not PH iterations and had no hook at all, so these pin the calls that give
+    a spoke somewhere to write its incumbent from. The loops are driven
+    against stubs -- a real spoke needs MPI windows and a hub to talk to --
+    but the loop bodies themselves are the shipped ones.
+    """
+
+    def _drive(self, cls, options, kill_after, prep=None, extra=None):
+        """Run cls.main() for kill_after passes; return the hook recorder."""
+        spoke = object.__new__(cls)
+        recorder = _HookRecorder()
+        spoke.opt = types.SimpleNamespace(
+            options=options, extensions=Extension, extobject=recorder)
+        spoke.global_rank = 0
+        spoke.cylinder_rank = 0
+        spoke.verbose = False
+        # False for kill_after passes, then True to end the loop.
+        kills = [False] * kill_after + [True]
+        spoke.got_kill_signal = lambda: kills.pop(0)
+        spoke.update_nonants = lambda: False
+        spoke.xhat_prep = lambda: (prep if prep is not None
+                                   else types.SimpleNamespace())
+        spoke._try_average_scenario_xhat = lambda: None
+        spoke._try_feasible_xhat = lambda: None
+        if extra is not None:
+            extra(spoke)
+        cls.main(spoke)
+        return recorder
+
+    def test_xhatlooper(self):
+        from mpisppy.cylinders.xhatlooper_bounder import XhatLooperInnerBound
+        recorder = self._drive(
+            XhatLooperInnerBound,
+            {"xhat_looper_options": {"scen_limit": 1}}, kill_after=3)
+        self.assertEqual(recorder.calls, 3)
+
+    def test_xhatxbar(self):
+        from mpisppy.cylinders.xhatxbar_bounder import XhatXbarInnerBound
+        recorder = self._drive(XhatXbarInnerBound, {}, kill_after=3)
+        self.assertEqual(recorder.calls, 3)
+
+    def test_xhatspecific(self):
+        from mpisppy.cylinders.xhatspecific_bounder import (
+            XhatSpecificInnerBound)
+        recorder = self._drive(
+            XhatSpecificInnerBound,
+            {"xhat_specific_options": {"xhat_scenario_dict": {"ROOT": "s0"}}},
+            kill_after=3)
+        self.assertEqual(recorder.calls, 3)
+
+    def _shuffle_options(self):
+        return {"xhat_looper_options": {"reverse": True, "iter_step": None,
+                                        "xhat_solver_options": None}}
+
+    def _shuffle_extra(self, spoke, kills=None):
+        import random
+        spoke.random_seed = 42
+        spoke.random_stream = random.Random()
+        spoke.opt.all_scenario_names = ["s0", "s1", "s2"]
+        # A two-stage tree: ROOT's kids are leaves, so ScenarioCycler stays in
+        # its non-multistage branch and needs nothing else from the tree.
+        spoke.opt.nonleaves = {"ROOT": types.SimpleNamespace(kids=[])}
+        spoke._nonant_len_receive_buffer = types.SimpleNamespace(
+            id=lambda: 1)
+        spoke.try_scenario_dict = lambda _: False
+
+    def test_xhatshuffle(self):
+        from mpisppy.cylinders.xhatshufflelooper_bounder import (
+            XhatShuffleInnerBound)
+        recorder = self._drive(
+            XhatShuffleInnerBound, self._shuffle_options(), kill_after=3,
+            extra=self._shuffle_extra)
+        self.assertEqual(recorder.calls, 3)
+
+    def test_xhatshuffle_kill_between_tries_still_offers_a_point(self):
+        """The one exit that skips the bottom of the loop.
+
+        xhatshuffle re-checks the kill signal between its two tries and
+        returns from the middle of the pass. The try just above it may have
+        improved the incumbent, so that improvement would never be offered a
+        write.
+        """
+        from mpisppy.cylinders.xhatshufflelooper_bounder import (
+            XhatShuffleInnerBound)
+
+        def extra(spoke):
+            self._shuffle_extra(spoke)
+            spoke.update_nonants = lambda: True
+            # localnonants is a read-only property over this buffer.
+            spoke._nonant_len_receive_buffer = types.SimpleNamespace(
+                id=lambda: 1, value_array=lambda: None)
+            spoke.opt._put_nonant_cache = lambda _: None
+            spoke.opt._restore_nonants = lambda **kwargs: None
+            # while-condition, then the mid-pass re-check.
+            kills = [False, True]
+            spoke.got_kill_signal = lambda: kills.pop(0)
+
+        recorder = self._drive(
+            XhatShuffleInnerBound, self._shuffle_options(), kill_after=0,
+            extra=extra)
+        self.assertEqual(recorder.calls, 1)
+
+
+@unittest.skipIf(not solver_available,
+                 "no solver is available for the hook placement test")
+class TestCheckpointHookPlacement(unittest.TestCase):
+    """What the hub writes does not depend on extension attach order."""
+
+    STOP = 3
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.ckpt_dir = os.path.join(self._tmp.name, "ckpt")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_enditer_model_changes_are_in_the_checkpoint(self):
+        """An extension that changes a model in enditer is checkpointed.
+
+        The Checkpointer is attached first, so dispatching the write from an
+        enditer would put it ahead of this extension's: the checkpoint would
+        hold the rho of the iteration before, and because a resume starts at
+        the *next* iteration, the scaling of the last one would be lost for
+        good.
+        """
+        stopped = _make_ph(_options(self.STOP, ckpt_dir=self.ckpt_dir),
+                           extension_name="enditer_mutator")
+        stopped.ph_main()
+
+        # A per-run budget of zero: the loop body never runs, so the resumed
+        # state is exactly what the checkpoint held.
+        resumed = _make_ph(_options(0, resume_from=self.ckpt_dir),
+                           extension_name="enditer_mutator")
+        resumed.ph_main()
+
+        self.assertEqual(
+            _primal_snapshot(resumed), _primal_snapshot(stopped),
+            msg="the checkpoint was written before the last enditer, so the "
+                "model change that hook made is missing from it")
+
+
+class _SpokeStub:
+    """Stands in for the spoke communicator the Checkpointer reads."""
+
+    def __init__(self, strata_rank=2, best_inner_bound=None):
+        self.strata_rank = strata_rank
+        self.best_inner_bound = best_inner_bound
+        self.sent_bounds = []
+        self.sent_xhats = 0
+
+    def send_bound(self, value):
+        self.sent_bounds.append(value)
+
+    def send_best_xhat(self):
+        self.sent_xhats += 1
+
+
+def _xhat_eval(ckpt_dir=None, resume_from=None, **overrides):
+    """An Xhat_Eval on farmer, the object an xhat spoke drives."""
+    from mpisppy.utils.xhat_eval import Xhat_Eval
+    options = _options(1, ckpt_dir=ckpt_dir, resume_from=resume_from,
+                       **overrides)
+    return Xhat_Eval(options, SCENARIO_NAMES, farmer.scenario_creator,
+                     farmer.scenario_denouement,
+                     scenario_creator_kwargs=CREATOR_KWARGS)
+
+
+def _set_and_cache_solution(opt, base):
+    """Give every variable a distinct known value and cache it as the
+    incumbent, the way an accepted xhat evaluation does."""
+    import pyomo.environ as pyo
+    for offset, (sname, s) in enumerate(opt.local_scenarios.items()):
+        for i, var in enumerate(s.component_data_objects(pyo.Var)):
+            var.set_value(base + offset * 100 + i, skip_validation=True)
+        s._mpisppy_data.inner_bound = float(base + offset)
+    opt.update_best_solution_if_improving(float(base))
+
+
+def _solution_by_name(opt):
+    import pyomo.environ as pyo
+    return {
+        sname: {v.name: v.value
+                for v in s.component_data_objects(pyo.Var)}
+        for sname, s in opt.local_scenarios.items()
+    }
+
+
+class TestSpokeIncumbentFile(unittest.TestCase):
+    """The spoke's own checkpoint: the best xhat, by variable name.
+
+    The hub checkpoint does not carry the incumbent -- it lives in
+    best_solution_cache on the xhat spoke -- so without this file a resumed
+    run restores its iterate perfectly and still reports whatever it happens
+    to find after the restart.
+    """
+
+    CYLINDER = "XhatShuffleInnerBound"
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.ckpt_dir = os.path.join(self._tmp.name, "ckpt")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _write_one(self, base=1.0, bound=-42.0):
+        opt = _xhat_eval(ckpt_dir=self.ckpt_dir)
+        _set_and_cache_solution(opt, base)
+        path = checkpointing.write_spoke_incumbent(
+            opt, self.ckpt_dir, self.CYLINDER, 2, best_inner_bound=bound)
+        return opt, path
+
+    def test_written_where_the_design_says(self):
+        _, path = self._write_one()
+        self.assertEqual(
+            os.path.relpath(path, self.ckpt_dir),
+            os.path.join("spokes",
+                         f"spoke_{self.CYLINDER}_strata_02_rank_0000.pkl"))
+
+    def test_nothing_written_before_an_incumbent_exists(self):
+        opt = _xhat_eval(ckpt_dir=self.ckpt_dir)
+        self.assertIsNone(checkpointing.write_spoke_incumbent(
+            opt, self.ckpt_dir, self.CYLINDER, 2))
+        self.assertFalse(os.path.exists(
+            os.path.join(self.ckpt_dir, "spokes")))
+
+    def test_restores_every_variable_onto_fresh_models(self):
+        """The load-bearing test: a *different* set of models, built by the
+        scenario_creator exactly as a resumed spoke builds them, ends up
+        holding the checkpointed solution."""
+        written, _ = self._write_one(base=7.0, bound=-99.0)
+        want = _solution_by_name(written)
+
+        resumed = _xhat_eval(resume_from=self.ckpt_dir)
+        state = checkpointing.load_spoke_incumbent(
+            resumed, self.ckpt_dir, self.CYLINDER, 2)
+        self.assertIsNotNone(state)
+        obj = checkpointing.restore_spoke_incumbent(resumed, state)
+
+        self.assertEqual(obj, 7.0)
+        self.assertEqual(resumed.best_solution_obj_val, 7.0)
+        # load_best_solution is what finalize() calls; after it the models
+        # hold the restored answer.
+        self.assertTrue(resumed.load_best_solution())
+        self.assertEqual(_solution_by_name(resumed), want)
+
+    def test_per_scenario_inner_bound_survives(self):
+        """send_best_xhat packs it beside the values, so a resumed spoke that
+        published without it would send whatever the fresh models hold."""
+        self._write_one(base=3.0)
+        resumed = _xhat_eval(resume_from=self.ckpt_dir)
+        state = checkpointing.load_spoke_incumbent(
+            resumed, self.ckpt_dir, self.CYLINDER, 2)
+        checkpointing.restore_spoke_incumbent(resumed, state)
+        for offset, s in enumerate(resumed.local_scenarios.values()):
+            self.assertEqual(s._mpisppy_data.inner_bound, 3.0 + offset)
+
+    def test_missing_file_is_not_an_error(self):
+        """A run may have stopped before this spoke found anything."""
+        resumed = _xhat_eval(resume_from=self.ckpt_dir)
+        self.assertIsNone(checkpointing.load_spoke_incumbent(
+            resumed, self.ckpt_dir, self.CYLINDER, 2))
+
+    def test_a_different_spoke_does_not_read_this_one(self):
+        self._write_one()
+        resumed = _xhat_eval(resume_from=self.ckpt_dir)
+        self.assertIsNone(checkpointing.load_spoke_incumbent(
+            resumed, self.ckpt_dir, "XhatXbarInnerBound", 3))
+
+    def test_structural_mismatch_is_refused(self):
+        """Values from a differently configured model are wrong answers, not
+        stale ones."""
+        self._write_one()
+        resumed = _xhat_eval(resume_from=self.ckpt_dir)
+        resumed.options["checkpoint_structural_cfg"] = {"crops_multiplier": 2}
+        with self.assertRaises(checkpointing.CheckpointMismatch):
+            checkpointing.load_spoke_incumbent(
+                resumed, self.ckpt_dir, self.CYLINDER, 2)
+
+    def test_a_variable_the_model_no_longer_has_is_refused(self):
+        """A partially restored incumbent is a solution that was never
+        feasible for anything."""
+        _, path = self._write_one()
+        with open(path, "rb") as f:
+            state = pickle.load(f)
+        state["solutions"]["scen0"]["values"]["NoSuchVar[0]"] = 1.0
+        resumed = _xhat_eval(resume_from=self.ckpt_dir)
+        with self.assertRaises(checkpointing.CheckpointMismatch):
+            checkpointing.restore_spoke_incumbent(resumed, state)
+
+
+class TestCheckpointerSpokeMode(unittest.TestCase):
+    """The extension half: when the spoke writes, and what it tells the hub."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.ckpt_dir = os.path.join(self._tmp.name, "ckpt")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _attach(self, opt, spoke=None):
+        # SPBase.spcomm is a weakref, so the stub needs an owner that outlives
+        # the call or it is collected before the extension ever reads it.
+        self.spoke = spoke if spoke is not None else _SpokeStub()
+        opt.spcomm = self.spoke
+        return Checkpointer(opt), self.spoke
+
+    def test_attaches_to_an_xhat_spoke(self):
+        opt = _xhat_eval(ckpt_dir=self.ckpt_dir)
+        ext, _ = self._attach(opt)
+        self.assertTrue(ext.spoke_mode)
+        self.assertTrue(ext.write_enabled)
+
+    def test_writes_only_when_the_incumbent_improves(self):
+        opt = _xhat_eval(ckpt_dir=self.ckpt_dir)
+        ext, spoke = self._attach(opt)
+
+        ext.maybe_checkpoint()          # nothing found yet
+        self.assertFalse(os.path.exists(os.path.join(self.ckpt_dir, "spokes")))
+
+        _set_and_cache_solution(opt, 5.0)
+        spoke.best_inner_bound = 5.0
+        ext.maybe_checkpoint()
+        path = os.path.join(
+            self.ckpt_dir, "spokes",
+            "spoke__SpokeStub_strata_02_rank_0000.pkl")
+        self.assertTrue(os.path.exists(path))
+        first = os.stat(path).st_mtime_ns
+
+        # A pass that found nothing new must not rewrite the file; the loop
+        # calls this every time round while it waits on the hub.
+        ext.maybe_checkpoint()
+        self.assertEqual(os.stat(path).st_mtime_ns, first)
+
+    def test_restore_only_run_reads_without_writing(self):
+        writer = _xhat_eval(ckpt_dir=self.ckpt_dir)
+        _set_and_cache_solution(writer, 11.0)
+        checkpointing.write_spoke_incumbent(
+            writer, self.ckpt_dir, "_SpokeStub", 2, best_inner_bound=11.0)
+
+        # --resume-from with no --checkpoint-dir: the spoke still has to
+        # restore, which is why the extension is attached for a read too.
+        opt = _xhat_eval(resume_from=self.ckpt_dir)
+        ext, spoke = self._attach(opt)
+        self.assertFalse(ext.write_enabled)
+        ext.pre_iter0()
+        self.assertEqual(opt.best_solution_obj_val, 11.0)
+        self.assertEqual(spoke.best_inner_bound, 11.0)
+
+    def test_restore_only_run_attempts_no_write(self):
+        """--resume-from with no --checkpoint-dir has nowhere to write.
+
+        The write failure path warns rather than raises, so attempting the
+        write anyway does not fail a run -- it just warns on every
+        improvement for the rest of it, which is how this went unnoticed in a
+        cylinders run until the log was read.
+        """
+        writer = _xhat_eval(ckpt_dir=self.ckpt_dir)
+        _set_and_cache_solution(writer, 17.0)
+        checkpointing.write_spoke_incumbent(
+            writer, self.ckpt_dir, "_SpokeStub", 2, best_inner_bound=17.0)
+
+        opt = _xhat_eval(resume_from=self.ckpt_dir)
+        ext, _ = self._attach(opt)
+        ext.pre_iter0()
+        with mock.patch.object(checkpointing, "write_spoke_incumbent") as write:
+            ext.maybe_checkpoint()
+            _set_and_cache_solution(opt, 3.0)
+            ext.maybe_checkpoint()
+        write.assert_not_called()
+
+    def test_restored_bound_is_published_to_the_hub_once(self):
+        """The hub learns bounds only from what a spoke sends, so a restored
+        incumbent that is never published leaves the hub reporting an
+        infinite inner bound and gapping against it."""
+        writer = _xhat_eval(ckpt_dir=self.ckpt_dir)
+        _set_and_cache_solution(writer, 13.0)
+        checkpointing.write_spoke_incumbent(
+            writer, self.ckpt_dir, "_SpokeStub", 2, best_inner_bound=13.0)
+
+        opt = _xhat_eval(resume_from=self.ckpt_dir)
+        ext, spoke = self._attach(opt)
+        ext.pre_iter0()
+        self.assertEqual(spoke.sent_bounds, [])   # buffers may not exist yet
+
+        ext.maybe_checkpoint()
+        self.assertEqual(spoke.sent_bounds, [13.0])
+        self.assertEqual(spoke.sent_xhats, 1)
+
+        ext.maybe_checkpoint()                    # not resent every pass
+        self.assertEqual(spoke.sent_bounds, [13.0])
 
 
 class TestUnknownBackend(unittest.TestCase):
