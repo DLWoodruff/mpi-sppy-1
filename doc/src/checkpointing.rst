@@ -145,9 +145,10 @@ always written, whatever K is -- either budget, whichever ended the run. With
 ``--max-iterations 100`` and ``K = 30`` the checkpoints are iterations 30, 60,
 90 and 100. Resuming to carry a study further is ordinary, and that last
 iterate is known-good and already in memory, so it is not worth discarding to
-save one write. No other kind of stop can be caught this way: a time limit, the
-convergence threshold and a user converger are all tested partway through the
-*next* iteration, by which point there is nothing coherent left to write.
+save one write. No other kind of stop can be caught this way: a time limit,
+``--rel-gap``, ``--abs-gap``, the convergence threshold and a user converger
+are all tested partway through the *next* iteration, by which point there is
+nothing coherent left to write.
 
 Changing K between a stop and a resume is allowed; like the iteration limit,
 it describes how the run is managed rather than what problem is being solved,
