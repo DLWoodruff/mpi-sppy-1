@@ -19,11 +19,11 @@ Checkpointing is entirely opt-in. With no ``--checkpoint-dir`` the machinery is
 not attached at all, and a run that does not ask for it pays nothing.
 
 .. note::
-   The current implementation covers a **PH hub with one rank per cylinder**,
-   run on its own or with spokes. Giving any cylinder more than one rank is
-   refused at startup, and bundles and stoch-ADMM are not yet validated. See
-   ``doc/designs/checkpointing_design.md`` for the full design and the phased
-   rollout.
+   The current implementation covers a **synchronous PH hub**, run on its own
+   or with spokes, on any number of ranks per cylinder, with plain scenarios,
+   proper bundles, or stoch-ADMM. Other hub types (notably ``--APH``) are
+   refused at startup. See ``doc/designs/checkpointing_design.md`` for the full
+   design and the phased rollout.
 
 Writing a checkpoint
 --------------------
@@ -245,6 +245,25 @@ the next successful write reclaims anything the interrupted one left behind.
 Use one checkpoint directory per run. Two runs sharing one share a manifest and
 will overwrite each other.
 
+Cylinders that span several ranks
+---------------------------------
+
+Each rank holds a different slice of the scenarios, so one checkpoint is the
+whole set of per-rank files, and it is committed only once every rank has
+written its own. If any rank cannot write, none of them publishes: the previous
+checkpoint stays on disk as the resumable one and the run carries on to try
+again at the next checkpoint point. There is no state in which some ranks have
+advanced their checkpoint and others have not.
+
+You get two log lines from such a failure: one from the rank that failed,
+carrying the actual cause, and one from rank 0 naming that rank.
+
+The cost is that the ranks wait for each other at each write, which the
+bracketing ``toc`` lines include -- the slowest rank sets the pace.
+
+Nothing in this coordination reaches beyond one cylinder: a hub and its spokes
+never wait on each other, and neither do two spokes.
+
 What it costs
 -------------
 
@@ -286,17 +305,18 @@ package::
 unserializable by what its ``scenario_creator`` closes over -- most commonly a
 Pyomo rule written as a nested function that reads ``cfg`` directly, which pulls
 the whole configuration object into the model. See :ref:`scenario_creator` for
-the pattern and the fix. Checkpointing checks one scenario at setup rather than
-discovering the problem at the first write, and the error
-names the offending rule.
+the pattern and the fix. Checkpointing serializes every scenario on every rank
+at setup rather than discovering the problem at the first write, and the error
+names the offending rule and the scenario it was found in.
 
 **The synchronous PH hub only.** ``--APH`` and the other hub types are refused
 at startup when either ``--checkpoint-dir`` or ``--resume-from`` is given, as
-is any cylinder with more than one rank, an unwritable directory, an unimplemented
-backend, scenario names that would collide once made filename-safe, and any
-configuration where the checkpointing extension would not actually be
-attached. The intent is that checkpointing either works or says so at startup,
-rather than running for hours and writing nothing.
+are an unwritable directory (checked from every rank -- on a cluster a path can
+be writable from some nodes and not others), an unimplemented backend, scenario
+names that would collide once made filename-safe, and any configuration where
+the checkpointing extension would not actually be attached. The intent is that
+checkpointing either works or says so at startup, rather than running for hours
+and writing nothing.
 
 **Extension and converger state is not yet part of a checkpoint.** Extensions
 that accumulate their own state across iterations -- the rho updaters,

@@ -916,10 +916,15 @@ class TestSetupRefusals(unittest.TestCase):
             Checkpointer(self._stub(backend="leaf"))
         self.assertIn("not implemented", str(ctx.exception))
 
-    def test_multirank_is_refused_at_setup(self):
-        with self.assertRaises(RuntimeError) as ctx:
-            Checkpointer(self._stub(n_proc=2))
-        self.assertIn("single rank", str(ctx.exception))
+    def test_multirank_is_accepted_at_setup(self):
+        """Phase 2 removed the single-rank refusal.
+
+        Only the setup gate is checked here -- a real multi-rank write needs
+        real ranks, which `test_checkpoint_multirank.py` supplies under
+        mpiexec. This is what keeps the refusal from creeping back in.
+        """
+        ckpt = Checkpointer(self._stub(n_proc=2))
+        self.assertTrue(ckpt.write_enabled)
 
     def test_unwritable_directory_is_refused_at_setup(self):
         stub = self._stub()
