@@ -152,7 +152,9 @@ class _MultiRankABMixin:
         cls.reference = leg("A", "--max-iterations", str(cls.N))
         cls.stopped = leg("B1", "--max-iterations", str(cls.STOP),
                           "--checkpoint-dir", cls.ckpt_dir)
-        cls.resumed = leg("B2", "--max-iterations", str(cls.N),
+        # --max-iterations bounds this run, so leg B2 asks for the iterations
+        # B1 did not do rather than for the study total.
+        cls.resumed = leg("B2", "--max-iterations", str(cls.N - cls.STOP),
                           "--resume-from", cls.ckpt_dir)
 
     @classmethod
