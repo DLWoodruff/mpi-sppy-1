@@ -8,7 +8,7 @@ use is a planned stop: a multi-day study that ends each day and resumes the next
 morning on the same cluster, losing at most the work done since the last
 checkpoint.
 
-Two words are used precisely throughout this page. A **run** is one execution of
+Two words are used throughout this page. A **run** is one execution of
 the software. A **study** is the whole piece of work: one run, or several linked
 by checkpoints. Iteration *numbers* belong to the study and carry across a
 resume, while the two ways to bound the work are named for what each one
@@ -16,7 +16,7 @@ counts: ``--max-iterations`` bounds the run being started, and
 ``--stop-at-iteration-number`` bounds the study. A run ends at whichever of
 them arrives first.
 
-A resumed run picks up from the last checkpoint that was **published**, which is
+A resumed run picks up from the last iteration that has a **published** checkpoint, which is
 not always the iteration at which the previous run stopped. How far back that is
 set by ``--checkpoint-every-iterations``; read `Choosing K`_ before relying on
 this for anything expensive.
@@ -111,20 +111,6 @@ There are six, and they are the whole interface:
 Choosing K
 ~~~~~~~~~~
 
-A checkpoint serializes every scenario model this rank owns. That cost scales
-with the size of your models, and the only number that matters is how it
-compares with a solve: if serializing a scenario takes a small fraction of the
-time to solve it, checkpointing every iteration is free in practice, and if it
-does not, it is not. Measure it on your own model rather than guessing -- the
-bracketing ``toc`` lines around each write report it directly (`What it
-costs`_).
-
-``--checkpoint-every-iterations K`` writes less often::
-
-  python -m mpisppy.generic_cylinders --module-name farmer --num-scens 50 \
-      --solver-name cplex --max-iterations 100 --default-rho 1.0 \
-      --checkpoint-dir ./ckpt --checkpoint-every-iterations 10
-
 **What K means.** A checkpoint is written at the end of a completed iteration
 whose number is a multiple of K. The numbers are the PH iteration numbers you
 see in the log, counted from the start of the study, so with ``K = 10`` the
@@ -177,23 +163,15 @@ you find out the next day::
 
 If you want the cheap single checkpoint, either turn the other stopping
 criteria off (``--rel-gap 0.0 --abs-gap 0.0``) or accept that an early
-convergence may leave you nothing. ``--time-limit`` is the one of them you can
-cover outright -- see below.
+convergence may leave you nothing. 
 
 .. _Guarding against a scheduler timeout:
 
 **Guarding against a scheduler timeout.** On a batch system the thing to avoid
-is the scheduler killing the job partway through a solve. Give the run a
-``--time-limit`` comfortably below your wall-clock allocation and it stops
-itself at an iteration boundary instead::
+is the scheduler killing the job partway through a solve. 
 
-  ... --max-iterations 500 --time-limit 28800 \
-      --checkpoint-dir ./ckpt --checkpoint-every-iterations 10
-
-``--time-limit`` does not *force* a write. On its own, what you resume from is
-the last multiple of K, exactly as for any other stop -- and you cannot predict
-which iteration the limit will fall on, so at ``K = 10`` a run stopped this way
-loses up to nine iterations, or all of them if it never reached a multiple of K.
+``--time-limit`` does not force a write. On its own, what you resume from is
+the last multiple of K, exactly as for any other stop. 
 
 ``--checkpoint-before-seconds S`` closes that gap::
 
@@ -201,21 +179,18 @@ loses up to nine iterations, or all of them if it never reached a multiple of K.
       --checkpoint-dir ./ckpt --checkpoint-every-iterations 10 \
       --checkpoint-before-seconds 28800
 
-At the end of each completed iteration it asks whether *another* iteration
-would take the run past S seconds since it started, and writes now if it would.
-The estimate is simply how long the last iteration took, so the option is worth
-most when your iterations take similar amounts of time; where they vary wildly,
-a short iteration followed by a long one can still overrun S.
+At the end of each completed iteration it asks whether *another* iteration that takes
+as long as the most recent iteration
+would take the run past S seconds since the run started, and writes now if it would.
 
-It writes at most once. Past the deadline every later iteration would qualify
-too, and writing at all of them is the cost K was set to avoid.
+It writes at most once. 
 
-**S is yours to size, and nothing is added to it.** In particular the write
+**S is yours to size, and nothing is added to it.** In particular the checkpointing
 itself is not: it takes as long as any other checkpoint of your models, and it
 starts when S has all but arrived. Read a write's cost off the ``toc`` lines in
 your own log (`What it costs`_) and leave room for it, along with anything else
 that must happen before the scheduler's axe falls. Setting S equal to
-``--time-limit``, as above, is the usual choice: the write then lands at the
+``--time-limit``, as above, is the usual choice when ``--time-limit`` is in use: the write then lands at the
 last iteration boundary before the time limit stops the run.
 
 Writing only at iteration boundaries is deliberate. PH computes xbar, updates
@@ -237,8 +212,8 @@ how long it took::
   [ 1261.03] Checkpoint written at iteration 42
 
 A write that fails mid-run -- the disk filling up, a network filesystem
-hiccup -- does not stop the optimization. The failure is reported loudly in
-the log, the previously published checkpoint stays intact and resumable, and
+hiccup -- does not stop the optimization. The failure is reported loudly,
+the previously published checkpoint stays intact and resumable, and
 the next iteration boundary tries again. Conditions detectable at setup (an
 unwritable directory, a model that cannot be serialized) still stop the run
 at startup, before any solving is done.
@@ -253,14 +228,14 @@ Point a new run at the directory::
       --resume-from ./ckpt
 
 The resumed run continues from the checkpointed iterate rather than starting
-over. It does **not** re-solve the subproblems at iteration 0 -- for large MIPs
-that solve is often the most expensive in the run, and its answer would be
-thrown away. Iteration numbering continues where it left off, but the budget
+over. It does **not** re-solve the subproblems at iteration 0.
+Iteration numbering continues where it left off, but the budget
 does not: ``--max-iterations`` bounds the run you are starting. To resume a run
 that stopped at iteration 4 and do two more, pass ``--max-iterations 2``, and
 the study ends at iteration 6.
 
-Say where the *study* should end and mpi-sppy will work the rest out::
+You can use ``--stop-at-iteration-number`` to say where the *study* should end .
+and mpi-sppy will work the rest out::
 
   python -m mpisppy.generic_cylinders --module-name farmer --num-scens 3 \
       --solver-name cplex --max-iterations 100 --default-rho 1.0 \
@@ -371,19 +346,16 @@ What must match, and what may change
 A checkpoint records the configuration it was written with and refuses to load
 into a run that differs, rather than producing a subtly wrong answer. Resuming
 requires the same number of MPI ranks with the same scenarios on each, and a
-configuration that matches everywhere except a short list of settings a resume
+configuration that matches everywhere except a short list of settings that a resume
 may legitimately change:
 
 * **the budget, and every termination criterion** -- ``--max-iterations``,
   ``--stop-at-iteration-number``, ``--time-limit``, ``--rel-gap``,
   ``--abs-gap``, ``--intra-hub-conv-thresh`` and ``--max-stalled-iters``.
   All of them say when to stop rather than what is being solved, so all of
-  them may differ: deciding over breakfast that the study should end at 500
-  rather than 400, or that a 1% gap is close enough after all, continues the
-  same problem;
+  them may differ.
 * **solver choice and how it is driven** -- ``--solver-name``, solver options
-  and thread counts, mipgaps, and every per-cylinder solver setting. Tightening
-  a mipgap on day two continues the same problem rather than redefining it;
+  and thread counts, mipgaps, and every per-cylinder solver setting.
 * **display, tracking and output destinations**, and the checkpoint options
   themselves;
 * **which cylinders run.** The hub's primal trajectory does not depend on the
