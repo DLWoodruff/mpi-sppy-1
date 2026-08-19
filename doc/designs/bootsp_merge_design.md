@@ -1,21 +1,24 @@
 # Bootstrap/bagging for data-based stochastic programming in mpi-sppy — design
 
-**Status:** design captured and decisions ratified 2026-07-02; PR-1
-(empirical core + schultz, incl. a data-file example) implemented and open
-upstream as draft [Pyomo/mpi-sppy#783](https://github.com/Pyomo/mpi-sppy/pull/783);
-extended 2026-07-03 to state the end goal
-(`generic_cylinders` integration) and a stacked, multi-PR roadmap (§6, §9).
-PR-2 (statdist + smoothed) and PR-3 (the `generic_cylinders` integration, the
-end goal — `--boot-*` group, `do_boot`, the positional layer with a strictly
-disjoint M/N split, the `K = 1` batch executor) are implemented on the stacked
-branches `bootsp-pr-b` / `bootsp-pr-c`. PR-4 (the `K > 1` batch executor: a
-`BatchExecutor` that groups the ranks and a wheel per group from
-`--boot-batch-config-file`, retiring the interim `--boot-solver-*`) is
-implemented on `bootsp-pr-d`; both endpoints are validated end to end — the
-`G = 1` checkpoint (one group, a wheel per batch in sequence) and `G > 1`
+**Status:** design captured and decisions ratified 2026-07-02; extended
+2026-07-03 to state the end goal (`generic_cylinders` integration) and a
+stacked, multi-PR roadmap (§6, §9). PR-1 (empirical core + schultz, incl. a
+data-file example) merged 2026-07-24 as
+[Pyomo/mpi-sppy#783](https://github.com/Pyomo/mpi-sppy/pull/783), followed by
+a `test_boot_sp.py` `np=2` fix merged 2026-07-28 as
+[#820](https://github.com/Pyomo/mpi-sppy/pull/820). PR-2 (statdist + smoothed
+methods) is open upstream as
+[#818](https://github.com/Pyomo/mpi-sppy/pull/818). PR-3 (the
+`generic_cylinders` integration, the end goal — `--boot-*` group, `do_boot`,
+the positional layer with a strictly disjoint M/N split, the `K = 1` batch
+executor) is implemented on `bootsp-pr-c`; it has no PR yet. PR-4 (the
+`K > 1` batch executor: a `BatchExecutor` that groups the ranks and a wheel
+per group from `--boot-batch-config-file`, retiring the interim
+`--boot-solver-*`) is this branch; both endpoints are validated end to end —
+the `G = 1` checkpoint (one group, a wheel per batch in sequence) and `G > 1`
 (np = 4, K = 2).
 **Author:** dlw (captured with Claude Code assistance)
-**Last updated:** 2026-07-03
+**Last updated:** 2026-07-28
 
 **Ultimate goal.** The end state this design builds toward is *bootstrap and
 bagging confidence intervals, computed from a given dataset, available
