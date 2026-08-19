@@ -71,6 +71,12 @@ class Parameter:
 
 
 class BaseDistribution(object):
+    # NOTE: this is the Python 2 spelling and has no effect in Python 3, where
+    # the metaclass belongs in the class bases (metaclass=ABCMeta). It is left
+    # as-is deliberately: switching it on would make UnivariateDiscrete
+    # uninstantiable, since it has no fit() -- and it is legitimately
+    # constructed from explicit breakpoints. The contract is enforced by the
+    # abstract bodies raising instead.
     __metaclass__ = ABCMeta
 
     # --------------------------------------------------------------------
@@ -116,8 +122,20 @@ class BaseDistribution(object):
             data (List[float]): The data the distribution is to be fit to
         Returns:
                 baseDistribution: The fitted distribution
+        Raises:
+            NotImplementedError: if the subclass does not define fit
+
+        The @abstractmethod above does not enforce anything (see the note on
+        __metaclass__ below), so a subclass without its own fit inherits this
+        one. Returning None here, as this used to, hands the caller a
+        non-distribution that fails much later and far away -- statdist's
+        distribution_factory offers every registered name, not just the
+        fittable ones.
         """
-        pass
+        raise NotImplementedError(
+            f"{cls.__name__} does not implement fit(); it cannot be fitted to "
+            "data. Construct it directly if it takes explicit parameters, or "
+            "choose a distribution that supports fitting.")
 
     @staticmethod
     def seed_reset(seed=None):
@@ -260,13 +278,21 @@ class UnivariateDistribution(BaseDistribution):
         else:
             return scipy.integrate.quad(self.pdf, self.alpha, x, epsabs=epsabs)[0]
 
-    @memoize_method
     def cdf_inverse(self, x, cdf_inverse_tolerance=1e-4,
                     cdf_inverse_max_refinements=10,
                     cdf_tolerance=1e-4):
         """
         Evaluates the inverse cumulative distribution function at a given
         point x.
+
+        Not memoized, and it clears the cdf cache on the way in. Sampling calls
+        this once per draw with a fresh uniform, so a cache keyed on that
+        argument never hits and simply grows for as long as the distribution
+        lives -- and a fitted distribution lives for a whole run. The cdf cache
+        below is a different matter: the refinement search does revisit points
+        within a single inversion (measured: 31 cdf calls, 18 distinct), so it
+        earns its keep there. Clearing it here keeps that benefit without
+        letting it accumulate across draws.
 
         TODO: Explain better how this is calculated
 
@@ -281,6 +307,10 @@ class UnivariateDistribution(BaseDistribution):
         Returns:
             float: the value of the inverse cdf
         """
+        # see the note above: bound the cdf cache to one inversion
+        cache = getattr(self, "_memoize_method__cache", None)
+        if cache:
+            cache.clear()
 
         # For ease in calculating the cdf, we define this temp function.
         cdf = lambda x: self.cdf(x, epsabs=cdf_tolerance)

@@ -8,7 +8,7 @@
 ###############################################################################
 # General-purpose bootstrap code for data-based, two-stage stochastic programs.
 # These are the empirical methods (classical, extended, subsampling, bagging);
-# the smoothed methods arrive in a follow-on merge.
+# the smoothed methods live in smoothed_boot_sp.py.
 
 import os
 import math
@@ -44,8 +44,10 @@ def _require_minimization(is_minimizing, what):
     """Refuse a maximization model instead of reporting a wrong interval.
 
     Per the repo-wide rule that maximization either works or raises, this is
-    the raise. It is checked in solve_routine, which every extensive form goes
-    through.
+    the raise. solve_routine checks it, which covers every extensive form the
+    bootstrap code builds itself -- but not the candidate xhat EF on the
+    default path, which the module's own xhat_generator builds and solves. So
+    a maximization model is refused only after that first solve has run.
     """
     if not is_minimizing:
         raise ValueError(_MAXIMIZATION_MSG.format(what=what))
@@ -829,7 +831,9 @@ def compute_ci(cfg, module, xhat):
         raise ValueError(
             f"boot_method={method} is a smoothed method; it is dispatched by "
             "smoothed_boot_sp.compute_smoothed_ci, not boot_sp.compute_ci "
-            "(the drivers route smoothed methods automatically).")
+            "(the drivers route smoothed methods automatically). The methods "
+            "this function does handle are: "
+            f"{', '.join(boot_utils.empirical_members())}.")
     if method == "Extended":
         return extended_bootstrap(cfg, module, xhat)
     elif method == "Bagging_with_replacement":

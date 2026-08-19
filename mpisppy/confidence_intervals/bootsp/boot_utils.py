@@ -145,6 +145,11 @@ def cfg_for_boot():
                       description="number of points to sample from the fitted distribution for the gap center.",
                       domain=int,
                       default=None)
+    cfg.add_to_config(name="smoothed_nonlinear_solver",
+                      description="nonlinear solver for the epi-spline fit"
+                      " (the other smoothed distributions need no solver).",
+                      domain=str,
+                      default="ipopt")
     return cfg
 
 
@@ -202,6 +207,13 @@ def cfg_from_json(json_fname):
     for idx in cfg:
         if idx not in options:
             if "smoothed" in idx and "Smoothed" not in boot_method:
+                continue
+            if cfg[idx] is not None:
+                # The option carries a default (cfg was just built by
+                # cfg_for_boot), so its absence is not an error: a json written
+                # before the option existed is still a valid json. Requiring it
+                # would break every file already out there, the shipped examples
+                # included, every time an option with a default is added.
                 continue
             badtrip = True
             print(f"ERROR: {idx} not in the options read from {json_fname}")
