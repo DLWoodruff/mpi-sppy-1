@@ -23,9 +23,12 @@ import os
 import sys
 import math
 import inspect
+import glob
+import json
 import importlib.util
 import subprocess
 import tempfile
+import types
 import unittest
 from unittest import mock
 from collections import OrderedDict
@@ -66,7 +69,7 @@ module_dir = os.path.dirname(os.path.abspath(__file__))
 bootsp_examples = os.path.join(module_dir, "..", "..", "examples", "bootsp")
 
 
-def _load_example(sub):
+def _load_example(sub, stem=None):
     """ Load an examples/bootsp module under a name of its own.
 
     These examples are farmer.py, cvar.py and multi_knapsack.py, and
@@ -78,14 +81,18 @@ def _load_example(sub):
     bootsp_ prefix means the two never contend for the same name.
 
     Args:
-        sub (str): the examples/bootsp subdirectory, which is also the file stem
+        sub (str): the examples/bootsp subdirectory
+        stem (str or None): the module file stem, when it differs from sub
+            (examples/bootsp/schultz holds unique_schultz.py and
+            nonunique_schultz.py)
     Returns:
         str: the name to hand boot_utils (module_name_to_module resolves it)
     """
-    path = os.path.join(bootsp_examples, sub, f"{sub}.py")
+    stem = sub if stem is None else stem
+    path = os.path.join(bootsp_examples, sub, f"{stem}.py")
     if not os.path.exists(path):
         raise RuntimeError(f"File not found: {path}")
-    name = f"bootsp_{sub}"
+    name = f"bootsp_{stem}"
     if name not in sys.modules:
         spec = importlib.util.spec_from_file_location(name, path)
         mod = importlib.util.module_from_spec(spec)
@@ -98,6 +105,9 @@ def _load_example(sub):
 FARMER = _load_example("farmer")
 CVAR = _load_example("cvar")
 MULTI_KNAPSACK = _load_example("multi_knapsack")
+UNIQUE_SCHULTZ = _load_example("schultz", "unique_schultz")
+NONUNIQUE_SCHULTZ = _load_example("schultz", "nonunique_schultz")
+SCHULTZ_DATA = _load_example("schultz_data")
 
 MK_DATA = os.path.abspath(
     os.path.join(bootsp_examples, "multi_knapsack", "multi_knapsack_data.json"))
@@ -150,13 +160,55 @@ def _make_farmer_cfg(method="Classical_quantile", seed=100):
 
 
 #*****************************************************************************
-class Test_statdist(unittest.TestCase):
+class _RestoresGlobalNumpySeed:
+    """ Puts numpy's global random state back after each test.
+
+    statdist's seed_reset calls np.random.seed, which is process-global. Left
+    alone, a test that seeds it re-seeds the stream for every test that runs
+    later in the same process -- mpisppy/opt/aph.py draws from it. Running this
+    file on its own hides that; a whole-directory pytest run does not.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self._np_random_state = np.random.get_state()
+
+    def tearDown(self):
+        np.random.set_state(self._np_random_state)
+        super().tearDown()
+
+
+class Test_statdist(_RestoresGlobalNumpySeed, unittest.TestCase):
     """ Direct tests of the trimmed statdist univariate distributions. """
 
     def test_factory_resolves_univariate(self):
+        # `hasattr(cls, "fit") or callable(cls)` used to stand here, which is a
+        # tautology: callable(cls) is True for every class, so the assertion
+        # could not fail -- and it was the one check that would have caught
+        # univariate-discrete inheriting an unimplemented fit.
         for token in univariate_tokens:
             cls = distribution_factory(token)
-            self.assertTrue(hasattr(cls, "fit") or callable(cls), msg=token)
+            self.assertTrue(inspect.isclass(cls), msg=token)
+            self.assertEqual(cls.registered_name, token)
+
+    def test_every_fittable_token_actually_fits(self):
+        # the tokens the smoothed methods name must return a distribution, not
+        # None and not an unimplemented-fit error
+        fittable = ["univariate-unif", "univariate-normal", "univariate-student",
+                    "univariate-empirical"]
+        data = [0.5, 1.5, 2.5, 3.5, 4.5, 2.0, 3.0]
+        for token in fittable:
+            with self.subTest(token=token):
+                fitted = smoothed_boot_sp.fit_distribution(data, distr_type=token)
+                self.assertIsNotNone(fitted, msg=f"{token} fit returned None")
+                self.assertTrue(hasattr(fitted, "cdf_inverse"), msg=token)
+
+    def test_unfittable_token_says_so(self):
+        # univariate-discrete has no fit; it used to return None silently and
+        # fail far away in the caller's scenario_creator
+        with self.assertRaisesRegex(NotImplementedError, "does not implement fit"):
+            smoothed_boot_sp.fit_distribution([1.0, 2.0, 2.0],
+                                              distr_type="univariate-discrete")
 
     def test_factory_rejects_unknown(self):
         with self.assertRaises(NameError):
@@ -187,6 +239,57 @@ class Test_statdist(unittest.TestCase):
         code = ("import sys;"
                 "import mpisppy.confidence_intervals.bootsp.statdist.distributions;"
                 "print('scipy loaded:', 'scipy' in sys.modules)")
+        done = subprocess.run([sys.executable, "-c", code],
+                              capture_output=True, text=True)
+        self.assertEqual(done.returncode, 0, msg=done.stderr)
+        self.assertIn("scipy loaded: False", done.stdout)
+
+    # the subprocess imports mpi-sppy, so it initializes MPI; under an mpiexec
+    # launch it would inherit this job's environment and join it
+    @unittest.skipIf(n_proc > 1, "spawns a plain (non-MPI) python subprocess")
+    def test_scipy_not_imported_by_an_empirical_lookup(self):
+        # Importing the module is the weaker property: the registry scan walks
+        # every binding in these modules, and scipy is bound there as a pyomo
+        # DeferredImportModule that resolves on any attribute access. So the
+        # first distribution_factory() call is where scipy actually leaked in,
+        # for empirical names too -- which the import-only check above cannot
+        # see. Every name here is one the empirical methods use.
+        code = ("import sys;"
+                "from mpisppy.confidence_intervals.bootsp.statdist"
+                ".distribution_factory import distribution_factory;"
+                "[distribution_factory(n) for n in ('univariate-unif',"
+                " 'univariate-normal', 'univariate-empirical',"
+                " 'univariate-discrete', 'univariate-student')];"
+                "print('scipy loaded:', 'scipy' in sys.modules)")
+        done = subprocess.run([sys.executable, "-c", code],
+                              capture_output=True, text=True)
+        self.assertEqual(done.returncode, 0, msg=done.stderr)
+        self.assertIn("scipy loaded: False", done.stdout)
+
+    # the subprocess imports mpi-sppy, so it initializes MPI; under an mpiexec
+    # launch it would inherit this job's environment and join it
+    @unittest.skipIf(n_proc > 1, "spawns a plain (non-MPI) python subprocess")
+    def test_empirical_scenario_builds_without_scipy(self):
+        # the end of the claim: a user who installed without [extras] can run
+        # the empirical methods. Blocks scipy outright and builds a scenario
+        # the way an empirical bootstrap run does.
+        code = (
+            "import sys\n"
+            "class Block:\n"
+            "    def find_spec(self, name, path=None, target=None):\n"
+            "        if name == 'scipy' or name.startswith('scipy.'):\n"
+            "            raise ImportError('scipy blocked')\n"
+            "        return None\n"
+            "sys.meta_path.insert(0, Block())\n"
+            f"sys.path.insert(0, {os.path.join(bootsp_examples, 'farmer')!r})\n"
+            "import farmer\n"
+            "import mpisppy.utils.config as config\n"
+            "cfg = config.Config()\n"
+            "cfg.add_to_config('seed_offset', description='s', domain=int, default=0)\n"
+            "farmer.inparser_adder(cfg)\n"
+            "cfg.yield_cv = 0.1\n"
+            "farmer.scenario_creator('scen3', cfg)\n"
+            "print('scipy loaded:', 'scipy' in sys.modules)\n")
         done = subprocess.run([sys.executable, "-c", code],
                               capture_output=True, text=True)
         self.assertEqual(done.returncode, 0, msg=done.stderr)
@@ -565,11 +668,12 @@ class _Interval:
             self.cutouts = cutouts
 
 
-class Test_statdist_base(unittest.TestCase):
+class Test_statdist_base(_RestoresGlobalNumpySeed, unittest.TestCase):
     """ The generic univariate machinery in base_distribution.py: the numeric
     cdf and its inversion, expectations, sampling and parameter bookkeeping. """
 
     def setUp(self):
+        super().setUp()          # snapshots numpy's global seed
         self.d = _RampDistribution()
 
     def test_support_defaults_to_unbounded(self):
@@ -1016,6 +1120,7 @@ class Test_review_regressions(unittest.TestCase):
         cfg.candidate_sample_size = 5
         reserved = set(range(cfg.sample_size,
                              cfg.sample_size + cfg.candidate_sample_size))
+        cfg.smoothed_B_I = 3      # bagging validates this before it fits now
         # the estimators are entered through compute_smoothed_ci in real runs,
         # which is what declares use_fitted and friends on the cfg
         smoothed_boot_sp._ensure_smoothed_cfg(cfg)
@@ -1036,11 +1141,19 @@ class Test_review_regressions(unittest.TestCase):
                                    side_effect=_Stop):
                 for seed in range(20):
                     cfg.seed_offset = seed
-                    with self.assertRaises(_Stop):
+                    # the fit runs on rank 0 and its outcome is broadcast, so a
+                    # failure inside it comes back wrapped
+                    with self.assertRaises((_Stop, RuntimeError)):
                         estimator(cfg, module, {"ROOT": []})
-        self.assertTrue(seen)
-        self.assertEqual(reserved & set(seen), set(),
-                         msg="the fitting sample reached into the xhat block")
+        if my_rank == 0:
+            # the fit runs on rank 0 and is broadcast, so only rank 0 draws the
+            # fitting sample at all
+            self.assertTrue(seen)
+            self.assertEqual(reserved & set(seen), set(),
+                             msg="the fitting sample reached into the xhat block")
+        else:
+            self.assertEqual(seen, [],
+                             msg="only rank 0 should draw the fitting sample")
 
     def test_estimators_hand_cfg_back_unchanged(self):
         # use_fitted used to be left True and subsample_size overwritten, so a
@@ -1048,6 +1161,7 @@ class Test_review_regressions(unittest.TestCase):
         # stale fitted distribution
         module = boot_utils.module_name_to_module(FARMER)
         cfg = _make_farmer_cfg()
+        cfg.smoothed_B_I = 3      # bagging validates this before it fits now
         smoothed_boot_sp._ensure_smoothed_cfg(cfg)
         before = (cfg.use_fitted, cfg.fitted_distribution, cfg.subsample_size)
 
@@ -1160,6 +1274,316 @@ class Test_review_regressions(unittest.TestCase):
         smoothed_boot_sp._ensure_smoothed_cfg(cfg)
         self.assertNotIn("detdata", cfg)
         self.assertIn("use_fitted", cfg)
+
+    def test_every_shipped_json_loads(self):
+        """ Each examples/bootsp config must survive cfg_from_json.
+
+        Nothing else in the suite reads these files -- the tests build their
+        cfg programmatically -- so adding a required option to cfg_for_boot
+        could (and did) break every shipped example and .bash script with CI
+        still green.
+        """
+        # the jsons name their module as a bare "farmer" / "cvar" / ...; map
+        # those to the copies this file already loaded under bootsp_ names
+        by_bare_name = {"farmer": FARMER, "cvar": CVAR,
+                        "multi_knapsack": MULTI_KNAPSACK,
+                        "unique_schultz": UNIQUE_SCHULTZ,
+                        "nonunique_schultz": NONUNIQUE_SCHULTZ,
+                        "schultz_data": SCHULTZ_DATA}
+
+        def _resolve(name):
+            return _orig_resolve(by_bare_name.get(name, name))
+
+        _orig_resolve = boot_utils.module_name_to_module
+        pattern = os.path.join(bootsp_examples, "*", "*.json")
+        configs = [f for f in sorted(glob.glob(pattern))
+                   if not f.endswith("multi_knapsack_data.json")]  # data, not config
+        self.assertGreaterEqual(len(configs), 9, msg=f"found only {configs}")
+        for path in configs:
+            with self.subTest(json=os.path.basename(path)):
+                with mock.patch.object(boot_utils, "module_name_to_module",
+                                       _resolve):
+                    cfg = boot_utils.cfg_from_json(path)
+                self.assertIsNotNone(cfg.boot_method)
+
+    def test_draw_space_is_disjoint_from_the_data(self):
+        """ Fitted draws must never land on a data record number.
+
+        A record number is the seed the model gives a draw, and the fitted
+        distribution is close to the one the data came from, so a draw at a
+        data record reproduces that data point rather than being independent of
+        it -- which correlates the batches with the sample whose spread they
+        are measuring. This checks the property directly, for the shipped
+        smoothed configs and for offsets chosen to be awkward.
+        """
+        for name in ("smoothed_farmer.json", "smoothed_cvar.json",
+                     "smoothed_multi_knapsack.json"):
+            sub = {"smoothed_farmer.json": "farmer",
+                   "smoothed_cvar.json": "cvar",
+                   "smoothed_multi_knapsack.json": "multi_knapsack"}[name]
+            path = os.path.join(bootsp_examples, sub, name)
+            with open(path) as f:
+                shipped = json.load(f)
+            for seed_offset in (0, 1, 111, 299, 300, 5000):
+                with self.subTest(json=name, seed_offset=seed_offset):
+                    cfg = boot_utils.cfg_for_boot()
+                    for k, v in shipped.items():
+                        if k in cfg:
+                            cfg[k] = None if v == "None" else v
+                    cfg.seed_offset = seed_offset
+                    data_records = set(int(x) for x in
+                                       boot_sp.eligible_scenarios(cfg))
+                    origin = smoothed_boot_sp.draw_space_origin(cfg)
+                    m, nB = cfg.subsample_size, cfg.nB
+                    draws = set()
+                    # the center block
+                    draws.update(range(origin,
+                                       origin + (cfg.smoothed_center_sample_size or 0)))
+                    # The smoothed-bootstrap batch blocks. smoothed_bootstrap
+                    # sets subsample_size = sample_size before drawing them, so
+                    # the footprint is nB * sample_size -- using subsample_size
+                    # here would check a smaller set than the run consumes.
+                    start = origin + (cfg.smoothed_center_sample_size or 0)
+                    draws.update(range(start, start + nB * cfg.sample_size))
+                    # the bagging blocks
+                    for i in range(cfg.smoothed_B_I or 1):
+                        base = origin + nB * m * i
+                        draws.update(range(base, base + nB * m))
+                    self.assertEqual(data_records & draws, set(),
+                                     msg="a fitted draw reused a data record")
+
+    def test_coverage_replications_do_not_share_records(self):
+        """ Replication i's draws must not land on replication j's data.
+
+        draw_space_origin separates the two spaces within one replication. The
+        coverage loop then walks seed_offset by a stride, and the two spaces
+        advance together only if the stride covers both -- otherwise the next
+        replication's data records sit on the previous one's draw records, and
+        the replications a coverage rate averages over are correlated.
+        """
+        path = os.path.join(bootsp_examples, "farmer", "smoothed_farmer.json")
+        with open(path) as f:
+            shipped = json.load(f)
+        cfg = boot_utils.cfg_for_boot()
+        for k, v in shipped.items():
+            if k in cfg:
+                cfg[k] = None if v == "None" else v
+        base, nB, m = cfg.seed_offset, cfg.nB, cfg.subsample_size
+        centre = cfg.smoothed_center_sample_size or 0
+        # the stride the coverage loop actually uses, not a copy of it
+        stride = simulate_boot.replication_stride(cfg)
+
+        def draws_of(offset):
+            cfg.seed_offset = offset
+            origin = smoothed_boot_sp.draw_space_origin(cfg)
+            out = set(range(origin, origin + centre))
+            out.update(range(origin + centre,
+                             origin + centre + nB * cfg.sample_size))
+            for i in range(cfg.smoothed_B_I or 1):
+                b0 = origin + nB * m * i
+                out.update(range(b0, b0 + nB * m))
+            return out
+
+        def data_of(offset):
+            # the model seeds a data record as record_num + seed_offset
+            return set(r + offset for r in range(cfg.max_count))
+
+        reps = [base + i * stride for i in range(4)]
+        for i, oi in enumerate(reps):
+            di = draws_of(oi)
+            for j, oj in enumerate(reps):
+                if i == j:
+                    continue
+                with self.subTest(draws_from=i, data_of=j):
+                    self.assertEqual(di & data_of(oj), set())
+
+    def test_serial_mode_calls_no_collectives(self):
+        # serial means the other ranks are not in the call at all, so any
+        # collective on COMM_WORLD blocks forever. The gather was guarded; the
+        # two barriers around it were not.
+        cfg = _make_farmer_cfg()
+        module = boot_utils.module_name_to_module(FARMER)
+        smoothed_boot_sp._ensure_smoothed_cfg(cfg)
+        fake_comm = mock.MagicMock()
+        with mock.patch.object(smoothed_boot_sp, "comm", fake_comm), \
+             mock.patch.object(smoothed_boot_sp, "fit_distribution",
+                               return_value="fitted"), \
+             mock.patch.object(smoothed_boot_sp, "center_smoothed",
+                               return_value=1.0), \
+             mock.patch.object(smoothed_boot_sp, "smoothed_resample_helper",
+                               return_value=np.zeros(cfg.nB)), \
+             mock.patch.object(module, "data_sampler", lambda r, c: 1.0):
+            smoothed_boot_sp.smoothed_bootstrap(cfg, module, {"ROOT": []},
+                                                serial=True)
+        fake_comm.Barrier.assert_not_called()
+        fake_comm.Gatherv.assert_not_called()
+
+    def test_rank0_optimal_failure_reaches_every_rank(self):
+        # rank 0 raising alone used to leave the others blocking in the next
+        # collective; the outcome is broadcast now so everyone stops.
+        # The bcast is stubbed to hand back what rank 0 would have sent, which
+        # is the whole point -- on a non-root rank the local value is None, so
+        # echoing the argument would test nothing.
+        cfg = _make_farmer_cfg()
+        rank0_failure = "ValueError: this model is a max"
+        with mock.patch.object(boot_sp, "process_optimal",
+                               side_effect=ValueError("this model is a max")), \
+             mock.patch.object(simulate_boot, "comm") as fake_comm:
+            fake_comm.bcast.side_effect = lambda v, root=0: rank0_failure
+            with self.assertRaises(RuntimeError) as ctx:
+                simulate_boot._rank0_optimal(cfg, None)
+        # every rank raises, not just the one that did the work
+        self.assertIn("this model is a max", str(ctx.exception))
+        self.assertIn("does not hang", str(ctx.exception))
+        fake_comm.bcast.assert_called_once()
+
+    def test_rank0_optimal_broadcasts_success_too(self):
+        cfg = _make_farmer_cfg()
+        with mock.patch.object(boot_sp, "process_optimal",
+                               return_value=(10.0, 2.5)), \
+             mock.patch.object(simulate_boot, "comm") as fake_comm:
+            fake_comm.bcast.side_effect = lambda v, root=0: None  # no failure
+            opt_obj, opt_gap = simulate_boot._rank0_optimal(cfg, None)
+        if my_rank == 0:
+            self.assertEqual((opt_obj, opt_gap), (10.0, 2.5))
+        else:
+            # the documented contract: only rank 0 computes these
+            self.assertEqual((opt_obj, opt_gap), (None, None))
+
+    def test_stride_tolerates_an_unset_subsample_size(self):
+        # subsample_size is a bagging option the smoothed bootstrap overwrites,
+        # so "None" is reasonable in a Smoothed_boot_* json; the stride
+        # expression used to multiply it and die with a raw TypeError
+        cfg = _make_farmer_cfg("Smoothed_boot_kernel")
+        cfg.subsample_size = None
+        cfg.smoothed_center_sample_size = 20
+        cfg.smoothed_B_I = 3
+        cfg.coverage_replications = 2
+        with mock.patch.object(boot_sp, "process_optimal", return_value=(1.0, 0.5)), \
+             mock.patch.object(boot_utils, "compute_xhat", return_value={"ROOT": [1.0]}), \
+             mock.patch.object(simulate_boot, "comm") as fake_comm, \
+             mock.patch.object(simulate_boot.smoothed_boot_sp, "compute_smoothed_ci",
+                               return_value=([0.0, 1.0], 0.5)):
+            fake_comm.bcast.side_effect = lambda v, root=0: None
+            simulate_boot.smoothed_main_routine(cfg, None)   # must not raise
+
+    def test_bagging_requires_a_subsample_size(self):
+        cfg = _make_farmer_cfg("Smoothed_bagging")
+        cfg.subsample_size = None
+        cfg.smoothed_B_I = 3          # so the B_I check is not what fires
+        smoothed_boot_sp._ensure_smoothed_cfg(cfg)
+        # the public entry validates before it fits, so module can be None:
+        # reaching the fit at all would be the bug
+        with self.assertRaisesRegex(ValueError, "subsample_size"):
+            smoothed_boot_sp.smoothed_bagging(cfg, None, {"ROOT": []})
+
+    def test_smoothed_bootstrap_requires_two_batches(self):
+        # nB == 1 made np.std(..., ddof=1) nan, and user_boot's max(0, nan)
+        # clamp reports that as [0, nan] rather than failing
+        cfg = _make_farmer_cfg("Smoothed_boot_kernel")
+        cfg.nB = 1
+        smoothed_boot_sp._ensure_smoothed_cfg(cfg)
+        with self.assertRaisesRegex(ValueError, "at least 2"):
+            smoothed_boot_sp.smoothed_bootstrap(cfg, None, {"ROOT": []})
+        # and the nan it was protecting against really does survive the clamp
+        self.assertEqual(max(0, float("nan")), 0)
+
+    def test_epispline_fit_checks_the_solve(self):
+        # the caller reads model.a/w0/u0 straight off the instance, so a solve
+        # that stopped early used to yield a density built from a partial
+        # iterate, and one that loaded nothing surfaced far away as a TypeError
+        from mpisppy.confidence_intervals.bootsp.statdist import splines
+        from pyomo.opt import TerminationCondition
+
+        class _Results:
+            class solver:
+                termination_condition = TerminationCondition.maxIterations
+                status = "warning"
+
+        fake_opt = mock.Mock()
+        fake_opt.solve.return_value = _Results()
+        with mock.patch.object(splines, "SolverFactory", return_value=fake_opt):
+            with self.assertRaisesRegex(RuntimeError, "did not solve to optimality"):
+                splines.fit_distribution([1.0, 2.0, 3.0, 4.0, 5.0])
+
+    def test_kernel_cdf_uses_the_closed_form(self):
+        # the closed form existed but was named _cdf, so the base class never
+        # saw it and ran scipy.integrate.quad over pdf on every draw instead
+        cls = distribution_factory("univariate-kernel")
+        self.assertIn("cdf", cls.__dict__,
+                      msg="the kernel must override cdf, not hide it as _cdf")
+        rng = np.random.default_rng(0)
+        k = cls.fit(list(rng.normal(3.0, 1.0, 25)))
+        # same function as the base class computes, to well inside its tolerance
+        for x in np.linspace(k.alpha - 1.0, k.beta + 1.0, 25):
+            self.assertAlmostEqual(
+                k.cdf(float(x)), UnivariateDistribution.cdf(k, float(x)),
+                places=6, msg=f"x={x}")
+
+    def test_sampling_does_not_grow_a_cache_without_bound(self):
+        # cdf_inverse was memoized on a fresh uniform per draw, so the cache
+        # never hit and grew for as long as the fitted distribution lived
+        rng = np.random.default_rng(0)
+        k = distribution_factory("univariate-kernel").fit(
+            list(rng.normal(3.0, 1.0, 25)))
+        sizes = []
+        for n in (10, 200):
+            for _ in range(n):
+                k.cdf_inverse(float(rng.uniform()))
+            sizes.append(len(getattr(k, "_memoize_method__cache", {})))
+        self.assertLess(sizes[-1], 50,
+                        msg=f"cache grew to {sizes[-1]} entries across draws")
+
+    def test_uniform_rejects_reversed_support(self):
+        # a > b was accepted silently and answered nonsense (cdf_inverse of a
+        # negative-width support), instead of being refused
+        unif = distribution_factory("univariate-unif")
+        with self.assertRaisesRegex(ValueError, "a < b"):
+            unif(0.0, -28.5)
+        with self.assertRaisesRegex(ValueError, "a < b"):
+            unif(1.0, 1.0)
+
+    def test_farmer_rejects_out_of_range_yield_cv(self):
+        # _get_b has a pole at 1/sqrt(3); at and above it the uniform support
+        # is undefined or reversed, and the run used to die much later in a
+        # raw Pyomo domain error that never mentioned yield_cv
+        module = boot_utils.module_name_to_module(FARMER)
+        cfg = _make_farmer_cfg()
+        for bad in (1.0 / math.sqrt(3.0), 0.7, 0.0, -0.1):
+            cfg.yield_cv = bad
+            with self.assertRaisesRegex(ValueError, "yield_cv"):
+                module.scenario_creator("scen3", cfg)
+        cfg.yield_cv = 0.1  # still fine below the pole
+        self.assertIsNotNone(module.scenario_creator("scen3", cfg))
+
+    def test_epispline_solver_is_configurable(self):
+        # fit_distribution never forwarded **distr_options, so nonlinear_solver
+        # was pinned to ipopt with no way to change it
+        cfg = _make_farmer_cfg()
+        self.assertEqual(cfg.smoothed_nonlinear_solver, "ipopt")
+        self.assertEqual(smoothed_boot_sp.fit_options(cfg, "univariate-epispline"),
+                         {"nonlinear_solver": "ipopt"})
+        cfg.smoothed_nonlinear_solver = "conopt"
+        self.assertEqual(smoothed_boot_sp.fit_options(cfg, "univariate-epispline"),
+                         {"nonlinear_solver": "conopt"})
+        # the others take no solver and would reject one
+        for other in ("univariate-kernel", "univariate-unif"):
+            self.assertEqual(smoothed_boot_sp.fit_options(cfg, other), {})
+
+    def test_smoothed_requires_data_sampler(self):
+        # a module without it used to die on a bare AttributeError, and only
+        # after the candidate xhat EF had been solved
+        cfg = _make_farmer_cfg("Smoothed_bagging")
+        module = types.ModuleType("no_data_sampler")
+        with self.assertRaisesRegex(RuntimeError, "data_sampler"):
+            smoothed_boot_sp.compute_smoothed_ci(cfg, module, {"ROOT": []})
+
+    def test_compute_ci_names_the_empirical_methods(self):
+        cfg = _make_farmer_cfg("Smoothed_bagging")
+        with self.assertRaises(ValueError) as ctx:
+            boot_sp.compute_ci(cfg, None, {"ROOT": []})
+        for method in boot_utils.empirical_members():
+            self.assertIn(method, str(ctx.exception))
 
     def test_farmer_data_sampler_has_no_spurious_zeros(self):
         # the first group is the unperturbed *scenario*; the perturbation

@@ -145,6 +145,11 @@ def cfg_for_boot():
                       description="number of points to sample from the fitted distribution for the gap center.",
                       domain=int,
                       default=None)
+    cfg.add_to_config(name="smoothed_nonlinear_solver",
+                      description="nonlinear solver for the epi-spline fit"
+                      " (the other smoothed distributions need no solver).",
+                      domain=str,
+                      default="ipopt")
     return cfg
 
 
@@ -202,6 +207,13 @@ def cfg_from_json(json_fname):
     for idx in cfg:
         if idx not in options:
             if "smoothed" in idx and "Smoothed" not in boot_method:
+                continue
+            if cfg[idx] is not None:
+                # The option carries a default (cfg was just built by
+                # cfg_for_boot), so its absence is not an error: a json written
+                # before the option existed is still a valid json. Requiring it
+                # would break every file already out there, the shipped examples
+                # included, every time an option with a default is added.
                 continue
             badtrip = True
             print(f"ERROR: {idx} not in the options read from {json_fname}")
@@ -285,12 +297,25 @@ def compute_xhat(cfg, module):
     xgo.pop("solver_name", None)  # it will be given explicitly
     xgo.pop("num_scens", None)
     xgo.pop("scenario_names", None)  # given explicitly
+    # The candidate solve runs on rank 0 alone and can fail: an infeasible
+    # candidate EF, a missing solver or license, a bad kw_creator kwarg. Rank 0
+    # raising by itself would leave the others in the bcast below with nobody
+    # ever sending, so the outcome travels with the result and everyone raises.
     if my_rank == 0:
-        xhat_k = xhat_fct(xhat_scenario_names, solver_name=cfg.solver_name, **xgo)
+        try:
+            xhat_k = xhat_fct(xhat_scenario_names, solver_name=cfg.solver_name,
+                              **xgo)
+            failure = None
+        except Exception as e:
+            xhat_k, failure = None, f"{type(e).__name__}: {e}"
     else:
-        xhat_k = None
+        xhat_k, failure = None, None
     if n_proc > 1:
-        xhat_k = comm.bcast(xhat_k, root=0)
+        xhat_k, failure = comm.bcast((xhat_k, failure), root=0)
+    if failure is not None:
+        raise RuntimeError(
+            f"computing the candidate xhat failed on rank 0 ({failure}); "
+            "every rank is stopping so the run does not hang")
     return xhat_k
 
 

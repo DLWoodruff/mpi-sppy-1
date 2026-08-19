@@ -29,25 +29,86 @@ my_rank = boot_utils.my_rank
 rankcomm = boot_utils.rankcomm
 
 
-def fit_distribution(sample_data, distr_type='univariate-epispline'):
+def fit_options(cfg, distr_type):
+    """ The fit options a distribution type takes from cfg.
+
+    Args:
+        cfg (Config): parameters
+        distr_type (str): a statdist univariate distribution token
+    Returns:
+        dict of keyword arguments for the distribution's fit()
+
+    Only the epi-spline fit solves anything, so it is the only one with a
+    solver to choose; the rest take no options from cfg and would reject them.
+    """
+    if distr_type == "univariate-epispline":
+        return {"nonlinear_solver": cfg.smoothed_nonlinear_solver}
+    return {}
+
+
+def fit_distribution(sample_data, distr_type='univariate-epispline',
+                     **distr_options):
     """ Fit a (univariate) distribution to sample data.
 
     Args:
         sample_data (list or list of dict): a list of scalars (one variable) or
             a list of dicts (multivariate, keyed by variable name)
         distr_type (str): a statdist univariate distribution token
+        distr_options: keyword arguments for the distribution's fit()
+            (see fit_options)
     Returns:
         the fitted distribution (or a dict of them, keyed as the input dicts)
     """
     distr_func = statdist.distribution_factory(distr_type)
-    if isinstance(sample_data[0], (float, int)):  # 1-dim
-        fitted_distr = distr_func.fit(sample_data)
+    # Test for the dict, not for float/int: numpy scalars are the ordinary
+    # return type of a data_sampler and only some of them subclass the python
+    # builtins (np.float64 does, np.int64 and np.float32 do not), so an
+    # integer-valued sampler would fall into the multivariate branch and fail
+    # inside the library with no hint that its return type was the cause.
+    if not isinstance(sample_data[0], dict):  # 1-dim
+        fitted_distr = distr_func.fit(sample_data, **distr_options)
     else:
         fitted_distr = {}
         for key in sample_data[0]:
             data = [data_dict[key] for data_dict in sample_data]
-            fitted_distr[key] = distr_func.fit(data)
+            fitted_distr[key] = distr_func.fit(data, **distr_options)
     return fitted_distr
+
+
+def _batch_barrier(serial):
+    """ Synchronize the ranks between batch phases, unless this run is serial.
+
+    Args:
+        serial (bool): one rank is doing every batch
+
+    In serial mode the other ranks are not in this call at all, so a collective
+    on COMM_WORLD blocks forever waiting for them -- the same reason the gather
+    that follows is guarded.
+    """
+    if not serial:
+        comm.Barrier()
+
+
+def draw_space_origin(cfg):
+    """ The first record number the fitted-distribution draws may use.
+
+    Args:
+        cfg (Config): parameters
+    Returns:
+        int
+
+    The draws must not reuse the record numbers the data occupies. A record
+    number is the seed the model gives a draw, and the fitted distribution is
+    close to the one the data came from, so a draw at a data record number is
+    the same uniform variate pushed through two nearly identical inverse CDFs:
+    it reproduces that data point instead of being independent of it. Batches
+    built from such draws are correlated with the sample the interval is
+    measuring spread around, which understates the width.
+
+    Starting the draw space past max_count keeps the two spaces disjoint for
+    any seed_offset. Do not fold this back to seed_offset alone.
+    """
+    return cfg.max_count + cfg.seed_offset
 
 
 def center_smoothed(cfg, module, xhat):
@@ -57,10 +118,15 @@ def center_smoothed(cfg, module, xhat):
     module globals' view; there is no communicator to thread through (an earlier
     signature took one and ignored it).
     """
-    assert cfg.smoothed_center_sample_size is not None, \
-        "need a sample size for smoothed bootstrap center estimation"
-    scenario_pool = list(range(cfg.seed_offset,
-                               cfg.seed_offset + cfg.smoothed_center_sample_size))
+    if cfg.smoothed_center_sample_size is None:
+        # an assert here would vanish under python -O, and the next line would
+        # then add None to an int somewhere inside the library
+        raise ValueError(
+            "smoothed_center_sample_size is required for the smoothed methods; "
+            "it is the number of draws the gap center is estimated from.")
+    origin = draw_space_origin(cfg)
+    scenario_pool = list(range(origin,
+                               origin + cfg.smoothed_center_sample_size))
 
     center_upper = boot_sp.evaluate_scenarios(cfg, module, scenario_pool, xhat, duplication=False)
     center_ef = boot_sp.solve_routine(cfg, module, scenario_pool, num_threads=2, duplication=False)
@@ -95,7 +161,7 @@ def smoothed_resample_helper(cfg, module, xhat, serial=False):
     local_boot_gaps = np.empty(local_nB, dtype=np.float64)
 
     m = cfg.subsample_size
-    start = cfg.seed_offset + (cfg.smoothed_center_sample_size or 0)
+    start = draw_space_origin(cfg) + (cfg.smoothed_center_sample_size or 0)
     # this rank's first batch in the global 0..nB-1 numbering
     first_batch = 0 if serial else sum(boot_sp.slice_lens(cfg.nB)[:my_rank])
 
@@ -112,7 +178,7 @@ def smoothed_resample_helper(cfg, module, xhat, serial=False):
 
 
 @contextmanager
-def _fitted_on_cfg(cfg, module, scenario_pool, distr_type):
+def _fitted_on_cfg(cfg, module, scenario_pool, distr_type, serial=False):
     """ Fit a distribution to the sampled data and expose it on cfg, then put
         cfg back the way it was found.
 
@@ -121,6 +187,8 @@ def _fitted_on_cfg(cfg, module, scenario_pool, distr_type):
         module (Python module): supplies data_sampler
         scenario_pool (iterable): the records to fit to
         distr_type (str): a statdist univariate distribution token
+        serial (bool): this rank is working alone, so it fits for itself and
+            takes part in no collective
 
     The estimators flip ``use_fitted`` so the module's scenario_creator draws
     from the fitted distribution rather than the real data, and the bootstrap
@@ -135,8 +203,37 @@ def _fitted_on_cfg(cfg, module, scenario_pool, distr_type):
              "subsample_size": cfg.subsample_size}
     try:
         cfg.use_fitted = False
-        sample_data = [module.data_sampler(scenario, cfg) for scenario in scenario_pool]
-        cfg.fitted_distribution = fit_distribution(sample_data, distr_type=distr_type)
+        # Fit once and hand the result round. Every rank used to fit the same
+        # data to the same distribution -- n_proc identical ipopt NLPs on the
+        # epi-spline path, for one answer -- and if a solve ever came out
+        # differently on one rank, the batches gathered from them would be
+        # draws from two different densities.
+        def _fit():
+            sample_data = [module.data_sampler(scenario, cfg)
+                           for scenario in scenario_pool]
+            return fit_distribution(sample_data, distr_type=distr_type,
+                                    **fit_options(cfg, distr_type))
+
+        if serial:
+            # no other rank is here to broadcast to
+            cfg.fitted_distribution = _fit()
+        else:
+            if my_rank == 0:
+                try:
+                    fitted, failure = _fit(), None
+                except Exception as e:
+                    fitted, failure = None, f"{type(e).__name__}: {e}"
+            else:
+                fitted, failure = None, None
+            fitted, failure = comm.bcast((fitted, failure), root=0)
+            if failure is not None:
+                # every rank raises: rank 0 leaving alone would strand the
+                # others in the next collective
+                raise RuntimeError(
+                    f"fitting the {distr_type} distribution failed on rank 0 "
+                    f"({failure}); every rank is stopping so the run does not "
+                    "hang")
+            cfg.fitted_distribution = fitted
         # From here on the draws come from the fitted distribution. Estimating
         # from the raw sample instead would give up the smoothing that is the
         # whole point of these methods.
@@ -159,23 +256,34 @@ def smoothed_bootstrap(cfg, module, xhat, distr_type='univariate-epispline', qua
         quantile (bool): use the quantile method (else the gaussian method)
         serial (bool): indicates that only one MPI rank should be used
     Returns:
-        tuple (ci_gap_two_sided, center_gap) if on MPI rank 0, else None
+        tuple (ci_gap_two_sided, center_gap) on MPI rank 0, else
+        (None, None) -- the arity matches so callers can unpack either way
 
     """
+    # the interval width comes from the spread *among* the batches, so one
+    # batch leaves it undefined: np.std(one element, ddof=1) is nan, and the
+    # nan then survives user_boot's max(0, .) clamp as a reported [0, nan].
+    # Same reasoning as the smoothed_B_I >= 2 check in bagging.
+    if cfg.nB is None or cfg.nB < 2:
+        raise ValueError(
+            "nB (the number of bootstrap batches) must be at least 2 for the "
+            f"smoothed bootstrap; got {cfg.nB}. The interval width is the "
+            "spread among the batch gaps, which a single batch does not have.")
+
     scenario_pool = boot_sp.draw_scenario_pool(cfg)
 
-    with _fitted_on_cfg(cfg, module, scenario_pool, distr_type):
+    with _fitted_on_cfg(cfg, module, scenario_pool, distr_type, serial):
         # the center: one replication at a large resample size
         # (smoothed_center_sample_size) drawn from the fitted distribution
         dag_gap = center_smoothed(cfg, module, xhat)
-        comm.Barrier()
+        _batch_barrier(serial)
 
         # each batch is a fresh set of cfg.sample_size draws from the same
         # fitted distribution, so the bootstrap batch size is the full sample
         # size (restored on the way out by _fitted_on_cfg)
         cfg.subsample_size = cfg.sample_size
         local_boot_gaps = smoothed_resample_helper(cfg, module, xhat, serial)
-        comm.Barrier()
+        _batch_barrier(serial)
 
     if serial:
         # one rank did every batch, so there is nothing to gather (and the
@@ -220,11 +328,34 @@ def smoothed_bagging(cfg, module, xhat, distr_type='univariate-kernel', serial=F
         distr_type (str): a statdist univariate distribution token to fit
         serial (bool): indicates that only one MPI rank should be used
     Returns:
-        tuple (ci_gap_two_sided, center_gap) if on MPI rank 0, else None
+        tuple (ci_gap_two_sided, center_gap) on MPI rank 0, else
+        (None, None) -- the arity matches so callers can unpack either way
     """
+    # Validate before anything is fitted: on the epi-spline path a fit is an
+    # ipopt solve plus a broadcast, and a config typo should not cost that.
+    # nB is dereferenced first of all (slice_lens divides by it), so it is
+    # checked first.
+    if cfg.nB is None or cfg.nB < 1:
+        raise ValueError(
+            "nB (the number of bags per seed point) must be a positive "
+            f"integer for smoothed bagging; got {cfg.nB}.")
+    # B_I is the number of initial seed points; s1 in the width is the variance
+    # *among* their averages, so fewer than two of them leaves it undefined
+    if cfg.smoothed_B_I is None or cfg.smoothed_B_I < 2:
+        raise ValueError(
+            "smoothed_B_I (the number of initial seed points) must be at least "
+            f"2 for smoothed bagging; got {cfg.smoothed_B_I}. The variance of "
+            "the per-seed-point averages is what estimates the between-point "
+            "term of the interval width.")
+    if cfg.subsample_size is None:
+        raise ValueError(
+            "subsample_size (the number of draws per bag) is required for "
+            "smoothed bagging; it is unset. Only the smoothed bootstrap may "
+            "leave it out, because it uses the full sample size per batch.")
+
     scenario_pool = boot_sp.draw_scenario_pool(cfg)
 
-    with _fitted_on_cfg(cfg, module, scenario_pool, distr_type):
+    with _fitted_on_cfg(cfg, module, scenario_pool, distr_type, serial):
         return _bagging_from_fitted(cfg, module, xhat, serial)
 
 
@@ -237,7 +368,8 @@ def _bagging_from_fitted(cfg, module, xhat, serial):
         xhat (dict): a candidate solution in mpi-sppy nonant format
         serial (bool): this rank does every bag, with no collectives
     Returns:
-        tuple (ci_gap_two_sided, center_gap) if on MPI rank 0, else None
+        tuple (ci_gap_two_sided, center_gap) on MPI rank 0, else
+        (None, None) -- the arity matches so callers can unpack either way
     """
     # serial means this rank does all nB bags itself, so it neither slices the
     # work nor takes part in the collectives below
@@ -254,18 +386,9 @@ def _bagging_from_fitted(cfg, module, xhat, serial):
         all_gaps = None
         avg_gaps = None
 
-    # B_I is the number of initial seed points; s1 below is the variance *among*
-    # their averages, so fewer than two of them leaves it undefined
-    if cfg.smoothed_B_I is None or cfg.smoothed_B_I < 2:
-        raise ValueError(
-            "smoothed_B_I (the number of initial seed points) must be at least "
-            f"2 for smoothed bagging; got {cfg.smoothed_B_I}. The variance of "
-            "the per-seed-point averages is what estimates the between-point "
-            "term of the interval width.")
-
     B_I = cfg.smoothed_B_I
     for i in range(B_I):
-        seed_offset_base = cfg.seed_offset + cfg.nB * cfg.subsample_size * i
+        seed_offset_base = draw_space_origin(cfg) + cfg.nB * cfg.subsample_size * i
 
         for j in range(local_nB):
             seed_offset = seed_offset_base + (first_bag + j) * cfg.subsample_size
@@ -276,10 +399,10 @@ def _bagging_from_fitted(cfg, module, xhat, serial):
             local_ef = boot_sp.solve_routine(cfg, module, scenario_pool, num_threads=2, duplication=False)
             local_optimal = pyo.value(local_ef.EF_Obj)
             local_gaps[j] = local_upper - local_optimal
+        _batch_barrier(serial)
         if serial:
             bagging_gap = local_gaps
         else:
-            comm.Barrier()
             lenlist = boot_sp.slice_lens(cfg.nB)
             comm.Gatherv(sendbuf=local_gaps, recvbuf=(bagging_gap, lenlist), root=0)
 
@@ -342,7 +465,7 @@ def compute_smoothed_ci(cfg, module, xhat):
         module (Python module): contains the scenario creator function and helpers
         xhat (dict): a candidate solution in mpi-sppy nonant format
     Returns:
-        (ci_gap_two_sided, center_gap) on MPI rank 0, else None
+        (ci_gap_two_sided, center_gap) on MPI rank 0, else (None, None)
 
     Note:
         This is the single smoothed-dispatch point shared by user_boot and
@@ -352,6 +475,17 @@ def compute_smoothed_ci(cfg, module, xhat):
     _ensure_smoothed_cfg(cfg)
     method = cfg.boot_method
     boot_utils.BootMethods.check_for_it(method)
+    # every smoothed method fits a distribution to module.data_sampler output.
+    # Checked here, before anything is solved: without it the run dies on a
+    # bare AttributeError, and only after the candidate xhat EF has been solved.
+    if not hasattr(module, "data_sampler"):
+        raise RuntimeError(
+            f"\nModule {cfg.module_name} must contain a function data_sampler "
+            f"to use a smoothed method ({method}); it is what supplies the "
+            "sample the distribution is fitted to. The empirical methods do "
+            "not need it.")
+    # on every rank, before any rank-dependent work: see the docstring there
+    boot_sp.require_minimizing_module(cfg, module)
     if method == "Smoothed_boot_epi":
         return smoothed_bootstrap(cfg, module, xhat, distr_type='univariate-epispline')
     elif method == "Smoothed_boot_kernel":

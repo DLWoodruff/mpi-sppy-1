@@ -13,5 +13,6 @@
     "boot_method": "Classical_quantile",
     "trace_fname": "None",
     "coverage_replications": 5,
+    "num_scens": "None",
     "data_file": "schultz_data.csv"
 }

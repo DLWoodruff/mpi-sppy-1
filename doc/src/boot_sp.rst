@@ -157,6 +157,23 @@ json file:
 
    $ python -m mpisppy.confidence_intervals.bootsp.simulate_boot instance.json
 
+Each replication is an independent repeat of the whole experiment: it steps
+``seed_offset``, which draws a different sample from the data-generating
+process, builds a confidence interval from it, and asks whether that interval
+covers the truth. The truth is one fixed number — the optimality gap under the
+process — so it is computed once, not per replication.
+
+.. note::
+
+   That fixed number is itself estimated, by solving over ``max_count``
+   records. If ``max_count`` is close to ``sample_size``, the estimate carries
+   about as much sampling error as the intervals being scored against it, and
+   the reported coverage rate inherits that noise. For a coverage study, either
+   set ``max_count`` well above ``sample_size``, or supply ``optimal_fname``
+   (written by ``boot_general_prep``) so the truth comes from a separate,
+   larger computation. The shipped example jsons use small values so they run
+   quickly; they are demonstrations, not calibrated studies.
+
 Arguments
 ~~~~~~~~~
 
@@ -180,20 +197,27 @@ command line (with dashes). The main options are:
 * ``xhat_fname`` / ``--xhat-fname`` — npy file with a precomputed ``xhat``, or
   the string ``"None"`` to compute it with ``xhat_generator``.
 * ``optimal_fname`` (simulation only) — npy file with a (presumed) optimal
-  value and the gap at ``xhat``, or ``"None"`` to compute both from
-  ``max_count`` scenarios. The smoothed methods report a gap interval, so their
-  coverage simulations score against the gap; supplying the file (written by
-  ``boot_general_prep``) saves recomputing it for every run.
+  value and the gap at ``xhat``, written by ``boot_general_prep``, or
+  ``"None"``. With ``"None"`` the optimal value is computed from all
+  ``max_count`` scenarios. The gap is computed too, but only where it is
+  used: the smoothed coverage simulations score their interval against it, so
+  they evaluate ``xhat`` to get the real ``z(xhat) - z*``. The empirical
+  harness scores against ``z*`` itself and never needs the gap, so it reports
+  a zero placeholder for it — a stand-in for the *solver* gap, not an
+  optimality gap. Supplying the file saves recomputing any of this per run.
 * ``coverage_replications`` (simulation only) — number of coverage replications.
 * ``boot_method`` / ``--boot-method`` — one of the tokens above.
 
-The smoothed methods use two additional options (ignored, and not required in
-the json, for the empirical methods):
+The smoothed methods use three additional options (ignored, and not required
+in the json, for the empirical methods):
 
 * ``smoothed_center_sample_size`` / ``--smoothed-center-sample-size`` — number
   of points drawn from the fitted distribution to estimate the gap center.
 * ``smoothed_B_I`` / ``--smoothed-B-I`` — number of outer replications for
   smoothed bagging.
+* ``smoothed_nonlinear_solver`` / ``--smoothed-nonlinear-solver`` — the solver
+  for the epi-spline fit (default ``ipopt``). Only the epi-spline methods solve
+  anything; the kernel methods ignore it.
 
 There may also be model-specific options added by ``inparser_adder``.
 
@@ -203,11 +227,34 @@ Batch parallelism
 The bootstrap batches are split across MPI ranks and reassembled on rank 0
 with ``Gatherv``, so a run can be accelerated with, e.g.,
 ``mpiexec -np 2 python -m mpi4py -m mpisppy.confidence_intervals.bootsp.user_boot ...``.
-The estimate on rank 0 depends on the number of ranks because each rank seeds
-its own bootstrap stream. In the standalone drivers each rank solves its own
+For the empirical methods the estimate on rank 0 depends on how the batches
+are divided up, because each group of ranks seeds its own batch stream (see
+``BatchExecutor.group_seed``). The smoothed methods do not: they address their
+draws by global batch or bag number, so a given ``seed_offset`` gives the same
+interval at any rank count. In the standalone drivers each rank solves its own
 batches as extensive forms; the ``generic_cylinders`` integration generalizes
 this to groups of ``K`` ranks per batch (see `MPI ranks: groups of K`_ below),
 of which this is the ``K = 1`` case.
+
+The optimality gap of each batch is its value at ``xhat`` minus the batch's
+optimal. For the optimal the estimators use the solver's **best bound** (an
+outer bound), not the incumbent objective: a mixed-integer batch is solved only
+to a MIP gap, so its incumbent would understate the gap. (The solver's
+incumbent is used only where no bound is reported.)
+
+What that buys is a *point* estimate that never understates: the reported gap,
+for each batch and for the pool as a whole, is at least the gap an exact solve
+would report. The interval **endpoints** carry no such guarantee. Each endpoint
+combines the point estimate with a width built from the *spread* of the batch
+gaps, and a bound slack perturbs that spread in either direction; the pivotal
+methods (``Classical_quantile``, ``Subsampling``, ``Extended``) reflect the
+bootstrap quantiles about the point estimate, so a batch slack can move both of
+their endpoints *down*. So do not read the reported interval as conservative.
+
+All of the methods converge to the exact-solve interval as the batch solves
+tighten, so when the interval itself matters, tighten the batch solves (e.g. a
+smaller ``mipgap`` via ``--boot-solver-options``) rather than relying on the
+outer bound to err in a safe direction.
 
 boot_general_prep
 ~~~~~~~~~~~~~~~~~~
@@ -458,7 +505,8 @@ empirical methods use, so it too excludes the records reserved for computing
 ``Smoothed_bagging``) fit with a Gaussian kernel and need only scipy; the
 epi-spline methods (``Smoothed_boot_epi``, ``Smoothed_boot_epi_quantile``) fit
 by solving a small Pyomo nonlinear program and additionally need a nonlinear
-solver such as ``ipopt``.
+solver, ``ipopt`` by default and any other named by
+``--smoothed-nonlinear-solver``.
 
 Three examples that need statdist ship in ``examples/bootsp``:
 
