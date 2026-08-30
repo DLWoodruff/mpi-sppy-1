@@ -215,7 +215,7 @@ def main():
                     "conv": t["conv"],
                     "wmax": t["wmax"],
                     "xerr": xerr,
-                    "xbar": " ".join("%.6g" % v for v in t["xbar"]),
+                    "xbar": " ".join("%.12g" % v for v in t["xbar"]),
                 }
             )
 

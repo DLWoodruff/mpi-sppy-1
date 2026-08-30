@@ -43,7 +43,7 @@ The mechanism is that the farmer's first-stage feasible set (`sum acres <=
 subproblem solution is just the projection of xbar onto that set, which is
 xbar itself.  Every scenario returns the same x, the primal residual is zero,
 and PH is frozen.  xbar still creeps toward the optimum at a rate exactly
-proportional to 1/rho -- 0.1726/rho acres per iteration, visible in the
+proportional to 1/rho -- 172.6/rho acres per iteration, visible in the
 `drift` column across rho = 1e4 ... 1e8 -- so at rho = 1e5 you would need
 roughly 30,000 iterations to close the gap.  Stalling, not divergence.
 
