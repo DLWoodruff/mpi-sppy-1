@@ -87,7 +87,7 @@ class FWConvTracer(Extension):
         )
 
 
-def run_one(rho, itermax, solver_name, fw_iter_limit):
+def run_one(rho, itermax, solver_name, fw_iter_limit, use_integer=False):
     options = {
         "solver_name": solver_name,
         "PHIterLimit": itermax,
@@ -115,7 +115,7 @@ def run_one(rho, itermax, solver_name, fw_iter_limit):
         farmer.scenario_creator,
         farmer.scenario_denouement,
         scenario_creator_kwargs={
-            "use_integer": False,
+            "use_integer": use_integer,
             "crops_multiplier": CROPS_MULTIPLIER,
             "num_scens": NUM_SCEN,
         },
@@ -129,23 +129,24 @@ def run_one(rho, itermax, solver_name, fw_iter_limit):
 # ups and downs are solver noise rather than algorithmic behaviour.  Counting
 # them as "rises" would report a diverging metric for a run that has in fact
 # frozen, which is exactly the mistake this study is about.
-CONV_FLOOR = 1e-12
+CONV_FLOOR_CONTINUOUS = 1e-12
+CONV_FLOOR_INTEGER = 1e-5
 
 
-def classify(trace, names, xstar):
+def classify(trace, names, xstar, conv_floor=CONV_FLOOR_CONTINUOUS):
     convs = [t["conv"] for t in trace]
     bounds = [t["bound"] for t in trace]
     tail = convs[1:] if len(convs) > 1 else convs
     rises = sum(
         1
         for a, b in zip(tail, tail[1:])
-        if b > a * (1.0 + 1e-9) and b > CONV_FLOOR
+        if b > a * (1.0 + 1e-9) and b > conv_floor
     )
     xbar = trace[-1]["xbar"]
     xerr = max(abs(xb - xstar[n]) for xb, n in zip(xbar, names))
     finite = [b for b in bounds if b == b]
     maxjump = max(
-        (b / a for a, b in zip(tail, tail[1:]) if a > 0 and b > a and b > CONV_FLOOR),
+        (b / a for a, b in zip(tail, tail[1:]) if a > 0 and b > a and b > conv_floor),
         default=1.0,
     )
     return {
@@ -164,15 +165,29 @@ def main():
     parser.add_argument("--solver", type=str, default="gurobi_direct")
     parser.add_argument("--rhos", type=float, nargs="+", default=DEFAULT_RHOS)
     parser.add_argument("--fw-iter-limit", type=int, default=10)
-    parser.add_argument("--csv", type=str, default="farmer_fwph_divergence.csv")
+    parser.add_argument("--integer", action="store_true",
+                        help="make the first-stage acreage variables integer")
+    parser.add_argument("--conv-floor", type=float, default=None,
+                        help="ignore conv changes below this when counting "
+                             "rises (default: %g continuous, %g integer)"
+                             % (CONV_FLOOR_CONTINUOUS, CONV_FLOOR_INTEGER))
+    parser.add_argument("--csv", type=str, default=None)
     args = parser.parse_args()
 
-    xstar, efobj = ef_reference(args.solver)
+    if args.conv_floor is None:
+        args.conv_floor = (CONV_FLOOR_INTEGER if args.integer
+                           else CONV_FLOOR_CONTINUOUS)
+    if args.csv is None:
+        args.csv = ("farmer_fwph_divergence%s.csv"
+                    % ("_int" if args.integer else ""))
+
+    xstar, efobj = ef_reference(args.solver, args.integer)
 
     rows, summary = [], []
     for rho in args.rhos:
-        trace, names = run_one(rho, args.itermax, args.solver, args.fw_iter_limit)
-        summary.append((rho, classify(trace, names, xstar)))
+        trace, names = run_one(rho, args.itermax, args.solver,
+                               args.fw_iter_limit, args.integer)
+        summary.append((rho, classify(trace, names, xstar, args.conv_floor)))
         for t in trace:
             xerr = max(abs(xb - xstar[n]) for xb, n in zip(t["xbar"], names))
             rows.append(
@@ -194,9 +209,10 @@ def main():
         w.writeheader()
         w.writerows(rows)
 
-    print("\n=== FWPH: farmer, %d crops, %d scenarios, %d major iterations, "
+    print("\n=== FWPH: farmer, %d crops%s, %d scenarios, %d major iterations, "
           "FW_iter_limit %d ==="
-          % (3 * CROPS_MULTIPLIER, NUM_SCEN, args.itermax, args.fw_iter_limit))
+          % (3 * CROPS_MULTIPLIER, ", INTEGER" if args.integer else "",
+             NUM_SCEN, args.itermax, args.fw_iter_limit))
     print("EF optimum %.2f" % efobj)
     print("%10s %13s %6s %10s %13s %13s %11s"
           % ("rho", "conv_last", "rises", "max jump", "bound first",
@@ -207,7 +223,7 @@ def main():
                  d["bound_first"], d["bound_last"], d["xerr"]))
     print("\n  rises/max jump ignore changes below conv = %g, where the "
           "squared\n  metric is machine zero and its motion is solver noise"
-          % CONV_FLOOR)
+          % args.conv_floor)
     print("\nfull per-iteration trace written to %s" % args.csv)
 
 

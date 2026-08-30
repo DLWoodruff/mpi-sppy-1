@@ -79,7 +79,7 @@ class ConvTracer(Extension):
         )
 
 
-def run_one(rho, itermax, solver_name):
+def run_one(rho, itermax, solver_name, use_integer=False):
     """Run PH (hub only) at a fixed rho; return the ConvTracer trace."""
     options = {
         "solver_name": solver_name,
@@ -102,7 +102,7 @@ def run_one(rho, itermax, solver_name):
         farmer.scenario_creator,
         farmer.scenario_denouement,
         scenario_creator_kwargs={
-            "use_integer": False,
+            "use_integer": use_integer,
             "crops_multiplier": CROPS_MULTIPLIER,
             "num_scens": NUM_SCEN,
         },
@@ -112,14 +112,14 @@ def run_one(rho, itermax, solver_name):
     return ph.extobject.trace, ph.extobject.nonant_names
 
 
-def ef_reference(solver_name):
+def ef_reference(solver_name, use_integer=False):
     """Root-node solution and objective of the extensive form."""
     ef = ExtensiveForm(
         {"solver": solver_name},
         ["scen{}".format(sn) for sn in range(NUM_SCEN)],
         farmer.scenario_creator,
         scenario_creator_kwargs={
-            "use_integer": False,
+            "use_integer": use_integer,
             "crops_multiplier": CROPS_MULTIPLIER,
             "num_scens": NUM_SCEN,
         },
@@ -129,21 +129,39 @@ def ef_reference(solver_name):
     return soln, ef.get_objective_value()
 
 
-def classify(trace, names, xstar):
+# Below this, conv is solver noise rather than algorithmic behaviour, and
+# counting its ups and downs as "rises" reports a diverging metric for a run
+# that has in fact frozen -- the exact mistake this study is about.  The
+# continuous default is LP feasibility tolerance; the integer default is much
+# higher because a MIQP returns integers only to its integrality tolerance, so
+# xbar wobbles in the sixth or seventh decimal while the true iterate is
+# perfectly constant.
+CONV_FLOOR_CONTINUOUS = 1e-12
+CONV_FLOOR_INTEGER = 1e-5
+
+
+def classify(trace, names, xstar, conv_floor=CONV_FLOOR_CONTINUOUS):
     """Summarize one rho's trajectory.
 
     Divergence of the *metric* is judged two ways:
       rises   -- how many iterations had conv strictly larger than the previous
       maxjump -- the largest such increase, as a ratio
+    both ignoring changes below conv_floor.
     Whether PH actually solved the problem is a separate question, answered by
     xerr = ||xbar_final - x*||_inf against the extensive-form root solution.
     """
     convs = [t["conv"] for t in trace]
     # skip iteration 1: W is still 0 there, so conv is just the wait-and-see spread
     tail = convs[1:] if len(convs) > 1 else convs
-    rises = sum(1 for a, b in zip(tail, tail[1:]) if b > a * (1.0 + 1e-9))
+    rises = sum(
+        1
+        for a, b in zip(tail, tail[1:])
+        if b > a * (1.0 + 1e-9) and b > conv_floor
+    )
     maxjump = max(
-        (b / a for a, b in zip(tail, tail[1:]) if a > 0 and b > a), default=1.0
+        (b / a for a, b in zip(tail, tail[1:])
+         if a > 0 and b > a and b > conv_floor),
+        default=1.0,
     )
     xbar = trace[-1]["xbar"]
     xerr = max(abs(xb - xstar[n]) for xb, n in zip(xbar, names))
@@ -195,17 +213,32 @@ def main():
     parser.add_argument("--itermax", type=int, default=100)
     parser.add_argument("--solver", type=str, default="gurobi_direct")
     parser.add_argument("--rhos", type=float, nargs="+", default=DEFAULT_RHOS)
-    parser.add_argument("--csv", type=str, default="farmer_divergence.csv")
-    parser.add_argument("--plot", type=str, default="farmer_divergence.png")
+    parser.add_argument("--integer", action="store_true",
+                        help="make the first-stage acreage variables integer")
+    parser.add_argument("--conv-floor", type=float, default=None,
+                        help="ignore conv changes below this when counting "
+                             "rises (default: %g continuous, %g integer)"
+                             % (CONV_FLOOR_CONTINUOUS, CONV_FLOOR_INTEGER))
+    parser.add_argument("--csv", type=str, default=None)
+    parser.add_argument("--plot", type=str, default=None)
     args = parser.parse_args()
 
-    xstar, efobj = ef_reference(args.solver)
+    if args.conv_floor is None:
+        args.conv_floor = (CONV_FLOOR_INTEGER if args.integer
+                           else CONV_FLOOR_CONTINUOUS)
+    suffix = "_int" if args.integer else ""
+    if args.csv is None:
+        args.csv = "farmer_divergence%s.csv" % suffix
+    if args.plot is None:
+        args.plot = "farmer_divergence%s.png" % suffix
+
+    xstar, efobj = ef_reference(args.solver, args.integer)
 
     rows = []
     summary = []
     for rho in args.rhos:
-        trace, names = run_one(rho, args.itermax, args.solver)
-        summary.append((rho, classify(trace, names, xstar)))
+        trace, names = run_one(rho, args.itermax, args.solver, args.integer)
+        summary.append((rho, classify(trace, names, xstar, args.conv_floor)))
         for t in trace:
             xerr = max(abs(xb - xstar[n]) for xb, n in zip(t["xbar"], names))
             rows.append(
@@ -226,8 +259,9 @@ def main():
         w.writeheader()
         w.writerows(rows)
 
-    print("\n=== farmer, %d crops, %d scenarios, %d PH iterations ==="
-          % (3 * CROPS_MULTIPLIER, NUM_SCEN, args.itermax))
+    print("\n=== farmer, %d crops%s, %d scenarios, %d PH iterations ==="
+          % (3 * CROPS_MULTIPLIER, ", INTEGER" if args.integer else "",
+             NUM_SCEN, args.itermax))
     print("EF optimum %.2f at %s"
           % (efobj, ", ".join("%s=%g" % (k.split("[")[1].rstrip("]"), v)
                               for k, v in sorted(xstar.items()))))
@@ -237,7 +271,8 @@ def main():
         print("%10g %12.4g %7d %11.4g %12.4g %12.4g"
               % (rho, d["conv_last"], d["rises"], d["maxjump"], d["xerr"],
                  d["drift"]))
-    print("\n  rises     = iterations (after the first) where conv went UP")
+    print("\n  rises     = iterations (after the first) where conv went UP,")
+    print("              ignoring changes below conv = %g" % args.conv_floor)
     print("  max jump  = largest one-iteration increase in conv, as a ratio")
     print("  |xbar-x*| = how far the final xbar really is from the EF answer")
     print("  drift     = how far xbar still moved on the last iteration")

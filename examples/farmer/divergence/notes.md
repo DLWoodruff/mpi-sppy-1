@@ -99,6 +99,54 @@ run that has frozen, which is the exact mistake this study is about.
 The outer bound is a second witness PH does not have, and it says the same
 thing: frozen at the iteration-1 value to every digit printed.
 
+## The integer case
+
+Same instance with the acreage variables declared general integer
+(`--integer` on both drivers).  The EF answer is unchanged, (80, 250, 170) at
+-108390, because the LP relaxation happens to be integral.
+
+PH:
+
+           rho    conv_last   rises    max jump    |xbar-x*|   drift/iter
+             1            0      14        2.25            0            0
+            10       0.2963      21           2       0.3333       0.6667
+           100            0       2         1.5           47            0
+          1000            0       0           1           58            0
+         10000            0       0           1           59            0
+        100000            0       0           1           59            0
+         1e+06            0       0           1           59            0
+         1e+08    9.474e-15       0           1           59    1.723e-06
+
+FWPH ends at |xbar-x*| = 0.00064, 0.0128, 32.1, 47.7, 56.6, 58.2, 58.3, 58.3
+over the same rhos, with its outer bound frozen at -115400 for rho >= 1e4 --
+the continuous FWPH column to three figures.
+
+Three findings.
+
+1. Large rho freezes harder, not less.  For rho >= 1e3 the metric is exactly
+   0.0, not merely below tolerance, while xbar is 58-59 acres off.  No
+   threshold helps because no positive threshold is below zero.  drift is 0
+   too: the 172.6/rho first-order correction is smaller than the one-acre
+   grid, so it cannot move an integer variable and xbar is a true fixed point
+   rather than a slow crawl.
+
+2. rho=10 is a limit cycle, which the continuous run does not have.  conv
+   floors at 0.2963 and cycles through {0.2963, 0.4444, 0.5185} with period
+   about fourteen; xbar orbits x* at distance 0.333 to 1.0, still moving
+   0.667/iteration at iteration 100.  The one place in the study where an
+   algorithm neither converges nor freezes.  Still bounded, so still not
+   divergence.
+
+3. FWPH is unaffected by integrality, as expected: its QP is over the convex
+   hull of the columns, a continuous set regardless of whether the MIP
+   subproblems generating those columns are integral.
+
+`rises` uses a 1e-5 floor here, not the 1e-12 used for the continuous runs: a
+MIQP returns integers only to its integrality tolerance, so xbar wobbles in
+the sixth decimal while the true iterate is constant.  Without the floor,
+rho=1e8 reported 46 rises for a run that had not moved at all.  Both drivers
+take `--conv-floor` to override.
+
 ## Files
 
 - `farmer_ph_divergence.py` -- the PH driver; `ConvTracer` is a PH extension
@@ -109,4 +157,7 @@ thing: frozen at the iteration-1 value to every digit printed.
 - `farmer_fwph_divergence.py` -- the FWPH driver; same tracer hook, since
   fwph's `iterk_loop` also calls `miditer()` right after setting `self.conv`
 - `farmer_fwph_divergence.csv` -- per-iteration conv, outer bound, error, xbar
-- `paper/ph_divergence.tex` -- the write-up
+- `farmer_divergence_int.csv`, `farmer_divergence_int.png`,
+  `farmer_fwph_divergence_int.csv` -- the same for `--integer`
+- `aph-fw/doc/divergence-report/ph_divergence.tex` -- the write-up, which
+  lives in the aph-fw repo with the rest of the divergence investigation
