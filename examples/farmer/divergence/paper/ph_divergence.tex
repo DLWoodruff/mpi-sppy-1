@@ -32,7 +32,9 @@ constraints, a dominant proximal term makes every subproblem return $\xbar$
 itself, and the PH iteration degenerates into a projected gradient step of
 length $1/\rho$ on the extensive-form objective.  The metric does increase, by
 as much as a factor of $5.4 \times 10^6$ in a single iteration, but at the
-intermediate values $\rho \in \{100, 1000\}$ rather than at the large ones.  On
+intermediate values $\rho \in \{100, 1000\}$ rather than at the large ones.
+FWPH behaves identically, to six figures, because a dominant proximal term
+makes its Frank-Wolfe columns irrelevant.  On
 this problem the primal residual measures agreement among subproblems, not
 proximity to a solution, and the two are easy to tell apart only if one is
 willing to solve the extensive form.
@@ -186,6 +188,63 @@ about $58.3\,\rho / 172.6 \approx 0.34\,\rho$ iterations: roughly $34{,}000$ at
 $\rho = 10^5$ and $3.4\times10^7$ at $\rho = 10^8$.  The algorithm is correct
 and hopeless at the same time.
 
+\section{FWPH does the same thing}
+
+Frank-Wolfe PH \cite{boland} replaces the exact subproblem solve with an inner
+Frank-Wolfe loop over a growing set of columns, and it carries its own
+convergence check --- Algorithm 3 of Boland et al., $\sum_s p_s \norm{x_s^{QP}
+- \xbar}_2^2$, a probability-weighted squared two-norm not scaled by the
+variable count.  It also reports an outer bound, which PH does not.  Running
+the same instance and the same sweep gives Table~\ref{tab:fwph}.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{rrrrrr}
+\toprule
+$\rho$ & conv$_{100}$ & rises & bound$_1$ & bound$_{100}$ & $\norm{\xbar - x^\star}_\infty$ \\
+\midrule
+$0.1$    & $5.5\times10^{-2}$  & 28 & $-115406$ & $-108391$ & $0.428$ \\
+$1$      & $1.2\times10^{-7}$  & 36 & $-115406$ & $-108390$ & $0.00064$ \\
+$10$     & $5.8\times10^{-5}$  & 31 & $-115406$ & $-108392$ & $0.0139$ \\
+$10^{2}$ & $1.0\times10^{-17}$ &  5 & $-115406$ & $-112258$ & $32.0$ \\
+$10^{3}$ & $1.6\times10^{-23}$ &  4 & $-115406$ & $-112978$ & $47.7$ \\
+$10^{4}$ & $3.1\times10^{-24}$ &  0 & $-115406$ & $-115406$ & $56.6$ \\
+$10^{5}$ & $3.2\times10^{-24}$ &  0 & $-115406$ & $-115406$ & $58.2$ \\
+$10^{6}$ & $3.7\times10^{-24}$ &  0 & $-115406$ & $-115406$ & $58.3$ \\
+$10^{8}$ & $3.4\times10^{-25}$ &  0 & $-115406$ & $-115406$ & $58.3$ \\
+\bottomrule
+\end{tabular}
+\caption{FWPH on the same instance, $100$ major iterations, ten Frank-Wolfe
+steps each, threshold disabled.  ``rises'' ignores changes below
+$\mathrm{conv} = 10^{-12}$, beneath which the squared metric is machine zero
+and its motion is solver noise.  bound$_1$ and bound$_{100}$ are the FWPH
+outer bound at the first and last major iteration.}
+\label{tab:fwph}
+\end{table}
+
+The conclusion is the same and the numbers are, to six figures, literally the
+same.  For $\rho \ge 10^4$ the metric never rises, the outer bound does not
+move off its iteration-$1$ value at all, and the final $\xbar$ is the same
+$58.3$ acres from $x^\star$.  The measured drift times $\rho$ is
+$172.5556$, $172.5556$, $172.556$, $172.6$ at $\rho = 10^4 \dots 10^8$ ---
+agreeing with the PH figures of Section~3 to every digit either run resolves.
+
+That agreement is what \eqref{eq:pg} predicts.  The Frank-Wolfe inner loop
+searches over convex combinations of columns for a point that minimizes the
+subproblem objective; when the proximal term dominates, that minimizer is
+$\xbar$ regardless of which columns are available, so the columns stop
+mattering and the major iteration reduces to the same projected gradient step
+of length $1/\rho$.  Large $\rho$ does not merely fail to be helped by
+Frank-Wolfe, it makes the Frank-Wolfe machinery inert.
+
+Two differences from PH are worth recording.  The metric being squared roughly
+doubles the exponent of everything: the spikes at $\rho = 10$ to $10^3$ reach
+ratios of $10^{12}$ to $10^{13}$ rather than $10^6$, and the floor sits near
+$10^{-24}$ rather than $10^{-8}$.  And the outer bound is a second, independent
+witness that PH does not have: at $\rho \ge 10^4$ it is frozen at the
+iteration-$1$ value to every digit printed, so a user watching the bound rather
+than the residual would also see nothing wrong --- only nothing happening.
+
 \section{Discussion}
 
 The practical reading is that on this problem \eqref{eq:conv} is a measure of
@@ -218,10 +277,12 @@ Everything is in \texttt{examples/farmer/divergence} on the
 \begin{center}
 \begin{tabular}{ll}
 \toprule
-\texttt{farmer\_ph\_divergence.py} & driver; sweeps $\rho$, writes the table, csv and figure \\
-\texttt{farmer\_divergence.csv}    & per-iteration $\rho$, conv, $\norm{w}_\infty$, error, $\xbar$ \\
-\texttt{farmer\_divergence.png}    & Figure~\ref{fig:traces} \\
-\texttt{notes.md}                  & the same findings in brief \\
+\texttt{farmer\_ph\_divergence.py}   & PH driver; sweeps $\rho$, writes the table, csv and figure \\
+\texttt{farmer\_divergence.csv}      & per-iteration $\rho$, conv, $\norm{w}_\infty$, error, $\xbar$ \\
+\texttt{farmer\_divergence.png}      & Figure~\ref{fig:traces} \\
+\texttt{farmer\_fwph\_divergence.py} & FWPH driver; Table~\ref{tab:fwph} \\
+\texttt{farmer\_fwph\_divergence.csv}& per-iteration conv, outer bound, error, $\xbar$ \\
+\texttt{notes.md}                    & the same findings in brief \\
 \bottomrule
 \end{tabular}
 \end{center}
@@ -233,6 +294,11 @@ Table~\ref{tab:sweep}.
 \begin{thebibliography}{9}
 \bibitem{birge} J.\ R.\ Birge and F.\ Louveaux,
   \emph{Introduction to Stochastic Programming}, 2nd ed., Springer, 2011.
+\bibitem{boland} N.\ Boland, J.\ Christiansen, B.\ Dandurand, A.\ Eberhard,
+  J.\ Linderoth, J.\ Luedtke and F.\ Oliveira,
+  Combining progressive hedging with a Frank--Wolfe method to compute Lagrangian
+  dual bounds in stochastic mixed-integer programming,
+  \emph{SIAM Journal on Optimization} 28(2):1312--1336, 2018.
 \bibitem{rw} R.\ T.\ Rockafellar and R.\ J.-B.\ Wets,
   Scenarios and policy aggregation in optimization under uncertainty,
   \emph{Mathematics of Operations Research} 16(1):119--147, 1991.

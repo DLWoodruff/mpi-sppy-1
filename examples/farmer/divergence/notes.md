@@ -61,10 +61,52 @@ is not a proxy for optimality.  Near-zero conv at large rho means "the
 subproblems agree", not "we are at the answer" -- the right panel of the plot
 puts conv and true distance to the optimum side by side.
 
+## FWPH
+
+`farmer_fwph_divergence.py` runs the same instance and sweep through FWPH,
+whose own check is Boland Algorithm 3 (`sum_s p_s ||x^QP_s - xbar||_2^2`, a
+weighted SQUARED two-norm, not on PH's scale) and which also reports an outer
+bound.
+
+       rho     conv_last  rises   max jump   bound first    bound last   |xbar-x*|
+       0.1       0.05493     28      104.3       -115406       -108391      0.4279
+         1      1.24e-07     36       5723       -115406       -108390    0.000643
+        10     5.784e-05     31  6.761e+12       -115406       -108392     0.01389
+       100     1.011e-17      5   3.67e+13       -115406       -112258       32.03
+      1000     1.603e-23      4  6.786e+12       -115406       -112978       47.68
+     10000     3.102e-24      0          1       -115406       -115406       56.63
+    100000     3.229e-24      0          1       -115406       -115406       58.16
+     1e+06     3.701e-24      0          1       -115406       -115406       58.32
+     1e+08     3.375e-25      0          1       -115406       -115406       58.33
+
+Same answer, same numbers.  At rho >= 1e4 the metric never rises, the outer
+bound never moves off its first value, and xbar ends the same 58.33 acres from
+x*.  drift*rho is 172.5556, 172.5556, 172.556, 172.6 at rho = 1e4 .. 1e8,
+matching PH to every digit either run resolves.
+
+Why they coincide: the FW inner loop looks for the convex combination of
+columns minimizing the subproblem objective, and when the proximal term
+dominates that minimizer is xbar whatever the columns are.  The columns stop
+mattering and the major iteration becomes the same 1/rho projected gradient
+step.  Large rho makes the Frank-Wolfe machinery inert rather than merely
+unhelpful.
+
+`rises` and `max jump` ignore changes below conv = 1e-12.  Beneath that the
+squared metric is machine zero and it wanders between 1e-23 and 1e-26 on
+solver noise; counting those as rises would report a diverging metric for a
+run that has frozen, which is the exact mistake this study is about.
+
+The outer bound is a second witness PH does not have, and it says the same
+thing: frozen at the iteration-1 value to every digit printed.
+
 ## Files
 
-- `farmer_ph_divergence.py` -- the driver; `ConvTracer` is a PH extension
+- `farmer_ph_divergence.py` -- the PH driver; `ConvTracer` is a PH extension
   whose `miditer()` runs right after phbase sets `self.conv`, so the trace is
   exactly the sequence phbase compares against `convthresh`
 - `farmer_divergence.csv` -- per-iteration rho, conv, ||W||_inf, |xbar-x*|, xbar
 - `farmer_divergence.png` -- conv vs iteration, and true error vs iteration
+- `farmer_fwph_divergence.py` -- the FWPH driver; same tracer hook, since
+  fwph's `iterk_loop` also calls `miditer()` right after setting `self.conv`
+- `farmer_fwph_divergence.csv` -- per-iteration conv, outer bound, error, xbar
+- `paper/ph_divergence.tex` -- the write-up
