@@ -222,8 +222,17 @@ cylinders run starts from the answer it already had rather than from nothing.
 Those files are deliberately not synchronised with the hub's: a spoke writes
 when it improves, the hub writes at iteration boundaries, and neither waits
 for the other. A spoke whose file is missing -- because the earlier run
-stopped before it found anything, or because you resumed with a different set
-of spokes -- simply starts without an incumbent and says so in the log.
+stopped before it found anything, or because that spoke was not in the earlier
+run at all -- simply starts without an incumbent and says so in the log.
+
+Each file is named for the spoke's class and for which spoke of that class it
+is, rather than for the cylinder's position in the wheel, because which
+cylinders run is on the list above that a resume may change. Resuming without
+``--lagrangian`` therefore still finds the xhat spoke's incumbent, and two
+spokes of one class still read their own. The one change that cannot be
+absorbed is dropping one of two spokes *of the same class*: the survivor then
+looks like the one that was removed, and the resume says so rather than
+adopting an incumbent that belonged to a different cylinder.
 
 On a deterministic LP or QP solve the primal trajectory can come back
 bit-identical, but that is a bonus rather than the guarantee.
