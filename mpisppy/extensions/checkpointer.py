@@ -263,7 +263,17 @@ class Checkpointer(Extension):
         obj = ckpt.restore_spoke_incumbent(self.opt, state)
         self.restored_incumbent_obj = obj
         self.opt.spcomm.best_inner_bound = state["best_inner_bound"]
-        self._last_written_obj = obj
+        # _last_written_obj means "what the file in self.ckpt_dir already
+        # holds", so it may only be seeded when that is the file we just read.
+        # Resuming into a *different* directory is the documented
+        # stop-today-resume-tomorrow flow, and there this spoke has written
+        # nothing yet: seeding it there makes the skip test below decline to
+        # write until the spoke strictly improves on what it restored, so a
+        # study whose xhat has stopped improving -- a converged one, the case
+        # where the answer is worth the most -- publishes no incumbent at all
+        # and the next resume starts without one, with exit code 0 throughout.
+        if self.write_enabled and self._same_directory(resume_from):
+            self._last_written_obj = obj
         # The hub learns bounds only from what a spoke sends, so a restored
         # incumbent that is never published leaves the hub reporting an
         # infinite inner bound -- and its gap and convergence tests reading
@@ -274,6 +284,20 @@ class Checkpointer(Extension):
         self._publish_restored_bound = state["best_inner_bound"]
         global_toc(f"Restored the checkpointed incumbent for {cylinder} "
                    f"(objective {obj})", rank0)
+
+    def _same_directory(self, other):
+        """True when ``other`` names the directory this run writes to.
+
+        Compared by resolved path rather than by string: the resume flow
+        passes these on a command line, so the same directory routinely
+        arrives spelled two ways.
+        """
+        if not other or not self.ckpt_dir:
+            return False
+        try:
+            return os.path.realpath(other) == os.path.realpath(self.ckpt_dir)
+        except OSError:
+            return False
 
     def _is_final_iteration(self):
         """True when the loop bound says this completed iteration is the last.
