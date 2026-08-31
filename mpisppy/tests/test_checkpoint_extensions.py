@@ -379,6 +379,175 @@ def _fixed_nonant_names(ph):
             if v.is_fixed()}
 
 
+def _relaxed_models(ph):
+    """Which scenarios currently carry the integer relaxation.
+
+    ``core.relax_integer_vars`` leaves ``_relaxed_integer_vars`` on the model
+    and its undo deletes it, so the attribute is the model's own answer to
+    "are my integers relaxed right now" -- independent of what any extension
+    believes.
+    """
+    return {sname for sname, s in ph.local_scenarios.items()
+            if hasattr(s, "_relaxed_integer_vars")}
+
+
+class _RelaxationProbe(Extension):
+    """Records which subproblems are relaxed, as the run goes.
+
+    The end of a run does not answer the question this file is about: a
+    resumed leg that re-relaxed at ``pre_iter0`` and then enforced again a
+    couple of iterations later ends unrelaxed, exactly as an uninterrupted one
+    does. What separates them is what the subproblems looked like *while the
+    iterations were being solved*, so that is what this records.
+    """
+
+    def __init__(self, opt):
+        super().__init__(opt)
+        self.after_iter0 = None
+        self.per_iteration = []
+
+    def post_iter0(self):
+        self.after_iter0 = _relaxed_models(self.opt)
+
+    def enditer(self):
+        self.per_iteration.append(_relaxed_models(self.opt))
+
+
+class _IntegerRelaxMixin(_ABMixin):
+    """Relax-then-enforce across a stop, on a MIP.
+
+    The relaxation is a model transformation, so it rides in the dill; the
+    extension's record of whether it has happened does not, and the extension
+    is rebuilt on a resumed run. Before this state was carried, ``pre_iter0``
+    applied the transformation again to models that came back from the
+    checkpoint -- so a study that had already enforced integrality went back
+    to solving relaxed subproblems, and enforced a second time later from a
+    different iterate.
+
+    The ratio decides which state the checkpoint is taken in, and both are
+    worth pinning: ``0.25`` enforces before the stop, ``1.1`` puts both the
+    iteration and the time condition out of reach so the run is still relaxed
+    when it writes.
+    """
+
+    MODEL = sizes
+    SCENARIOS = SIZES_SCENARIOS
+    CREATOR_KWARGS = SIZES_KWARGS
+    N = 4
+    STOP = 2
+    RATIO = None
+
+    def setUp(self):
+        super().setUp()
+        self.EXTRA_OPTIONS = {
+            "integer_relax_then_enforce_options": {"ratio": self.RATIO},
+        }
+
+    def ext_classes(self):
+        from mpisppy.extensions.integer_relax_then_enforce import (
+            IntegerRelaxThenEnforce)
+        return [IntegerRelaxThenEnforce, _RelaxationProbe]
+
+    def _extension_state(self, generation):
+        leaf = _read_leaf(self.ckpt_dir, generation)
+        return leaf["extension_state"]["extensions"]["IntegerRelaxThenEnforce"]
+
+    def _flag(self, ph):
+        from mpisppy.extensions.integer_relax_then_enforce import (
+            IntegerRelaxThenEnforce)
+        return _extension(ph, IntegerRelaxThenEnforce)._integers_relaxed
+
+
+@unittest.skipIf(not solver_available, "no solver is available")
+class TestIntegerRelaxThenEnforceEnforcedAtTheStop(_IntegerRelaxMixin,
+                                                   unittest.TestCase):
+    """The stop lands after integrality has been enforced.
+
+    The ratio is a fraction of *this run's* iteration budget, so a leg told to
+    run fewer iterations reaches its fraction sooner. At 0.1 both the
+    uninterrupted leg and the stopped leg enforce at iteration 1, which is
+    what lets the two be compared at all: a ratio where they enforced at
+    different iterations would be measuring the window rather than the
+    checkpoint.
+    """
+
+    RATIO = 0.1
+
+    def test_the_stop_really_did_land_after_enforcement(self):
+        """Otherwise this class is silently testing the other case."""
+        _, stopped, _ = self.run_ab()
+        self.assertEqual(_relaxed_models(stopped), set(),
+                         msg="the stopped run was still relaxed, so the "
+                             "checkpoint was not taken after enforcement")
+        self.assertEqual(self._extension_state(self.STOP),
+                         {"integers_relaxed": False})
+
+    def test_a_resumed_run_does_not_re_relax_what_was_enforced(self):
+        """Every iteration of the resumed leg solves what the study enforced.
+
+        Checking the end of the run would not catch this: a leg that relaxed
+        at pre_iter0 and enforced again two iterations later also ends
+        unrelaxed.
+        """
+        reference, _, resumed = self.run_ab()
+        probe = _extension(resumed, _RelaxationProbe)
+        self.assertEqual(
+            probe.after_iter0, set(),
+            msg="the resumed run relaxed integrality that the study had "
+                "already enforced")
+        self.assertEqual(
+            probe.per_iteration, [set()] * (self.N - self.STOP),
+            msg=f"the resumed run solved relaxed subproblems: "
+                f"{probe.per_iteration}")
+        self.assertFalse(self._flag(resumed))
+        # The uninterrupted leg is the standard: it, too, was enforced by the
+        # time these iterations came around.
+        self.assertEqual(
+            _extension(reference, _RelaxationProbe).per_iteration[self.STOP:],
+            [set()] * (self.N - self.STOP))
+
+    def test_resume_matches_the_uninterrupted_run(self):
+        reference, _, resumed = self.run_ab()
+        self.assert_bit_identical(reference, resumed)
+
+
+@unittest.skipIf(not solver_available, "no solver is available")
+class TestIntegerRelaxThenEnforceRelaxedAtTheStop(_IntegerRelaxMixin,
+                                                  unittest.TestCase):
+    """The stop lands while the integers are still relaxed.
+
+    The state a run using the profile's own ratio is overwhelmingly likely to
+    be stopped in, since above 1 neither the iteration nor the time condition
+    can fire inside a run.
+    """
+
+    RATIO = 1.1
+
+    def test_the_stop_really_did_land_while_relaxed(self):
+        _, stopped, _ = self.run_ab()
+        self.assertEqual(_relaxed_models(stopped), set(stopped.local_scenarios))
+        self.assertEqual(self._extension_state(self.STOP),
+                         {"integers_relaxed": True})
+
+    def test_a_resumed_run_comes_back_relaxed_and_knows_it(self):
+        """The models keep the relaxation; the extension has to agree.
+
+        An extension that came back believing the integers were enforced
+        would return from `miditer` without ever undoing the relaxation, and
+        the study would finish on a solution to the wrong problem.
+        """
+        _, _, resumed = self.run_ab()
+        probe = _extension(resumed, _RelaxationProbe)
+        self.assertEqual(probe.after_iter0, set(resumed.local_scenarios))
+        self.assertEqual(probe.per_iteration,
+                         [set(resumed.local_scenarios)] * (self.N - self.STOP))
+        self.assertTrue(self._flag(resumed))
+
+    def test_resume_matches_the_uninterrupted_run(self):
+        reference, _, resumed = self.run_ab()
+        self.assert_bit_identical(reference, resumed)
+
+
 def _read_leaf(ckpt_dir, generation):
     path = os.path.join(ckpt_dir, "hub", f"gen_{generation:04d}",
                         "hub_rank_0000.pkl")

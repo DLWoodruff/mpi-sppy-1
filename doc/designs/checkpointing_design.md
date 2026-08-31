@@ -1198,9 +1198,10 @@ as a branch stacked on the 1a PR.
   a resume with a different extension set report what it could not restore instead
   of dropping it silently. `MultiExtension` is flattened away as the container it
   is. Implemented for `NormRhoUpdater`, `MultRhoUpdater`, `Dyn_Rho_extension_base`
-  (so `sep_rho`/`sensi_rho`/`grad_rho` at once), `fixer`, `slammer` and
-  `primal_dual_converger`; `norm_rho_converger` and `fracintsnotconv` recompute
-  everything each iteration and correctly have none.
+  (so `sep_rho`/`sensi_rho`/`grad_rho` at once), `fixer`, `slammer`,
+  `integer_relax_then_enforce` and `primal_dual_converger`;
+  `norm_rho_converger` and `fracintsnotconv` recompute everything each
+  iteration and correctly have none.
 
   **Restore runs at the end of `Iter0`, not in the resume branch**, and the
   ordering is the whole trick: extensions rebuild their bookkeeping from the
@@ -1231,7 +1232,21 @@ as a branch stacked on the 1a PR.
      too — reset every countdown. Model-attached state is not automatically safe;
      it is only safe from *serialization*.
 
-  A fourth is a divergence rather than a break, and it generalizes: `slammer`,
+  4. **A resumed run relaxed integrality the study had already enforced.**
+     `integer_relax_then_enforce` applies a Pyomo transformation, so the
+     relaxation itself rides in the dill; what did not ride was the
+     extension's record of whether it had happened, and the extension is
+     rebuilt on a resumed run. `pre_iter0` then applied the transformation a
+     second time, to models that came back from the checkpoint already
+     enforced — so the resumed run solved relaxed subproblems where the
+     uninterrupted one solved integral ones, and enforced again later from a
+     different iterate. The flag is now checkpointed and `pre_iter0` leaves a
+     resumed run's models alone, the checkpoint being the authority on which
+     state they are in. This is a different shape from the three above: not
+     state that biases a decision, but state without which a *model
+     transformation* is silently reapplied.
+
+  A fifth is a divergence rather than a break, and it generalizes: `slammer`,
   `relaxed_ph_fixer` and `reduced_costs_fixer` each build a "modeler fixed this"
   set at `pre_iter0` by reading `xvar.fixed`. On a resumed run every mid-run
   fixing is already applied, so each filed its own earlier fixings as the
@@ -1242,9 +1257,12 @@ as a branch stacked on the 1a PR.
   named scope but have the identical defect and the identical one-line fix.
 
   Tests: `test_checkpoint_extensions.py` — A/B resume with `NormRhoUpdater`,
-  `MultRhoUpdater`, `SepRho`, `fixer` (on `sizes`), `slammer` and
-  `primal_dual_converger`, each asserting both bit-identity *and* the specific
-  state by name, plus contract unit tests for the aggregation, the flattening,
+  `MultRhoUpdater`, `SepRho`, `fixer` (on `sizes`), `slammer`,
+  `integer_relax_then_enforce` (on `sizes`, stopped once in each integrality
+  state, with a probe extension recording what the subproblems looked like
+  *during* the resumed leg's iterations — the end of the run cannot tell a
+  re-relaxed leg from a clean one) and `primal_dual_converger`, each asserting
+  both bit-identity *and* the specific state by name, plus contract unit tests for the aggregation, the flattening,
   and a resume with a changed extension or converger set. Each fix was verified
   to be load-bearing by reverting it and watching the matching test fail.
 
