@@ -337,11 +337,25 @@ Two things this does not cover:
 * **Your own extension carries nothing unless you say so.** If it keeps state
   on itself that decides what it does next -- a history, a counter, a record of
   what it has already changed -- implement ``checkpoint_state()`` and
-  ``restore_state(state)`` on it. They are no-ops on the base class, so an
-  extension that does not need them costs nothing. Return plain data keyed by
-  variable *name* or by ``(node name, index)``, never Pyomo objects: a resume
-  replaces every model, so a saved variable reference addresses something that
-  no longer exists.
+  ``restore_state(state)`` on it. Return plain data keyed by variable *name* or
+  by ``(node name, index)``, never Pyomo objects: a resume replaces every
+  model, so a saved variable reference addresses something that no longer
+  exists. If it keeps no such state, set ``checkpoint_stateless = True`` on the
+  class instead.
+
+  Do one or the other. A resumed run names every attached extension that has
+  done neither, because from the outside "keeps nothing" and "nobody decided"
+  look the same, and the second one is a run that quietly stops retracing an
+  uninterrupted one. The declaration is deliberately not inherited: a subclass
+  that adds state to a stateless parent is named rather than covered by its
+  parent's answer.
+
+  Some of the shipped extensions are in that unanswered set and say so at the
+  resume -- ``PrimalDualRho``, ``WOscillationMonitor``, ``ReducedCostsFixer``,
+  ``RelaxedPHFixer``, ``CrossScenarioExtension``, ``TimedMIPGapCB``,
+  ``PHTracker`` and ``XhatFeasibilityCutExtension``. Using one across a resume
+  works and continues from the right models; it will not retrace an
+  uninterrupted run.
 * **A converger with no such implementation still starts fresh**, and the resume
   says so in the log. That matters more than it sounds: a converger decides when
   the run stops, so one that accumulates history can terminate a resumed run at a

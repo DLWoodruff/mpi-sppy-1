@@ -38,6 +38,7 @@ import json
 import os
 import pickle
 import tempfile
+import types
 import unittest
 
 import mpisppy.tests.examples.farmer as farmer
@@ -699,7 +700,10 @@ class _StatefulExtension(Extension):
 
 
 class _StatelessExtension(Extension):
-    pass
+    # Says so, rather than merely being so: an extension that answers
+    # neither question is named at the resume, and the name of this one
+    # is the whole claim it makes.
+    checkpoint_stateless = True
 
 
 class _FakeOpt:
@@ -846,6 +850,129 @@ class TestFixerCountsAreNotZeroedOnResume(unittest.TestCase):
                              saved[sname],
                              msg=f"{sname}: the fixer's counts were reset by "
                                  f"its own setup hook on the way back in")
+
+
+class TestTheStateContractIsAnsweredBothWays(unittest.TestCase):
+    """An extension with no checkpoint entry used to be indistinguishable from
+    one that correctly has no state.
+
+    restore_extension_state reported a checkpoint entry with no extension, and
+    said nothing in the other direction, on the reasoning that an extension
+    added since the checkpoint "is starting fresh because it never ran, which
+    is correct". True for that case, and it also covered every extension that
+    keeps state and never implemented the hook -- which is a different thing
+    and is not correct. An extension now answers the question one of two ways,
+    and a resumed run names the ones that answered neither.
+    """
+
+    class _Implements(Extension):
+        def checkpoint_state(self):
+            return {"n": 1}
+
+        def restore_state(self, state):
+            pass
+
+    class _Declares(Extension):
+        checkpoint_stateless = True
+
+    class _AnswersNeither(Extension):
+        pass
+
+    class _SubclassOfDeclares(_Declares):
+        """Adds state to a stateless parent."""
+
+    class _SubclassOfImplements(_Implements):
+        """Inherits a real implementation."""
+
+    def _named(self, *classes):
+        opt = types.SimpleNamespace(
+            extobject=types.SimpleNamespace(
+                extdict={c.__name__: c.__new__(c) for c in classes}))
+        return sorted(checkpointing.extensions_without_a_state_contract(opt))
+
+    def test_implementing_the_hook_answers_it(self):
+        self.assertEqual(self._named(self._Implements), [])
+
+    def test_declaring_statelessness_answers_it(self):
+        self.assertEqual(self._named(self._Declares), [])
+
+    def test_answering_neither_is_named(self):
+        self.assertEqual(self._named(self._AnswersNeither),
+                         ["_AnswersNeither"])
+
+    def test_the_declaration_is_not_inherited(self):
+        """A subclass that adds state to a stateless parent must be named, or
+        the declaration becomes the same silence it was meant to remove."""
+        self.assertEqual(self._named(self._SubclassOfDeclares),
+                         ["_SubclassOfDeclares"])
+
+    def test_the_implementation_is_inherited(self):
+        """Unlike the declaration: a subclass of an extension that implements
+        the hook really does carry its state."""
+        self.assertEqual(self._named(self._SubclassOfImplements), [])
+
+    def test_the_warning_is_raised_with_no_checkpointed_state_at_all(self):
+        """A checkpoint written by a run whose extensions all had nothing to
+        say carries no extension state, and the early return for that used to
+        skip everything below it."""
+        opt = types.SimpleNamespace(
+            extobject=types.SimpleNamespace(
+                extdict={"_AnswersNeither": self._AnswersNeither.__new__(
+                    self._AnswersNeither)}))
+        warnings = checkpointing.restore_extension_state(opt, None)
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("_AnswersNeither", warnings[0])
+        self.assertIn("checkpoint_stateless", warnings[0])
+
+
+class TestShippedExtensionsAnswerTheQuestion(unittest.TestCase):
+    """Every shipped extension either carries its state or says it has none.
+
+    The point of the declaration is that adding an extension makes somebody
+    decide. This pins the ones already decided, so a new one cannot join the
+    unanswered set unnoticed -- and names the ones still unanswered, each of
+    which is a known open question rather than an oversight.
+    """
+
+    #: Extensions that keep state across iterations and do not yet carry it.
+    #: Every name here is a resumed run that will not retrace an uninterrupted
+    #: one; they warn at runtime for exactly that reason.
+    UNANSWERED = {
+        "CrossScenarioExtension", "PHTracker", "PrimalDualRho",
+        "ReducedCostsFixer", "RelaxedPHFixer", "TimedMIPGapCB",
+        "WOscillationMonitor", "XhatFeasibilityCutExtension",
+    }
+
+    def _all_extension_classes(self):
+        import importlib
+        import inspect
+        import pkgutil
+        import mpisppy.extensions as package
+        found = {}
+        for mod_info in pkgutil.iter_modules(package.__path__):
+            try:
+                mod = importlib.import_module(
+                    f"mpisppy.extensions.{mod_info.name}")
+            except ImportError:
+                continue        # an optional dependency this env lacks
+            for name, cls in inspect.getmembers(mod, inspect.isclass):
+                if (issubclass(cls, Extension)
+                        and cls not in (Extension, MultiExtension)
+                        and cls.__module__ == mod.__name__):
+                    found[name] = cls
+        return found
+
+    def test_the_unanswered_set_is_exactly_what_is_recorded(self):
+        unanswered = {
+            name for name, cls in self._all_extension_classes().items()
+            if cls.checkpoint_state is Extension.checkpoint_state
+            and not cls.__dict__.get("checkpoint_stateless", False)}
+        self.assertEqual(
+            unanswered, self.UNANSWERED,
+            msg="an extension joined or left the set that answers neither "
+                "question. If you added one, implement checkpoint_state or "
+                "set checkpoint_stateless = True; if you answered one, drop "
+                "it from UNANSWERED here.")
 
 
 if __name__ == "__main__":

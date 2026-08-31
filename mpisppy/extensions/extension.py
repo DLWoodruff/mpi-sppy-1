@@ -173,6 +173,19 @@ class Extension:
         '''
         pass
 
+    #: Set True on an extension that has been looked at and found to keep no
+    #: state of its own across a stop and resume -- no history, no counter, no
+    #: record of what it has already changed. It is the other way of answering
+    #: the question ``checkpoint_state`` answers, and a resumed run names every
+    #: attached extension that has answered neither, because an extension that
+    #: keeps state and carries none takes a different action at the next
+    #: iteration than the uninterrupted run would.
+    #:
+    #: Deliberately not inherited: the check reads the class's own ``__dict__``,
+    #: so a subclass that adds state to a stateless parent is named rather than
+    #: quietly covered by its parent's answer. Declare it on each class.
+    checkpoint_stateless = False
+
     def checkpoint_state(self):
         ''' Return this extension's own state as picklable plain data, or
             None if it has none worth carrying across a stop and resume.
