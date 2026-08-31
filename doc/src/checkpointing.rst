@@ -314,7 +314,10 @@ at startup when either ``--checkpoint-dir`` or ``--resume-from`` is given, as
 are an unwritable directory (checked from every rank -- on a cluster a path can
 be writable from some nodes and not others), an unimplemented backend, scenario
 names that would collide once made filename-safe, and any configuration where
-the checkpointing extension would not actually be attached. The intent is that
+the checkpointing extension would not actually be attached. ``--EF`` and the
+write-only modes (``--pickle-bundles-dir``, ``--pickle-scenarios-dir``,
+``--write-scenario-lp-mps-files-dir``) are refused for the same reason: none of
+them runs the iterative algorithm a checkpoint describes. The intent is that
 checkpointing either works or says so at startup, rather than running for hours
 and writing nothing.
 
@@ -328,7 +331,15 @@ same trajectory as an uninterrupted one. The rho-setting extensions
 (``--sep-rho``, ``--coeff-rho``, ``--sensi-rho``, ``--grad-rho``) do not
 recompute rho at the resume itself: the checkpointed rho -- including
 whatever adaptation had happened by the write -- carries over, and the
-extensions resume their per-iteration updates from there.
+extensions go on adapting it from there. Their own histories still start
+empty, so the first iteration or two after a resume have nothing to measure a
+change against and recommend no update; an uninterrupted run would have had
+several iterations of history at that point.
+
+**W and xbar input files are not read on a resumed run.** ``--init-W-fname``
+and ``--init-Xbar-fname`` initialize a study; a resumed run takes both from the
+checkpoint. Leaving the flags on the command you resubmit each morning is
+harmless -- they are skipped, with a line in the log saying so.
 
 **The order you attach extensions in does not affect what is checkpointed.**
 The write happens at a dedicated point in the iteration loop, after every
