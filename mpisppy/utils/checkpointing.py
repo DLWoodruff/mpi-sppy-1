@@ -510,6 +510,33 @@ def gather_extension_state(opt):
     return {"extensions": extensions, "converger": converger}
 
 
+def extensions_without_a_state_contract(opt):
+    """Yield the name of every attached extension that answers neither question.
+
+    An extension says what happens to its state across a resume in one of two
+    ways: it implements ``checkpoint_state``, or it declares
+    ``checkpoint_stateless``. Answering neither is not the same as having no
+    state -- it is nobody having decided -- and the two used to look identical
+    from here, because the base-class hook returns None and this function only
+    ever reported checkpoint entries with no extension. The reverse direction,
+    an extension with no entry, was silent, which is how a shipped rho updater
+    with exactly the state this phase carries for its neighbours went unnoticed.
+
+    ``checkpoint_state`` is matched with inheritance, since a subclass of an
+    extension that implements it inherits a real implementation.
+    ``checkpoint_stateless`` is matched without, so a subclass that adds state
+    to a stateless parent is named instead of covered by it.
+    """
+    from mpisppy.extensions.extension import Extension
+    for name, ext in _extension_objects(opt):
+        cls = type(ext)
+        if cls.checkpoint_state is not Extension.checkpoint_state:
+            continue
+        if cls.__dict__.get("checkpoint_stateless", False):
+            continue
+        yield name
+
+
 def restore_extension_state(opt, state):
     """Hand each extension its own state back. Returns a list of warnings.
 
@@ -518,11 +545,24 @@ def restore_extension_state(opt, state):
     still valid), so it should say clearly what it could not restore instead
     of refusing the whole checkpoint. The caller prints them.
 
-    Only entries the checkpoint actually holds are reported. An extension
-    added *since* the checkpoint has nothing to restore and nothing to warn
-    about -- it is starting fresh because it never ran, which is correct.
+    Reported in both directions. A checkpoint entry with no extension means
+    state that could not be handed to anybody. An extension that has neither
+    implemented ``checkpoint_state`` nor declared ``checkpoint_stateless``
+    means state nobody has decided about -- which is not the same as an
+    extension added since the checkpoint, and used to be indistinguishable
+    from one.
     """
     warnings = []
+    missing = sorted(extensions_without_a_state_contract(opt))
+    if missing:
+        warnings.append(
+            f"these attached extensions carry no state across the resume: "
+            f"{', '.join(missing)}. Each keeps whatever it had at the start of "
+            f"a fresh run, so one that decides what to do next from what it "
+            f"did earlier -- a history, a counter, a record of what it already "
+            f"changed -- will not retrace an uninterrupted run. Implement "
+            f"checkpoint_state and restore_state on it, or set "
+            f"checkpoint_stateless = True to say it has nothing to carry.")
     if not state:
         return warnings
 

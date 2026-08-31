@@ -24,6 +24,11 @@ class Wtracker_extension(mpisppy.extensions.extension.Extension):
                 keys are comms (i.e., tree nodes); values are dicts with keys
                 that are scenario names and values that are ranks
     """
+
+    #: Nothing to carry across a resume. The history it reports on lives
+    #: in the WTracker it holds, which is rebuilt from the models; nothing
+    #: here decides what it does next.
+    checkpoint_stateless = True
     def __init__(self, opt, comm=None):
         super().__init__(opt)
         self.cylinder_rank = self.opt.cylinder_rank
