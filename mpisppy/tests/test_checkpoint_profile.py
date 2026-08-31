@@ -36,19 +36,25 @@ extension object that believes nothing has happened yet. Both instances here
 stop while the integers are relaxed, which is the state a real run is
 overwhelmingly likely to be stopped in.
 
-What the legs measured when this file was written (gurobi_persistent, sizes
-with 10 scenarios): leg A repeated is **bit-identical**, so any A-versus-B2
-difference is caused by the stop and not by solver noise. The resumed leg is
-*not* bit-identical: 496 of 3250 recorded state entries differ, 30 of them
-fixedness flags, and the expected objective differs by 3.6e-4 relative. The
-cause is structural rather than a lost restore -- ``RelaxedPHSpoke``
-checkpoints nothing, so on the resumed leg it starts over, hands the primal
-hub a different W than an uninterrupted run would have at that iteration, and
-the fixer downstream of it fixes a different set of variables. So this file
-pins what the determinism contract (design section 7) promises for a
-configuration whose hub reads a cylinder: a valid continuation, an objective
-that does not walk away, bounds that stay ordered, and an incumbent that does
-not regress -- not a reproduced trajectory.
+No leg of this profile reproduces another exactly, stop or no stop, and the
+file is built around that rather than against it. The hub's W arrives from a
+cylinder and its incumbent from an asynchronous one, so how far each gets
+depends on wall-clock timing: two identical uninterrupted legs measured
+bit-identical on a quiet machine and 1.0 apart in a nonant under load. A
+resumed leg differs by more, for a reason that is structural rather than a
+lost restore -- ``RelaxedPHSpoke`` checkpoints nothing, so it starts over and
+hands the primal hub a different W than an uninterrupted run would have at
+that iteration, and the fixer downstream of it fixes a different set of
+variables. Measured on sizes with 10 scenarios: 496 of 3250 recorded state
+entries differ, 30 of them fixedness flags, and the expected objective by
+3.6e-4 relative.
+
+So this file pins what the determinism contract (design section 7) promises
+for a configuration whose hub reads a cylinder: a valid continuation, an
+objective that does not walk away, bounds that stay ordered, an incumbent
+that does not regress, and each extension picking up in the state the study
+left it in -- not a reproduced trajectory. A test asserting reproduction here
+would be asserting that the cylinders got scheduled the same way twice.
 
 Two departures from the profile as the user writes it, both deliberate:
 
@@ -180,10 +186,6 @@ class _ProfileABMixin:
     #: reach, so a run stops while still relaxed; the uc case below lowers it
     #: to reach the other state.
     RATIO = "1.1"
-    #: Run the reference leg twice. That is what makes an A-versus-B2
-    #: difference attributable to the stop instead of to the solver, and it is
-    #: worth one extra leg on the fast instance only.
-    REPEAT_REFERENCE = False
 
     @classmethod
     def setUpClass(cls):
@@ -199,8 +201,6 @@ class _ProfileABMixin:
             return _snapshot(out_path, cls._tmp.name)
 
         cls.reference = leg("A", "--max-iterations", str(cls.N))
-        cls.repeat = leg("A2", "--max-iterations", str(cls.N)) \
-            if cls.REPEAT_REFERENCE else None
         cls.stopped = leg("B1", "--max-iterations", str(cls.STOP),
                           "--checkpoint-dir", cls.ckpt_dir)
         # --max-iterations bounds this run, so leg B2 asks for the iterations
@@ -305,7 +305,6 @@ class TestSizesProfileResumeAB(_ProfileABMixin, unittest.TestCase):
 
     MODULE = _SIZES
     MODEL_ARGS = ("--num-scens", "10")
-    REPEAT_REFERENCE = True
 
     def test_the_checkpoint_was_taken_with_the_integers_relaxed(self):
         """The state the hazard lives in, and the one a real run stops in.
@@ -327,21 +326,6 @@ class TestSizesProfileResumeAB(_ProfileABMixin, unittest.TestCase):
         self.assertNotIn("relaxing integrality constraints", self.logs["B2"],
                          msg="the resumed leg relaxed models that came back "
                              "from the checkpoint already relaxed")
-
-    def test_the_reference_leg_is_reproducible(self):
-        """Any A-versus-B2 difference is the stop's doing, not the solver's.
-
-        This instance and profile are deterministic run to run, which is what
-        makes the comparisons above mean anything. If this ever fails, the
-        tolerance in ``test_the_objective_agrees_within_tolerance`` stops
-        being a statement about checkpointing.
-        """
-        want, got = self.reference["state"], self.repeat["state"]
-        self.assertEqual(set(want), set(got))
-        worst = max((abs(want[k] - got[k]) for k in want), default=0.0)
-        self.assertEqual(
-            worst, 0.0,
-            msg=f"two identical runs differ by {worst}")
 
 
 @unittest.skipIf(not solver_available, "no solver is available")
