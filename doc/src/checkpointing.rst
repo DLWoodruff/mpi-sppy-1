@@ -402,8 +402,9 @@ bug.
 Bounds and the incumbent are carried forward as valid best-so-far values. A
 resumed run never reports a worse best-so-far than its checkpoint.
 
-In a cylinders run the best solution does not live on the hub: the xhat spoke
-that found it holds it. So each xhat spoke keeps its own small file under
+In a cylinders run the best solution does not live on the hub: the spoke that
+found it holds it. So each spoke that looks for one -- the xhat spokes, the
+L-shaped xhatter and the two slammers -- keeps its own small file under
 ``spokes/`` in the checkpoint directory, holding the best solution it has
 found, written by variable name whenever that solution improves. A resumed
 spoke reads it back and reports it to the hub, which is why a resumed

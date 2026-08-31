@@ -352,3 +352,95 @@ class TestRestoredIncumbentIsRepublished(unittest.TestCase):
         ext = self._restore(ckpt_dir=None, resume_from="/tmp/ck1")
         self.assertEqual(ext.restored_incumbent_obj, -108382.22)
         self.assertIsNone(ext._last_written_obj)
+
+
+class TestEverySpokeGivenTheCheckpointerDrivesIt(unittest.TestCase):
+    """cfg_vanilla attaches the Checkpointer in one place, and the spokes that
+    place builds do not all derive from the same class.
+
+    add_checkpointing is called from _Xhat_Eval_spoke_foundation, which builds
+    the four xhat spokes *and* the L-shaped xhatter and the two slammers. The
+    latter three derive from InnerBoundNonantSpoke rather than
+    XhatInnerBoundBase, which is where the two hooks used to live, so the
+    extension was constructed, probed the checkpoint directory, and was then
+    inert: it never wrote and never restored, with no warning. The user doc
+    says every xhat spoke keeps its own file under ``spokes/``.
+    """
+
+    #: Every cylinder class cfg_vanilla builds through
+    #: _Xhat_Eval_spoke_foundation, and therefore hands a Checkpointer.
+    SPOKES = (
+        ("mpisppy.cylinders.xhatlooper_bounder", "XhatLooperInnerBound"),
+        ("mpisppy.cylinders.xhatshufflelooper_bounder", "XhatShuffleInnerBound"),
+        ("mpisppy.cylinders.xhatspecific_bounder", "XhatSpecificInnerBound"),
+        ("mpisppy.cylinders.xhatxbar_bounder", "XhatXbarInnerBound"),
+        ("mpisppy.cylinders.lshaped_bounder", "XhatLShapedInnerBound"),
+        ("mpisppy.cylinders.slam_heuristic", "SlamMaxHeuristic"),
+        ("mpisppy.cylinders.slam_heuristic", "SlamMinHeuristic"),
+    )
+
+    def _classes(self):
+        import importlib
+        for module_name, class_name in self.SPOKES:
+            mod = importlib.import_module(module_name)
+            yield class_name, getattr(mod, class_name), mod
+
+    def test_the_foundation_still_builds_exactly_these(self):
+        """If a spoke is added to _Xhat_Eval_spoke_foundation it gets a
+        Checkpointer, so it has to appear above and drive the hooks."""
+        import inspect
+        from mpisppy.utils import cfg_vanilla
+        source = inspect.getsource(cfg_vanilla)
+        builders = source.count("_Xhat_Eval_spoke_foundation(")
+        self.assertEqual(
+            builders - 1, len(self.SPOKES),      # -1 for the definition
+            msg="the number of spokes built through the foundation that "
+                "attaches the Checkpointer changed; add it to SPOKES here "
+                "and make its loop drive the hooks")
+
+    def test_each_one_asks_for_its_checkpointed_incumbent(self):
+        import inspect
+        for name, cls, mod in self._classes():
+            with self.subTest(spoke=name):
+                source = inspect.getsource(mod)
+                self.assertTrue(
+                    "restore_checkpointed_incumbent()" in source
+                    or "xhat_prep()" in source,
+                    msg=f"{name} never gives its extensions their pre-loop "
+                        f"hook, so a Checkpointer attached to it can never "
+                        f"restore")
+
+    def test_each_one_offers_a_checkpoint_point(self):
+        import inspect
+        for name, cls, mod in self._classes():
+            with self.subTest(spoke=name):
+                self.assertIn(
+                    "self.maybe_checkpoint()", inspect.getsource(mod),
+                    msg=f"{name}'s loop never offers a checkpoint point, so a "
+                        f"Checkpointer attached to it can never write")
+
+    def test_the_hooks_reach_the_extension(self):
+        """Inherited from InnerBoundNonantSpoke, so all three families get
+        them and not just the XhatInnerBoundBase ones."""
+        for name, cls, _ in self._classes():
+            with self.subTest(spoke=name):
+                spoke = cls.__new__(cls)
+                seen = []
+                spoke.opt = types.SimpleNamespace(
+                    extensions=object(),
+                    extobject=types.SimpleNamespace(
+                        pre_iter0=lambda: seen.append("pre_iter0"),
+                        maybe_checkpoint=lambda: seen.append("maybe_checkpoint"),
+                    ),
+                )
+                spoke.restore_checkpointed_incumbent()
+                spoke.maybe_checkpoint()
+                self.assertEqual(seen, ["pre_iter0", "maybe_checkpoint"])
+
+    def test_a_spoke_without_extensions_does_nothing(self):
+        for name, cls, _ in self._classes():
+            with self.subTest(spoke=name):
+                spoke = cls.__new__(cls)
+                spoke.opt = types.SimpleNamespace(extensions=None)
+                spoke.restore_checkpointed_incumbent()   # must not raise
+                spoke.maybe_checkpoint()
