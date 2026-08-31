@@ -195,6 +195,14 @@ class _CursorSpokeStub:
     def checkpoint_loop_state(self):
         return self.loop_state
 
+    def loop_state_progress(self, state):
+        # Delegated to the real spoke rather than reimplemented: a stub that
+        # answers this itself cannot notice when the real projection changes,
+        # which is how an idle pass came to rewrite the file on every pass.
+        from mpisppy.cylinders.xhatshufflelooper_bounder import (
+            XhatShuffleInnerBound)
+        return XhatShuffleInnerBound.loop_state_progress(self, state)
+
 
 @unittest.skipIf(not solver_available, "no solver is available")
 class TestSpokeWritesWhenTheCursorMoves(unittest.TestCase):
@@ -238,6 +246,29 @@ class TestSpokeWritesWhenTheCursorMoves(unittest.TestCase):
         # Same incumbent, same cursor: the spinning-loop case.
         ext.maybe_checkpoint()
         self.assertEqual(os.path.getmtime(self._spoke_file()), first)
+
+    def test_an_idle_pass_does_not_write_when_only_xh_iter_ticks(self):
+        """The loop increments xh_iter at the bottom of every pass, including
+        the ones that only poll the hub and solve nothing, because it feeds
+        the periodic debug line about where the delay comes from. Comparing
+        the whole loop state therefore made every such pass pickle the
+        incumbent, rename the file and fsync the directory -- measured at
+        about 8,700 writes a second on farmer over tmpfs, and silent, because
+        the write only announces itself when the objective improved."""
+        ext = self._checkpointer()
+        self._set_and_cache_solution(self.opt, 1.0)
+        self.opt.best_solution_obj_val = 10.0
+        self.spoke.loop_state = {"xh_iter": 1, "cursor": {"cycle_idx": 3}}
+        ext.maybe_checkpoint()
+        first = os.path.getmtime(self._spoke_file())
+
+        for n in range(2, 8):
+            self.spoke.loop_state = {"xh_iter": n, "cursor": {"cycle_idx": 3}}
+            ext.maybe_checkpoint()
+
+        self.assertEqual(
+            os.path.getmtime(self._spoke_file()), first,
+            msg="a pass that solved nothing rewrote the incumbent file")
 
     def test_a_cursor_move_alone_triggers_a_write(self):
         import pickle

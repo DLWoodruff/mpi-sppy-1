@@ -124,6 +124,17 @@ class XhatInnerBoundBase(spoke.InnerBoundNonantSpoke):
         """Accept what checkpoint_loop_state() returned. Returns warnings."""
         return []
 
+    def loop_state_progress(self, state):
+        """The part of a loop state that means this spoke did some work.
+
+        The write decision compares this rather than the whole loop state, so
+        a counter that ticks on every pass of a loop that spins while it waits
+        on the hub does not turn every idle pass into a file write. The whole
+        state is the right answer by default; a spoke whose state mixes
+        progress with bookkeeping overrides it.
+        """
+        return state
+
     def _checkpointed_loop_state(self):
         """The loop state a resume read for this spoke, or None.
 

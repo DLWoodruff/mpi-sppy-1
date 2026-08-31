@@ -34,9 +34,11 @@ import os
 import pickle
 import shutil
 import subprocess
+import types
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 from mpisppy.tests.utils import get_solver
 
@@ -278,3 +280,75 @@ class TestStochAdmmCylindersResumeAB(_ResumeABMixin, unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestRestoredIncumbentIsRepublished(unittest.TestCase):
+    """A spoke that restores an incumbent has written nothing to the directory
+    this run writes to, unless that is the very directory it read.
+
+    _last_written_obj means "what the file in self.ckpt_dir already holds", so
+    seeding it from a restore out of a *different* directory makes the skip
+    test decline to write until the spoke strictly improves on what it
+    restored. Stopping today and resuming tomorrow into a fresh
+    --checkpoint-dir is the documented flow, and a study whose xhat has
+    stopped improving is exactly where that loses the answer -- silently, at
+    exit code 0.
+    """
+
+    def _checkpointer(self, ckpt_dir, resume_from):
+        from mpisppy.extensions.checkpointer import Checkpointer
+        ext = Checkpointer.__new__(Checkpointer)
+        ext.opt = types.SimpleNamespace(
+            options={"resume_from": resume_from},
+            spcomm=types.SimpleNamespace(
+                best_inner_bound=None,
+                # XhatBase's default: the whole loop state is the progress.
+                # Spelled out because a SimpleNamespace inherits nothing, and
+                # the restore path reads this on branches that carry a cursor.
+                loop_state_progress=lambda state: state,
+            ),
+            cylinder_rank=0,
+        )
+        ext.ckpt_dir = ckpt_dir
+        ext.write_enabled = ckpt_dir is not None
+        ext.spoke_mode = True
+        ext._last_written_obj = None
+        ext._publish_restored_bound = None
+        ext.restored_incumbent_obj = None
+        ext._spoke_identity = lambda: ("XhatShuffleInnerBound", 2)
+        return ext
+
+    def _restore(self, ckpt_dir, resume_from):
+        from mpisppy.extensions import checkpointer as mod
+        ext = self._checkpointer(ckpt_dir, resume_from)
+        state = {"best_inner_bound": -108382.22}
+        with mock.patch.object(mod.ckpt, "load_spoke_incumbent",
+                               return_value=state), \
+             mock.patch.object(mod.ckpt, "restore_spoke_incumbent",
+                               return_value=-108382.22):
+            ext._restore_incumbent()
+        return ext
+
+    def test_a_fresh_directory_gets_the_restored_incumbent(self):
+        ext = self._restore(ckpt_dir="/tmp/ck2", resume_from="/tmp/ck1")
+        self.assertEqual(ext.restored_incumbent_obj, -108382.22)
+        self.assertIsNone(
+            ext._last_written_obj,
+            msg="the spoke believes it has already written its incumbent to a "
+                "directory it has never written to, so it will not publish "
+                "until it improves")
+
+    def test_the_same_directory_is_not_rewritten(self):
+        ext = self._restore(ckpt_dir="/tmp/ck1", resume_from="/tmp/ck1")
+        self.assertEqual(ext._last_written_obj, -108382.22,
+                         msg="resuming in place should not rewrite the file "
+                             "it just read")
+
+    def test_the_same_directory_spelled_two_ways(self):
+        ext = self._restore(ckpt_dir="/tmp/ck1", resume_from="/tmp/./ck1/")
+        self.assertEqual(ext._last_written_obj, -108382.22)
+
+    def test_a_restore_only_run_writes_nothing_anywhere(self):
+        ext = self._restore(ckpt_dir=None, resume_from="/tmp/ck1")
+        self.assertEqual(ext.restored_incumbent_obj, -108382.22)
+        self.assertIsNone(ext._last_written_obj)

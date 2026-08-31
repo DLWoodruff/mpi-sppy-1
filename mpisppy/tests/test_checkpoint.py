@@ -2183,6 +2183,12 @@ class _SpokeStub:
     def checkpoint_loop_state(self):
         return self.loop_state
 
+    def loop_state_progress(self, state):
+        # XhatBase's default. A stub that stands in for a spoke has to carry
+        # the whole contract, not just the part that was in use when it was
+        # written -- the Checkpointer calls this unguarded.
+        return state
+
 
 def _xhat_eval(ckpt_dir=None, resume_from=None, **overrides):
     """An Xhat_Eval on farmer, the object an xhat spoke drives."""

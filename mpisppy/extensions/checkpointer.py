@@ -238,7 +238,7 @@ class Checkpointer(Extension):
         self._last_written_obj = None
         #: Likewise for the loop cursor, which moves independently of the
         #: incumbent -- most cursor moves do not improve on the best xhat.
-        self._last_written_loop_state = None
+        self._last_written_loop_progress = None
 
         if not self.spoke_mode and not self.dual_spoke_mode \
                 and self.write_enabled:
@@ -387,16 +387,27 @@ class Checkpointer(Extension):
         obj = ckpt.restore_spoke_incumbent(self.opt, state)
         self.restored_incumbent_obj = obj
         self.opt.spcomm.best_inner_bound = state["best_inner_bound"]
-        self._last_written_obj = obj
         # Held rather than applied: the spoke's loop -- and the cursor this
         # describes -- is built after pre_iter0, so it collects this itself
         # once it exists. Older files have no such key.
         self.restored_loop_state = state.get("loop_state")
-        self._last_written_loop_state = self.restored_loop_state
         # Held for the same reason, and handed over at the end of xhat_prep:
         # post_iter0 has not run yet, and it is where an extension rebuilds
         # its bookkeeping from the models.
         self.restored_extension_state = state.get("extension_state")
+        # These two mean "what the file in self.ckpt_dir already holds", so
+        # they may only be seeded when that is the file we just read. Resuming
+        # into a *different* directory is the documented
+        # stop-today-resume-tomorrow flow, and there this spoke has written
+        # nothing yet: seeding them there makes the skip test below decline to
+        # write until the spoke strictly improves on what it restored, so a
+        # study whose xhat has stopped improving -- a converged one, the case
+        # where the answer is worth the most -- publishes no incumbent at all
+        # and the next resume starts without one, with exit code 0 throughout.
+        if self.write_enabled and self._same_directory(resume_from):
+            self._last_written_obj = obj
+            self._last_written_loop_progress = \
+                self.opt.spcomm.loop_state_progress(self.restored_loop_state)
         # The hub learns bounds only from what a spoke sends, so a restored
         # incumbent that is never published leaves the hub reporting an
         # infinite inner bound -- and its gap and convergence tests reading
@@ -407,6 +418,20 @@ class Checkpointer(Extension):
         self._publish_restored_bound = state["best_inner_bound"]
         global_toc(f"Restored the checkpointed incumbent for {cylinder} "
                    f"(objective {obj})", rank0)
+
+    def _same_directory(self, other):
+        """True when ``other`` names the directory this run writes to.
+
+        Compared by resolved path rather than by string: the resume flow
+        passes these on a command line, so the same directory routinely
+        arrives spelled two ways.
+        """
+        if not other or not self.ckpt_dir:
+            return False
+        try:
+            return os.path.realpath(other) == os.path.realpath(self.ckpt_dir)
+        except OSError:
+            return False
 
     def _is_final_iteration(self):
         """True when the loop bound says this completed iteration is the last.
@@ -618,8 +643,17 @@ class Checkpointer(Extension):
             # cursor rides along with it rather than on its own.
             return
         loop_state = spoke.checkpoint_loop_state()
+        # Compared on the progress projection rather than the whole state.
+        # xhatshuffle's loop state carries xh_iter, which counts passes of a
+        # loop that spins while it waits on the hub, so it differs on every
+        # pass whether or not anything was solved -- and comparing it made a
+        # pass that solves nothing write the incumbent, pickle and rename the
+        # file and fsync the directory. Measured at 0.115 ms a pass on farmer
+        # over tmpfs: about 8,700 writes a second, per spoke rank, silently,
+        # since the toc below only speaks when the objective improved.
+        progress = spoke.loop_state_progress(loop_state)
         if (obj == self._last_written_obj
-                and loop_state == self._last_written_loop_state):
+                and progress == self._last_written_loop_progress):
             return
         try:
             cylinder, strata_rank = self._spoke_identity()
@@ -638,7 +672,7 @@ class Checkpointer(Extension):
             return
         improved = obj != self._last_written_obj
         self._last_written_obj = obj
-        self._last_written_loop_state = loop_state
+        self._last_written_loop_progress = progress
         if not improved:
             # The cursor moved but the answer did not. Worth writing, not
             # worth a line in the log every time the spoke tries a scenario.

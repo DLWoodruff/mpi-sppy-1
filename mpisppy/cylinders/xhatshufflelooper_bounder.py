@@ -207,6 +207,17 @@ class XhatShuffleInnerBound(_PreLoopXhatMixin, XhatInnerBoundBase):
         return {"xh_iter": int(self.xh_iter),
                 "cursor": cycler.checkpoint_state()}
 
+    def loop_state_progress(self, state):
+        """Only the cursor. xh_iter counts passes, not work.
+
+        The loop increments xh_iter at the bottom of every pass, including the
+        ones that only poll the hub and solve nothing -- it feeds the periodic
+        debug line about where the delay in getting an xhat comes from, so it
+        has to count those. The cursor moves only when a subproblem was
+        actually solved, which is the thing worth a write.
+        """
+        return None if state is None else state.get("cursor")
+
     def restore_loop_state(self, state):
         """Put the cursor back where the checkpoint left it.
 
