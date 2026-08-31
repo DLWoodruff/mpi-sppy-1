@@ -201,6 +201,9 @@ def _extension_class(name):
         return PreIter0Tagger
     if name == "clock_rewinder":
         return ClockRewinder
+    if name == "sep_rho":
+        from mpisppy.extensions.sep_rho import SepRho
+        return SepRho
     raise ValueError(name)
 
 
@@ -2062,6 +2065,240 @@ class TestUnknownBackend(unittest.TestCase):
     def test_require_dill_ignores_other_backends(self):
         # Only the dill-reload backend needs dill; nothing should raise here.
         checkpointing.require_dill(checkpointing.LEAF_BACKEND)
+
+
+@unittest.skipIf(not solver_available,
+                 "no solver is available for the varid map tests")
+class TestVaridToNonantIndexRestored(unittest.TestCase):
+    """varid_to_nonant_index is keyed by id(vardata), so it cannot cross a
+    checkpoint on its own: dill brings the dict back holding the addresses of
+    the objects that were written, which say nothing about the objects that
+    came out. It looks intact and maps nothing."""
+
+    STOP = 2
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.ckpt_dir = os.path.join(self._tmp.name, "ckpt")
+        stopped = _make_ph(_options(self.STOP, ckpt_dir=self.ckpt_dir))
+        stopped.ph_main()
+        self.resumed = _make_ph(_options(0, resume_from=self.ckpt_dir))
+        self.resumed.ph_main()
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_the_map_addresses_the_restored_models(self):
+        for sname, s in self.resumed.local_scenarios.items():
+            varids = s._mpisppy_data.varid_to_nonant_index
+            for ndn_i, var in s._mpisppy_data.nonant_indices.items():
+                self.assertIn(
+                    id(var), varids,
+                    msg=f"{sname} nonant {ndn_i} is not in "
+                        f"varid_to_nonant_index after the resume; the map "
+                        f"still holds the writing process's ids")
+                self.assertEqual(varids[id(var)], ndn_i)
+
+    def test_the_consumer_that_crashes_does_not(self):
+        """is_zero_prob indexes the map rather than testing membership, so a
+        stale one raises. It is reached from _check_staleness after every
+        solve and from gather_var_values_to_rank0 when a run writes its
+        solution, on any run that sets variable_probability."""
+        self.resumed.variable_probability = {}     # take the early return out
+        for sname, s in self.resumed.local_scenarios.items():
+            for var in s._mpisppy_data.nonant_indices.values():
+                self.resumed.is_zero_prob(s, var)  # must not raise
+
+
+class TestIntegerRelaxThenEnforceResume(unittest.TestCase):
+    """The transformation records its undo map in a _relaxed_integer_vars
+    Suffix. Applying it twice replaces that Suffix with an empty one, so the
+    undo restores nothing while still reporting that it enforced integrality
+    -- and the run answers the relaxation."""
+
+    def _extension(self, scenarios, resumed):
+        import types
+        from mpisppy.extensions.integer_relax_then_enforce import (
+            IntegerRelaxThenEnforce)
+        opt = types.SimpleNamespace(
+            options={"integer_relax_then_enforce_options": {"ratio": 0.5}},
+            local_scenarios=scenarios,
+            cylinder_rank=0,
+            _resumed_from_checkpoint=resumed,
+        )
+        return IntegerRelaxThenEnforce(opt)
+
+    def _model(self):
+        import pyomo.environ as pyo
+        m = pyo.ConcreteModel()
+        m.x = pyo.Var(domain=pyo.NonNegativeIntegers, bounds=(0, 10))
+        m.obj = pyo.Objective(expr=m.x)
+        m._solver_plugin = None
+        return m
+
+    def test_a_relaxed_model_is_not_relaxed_a_second_time(self):
+        m = self._model()
+        ext = self._extension({"s": m}, resumed=False)
+        ext.pre_iter0()                       # the run that wrote the checkpoint
+        undo_map = m._relaxed_integer_vars
+
+        resumed = self._extension({"s": m}, resumed=True)
+        resumed.integer_relaxer = mock.Mock()
+        resumed.pre_iter0()
+
+        resumed.integer_relaxer.apply_to.assert_not_called()
+        self.assertIs(m._relaxed_integer_vars, undo_map,
+                      msg="the undo map was replaced, so unrelaxing would "
+                          "restore nothing")
+        # Which state the models are in is checkpointed extension state on
+        # this branch, restored after this hook, rather than inferred from
+        # whether the Suffix is present.
+        resumed.restore_state(ext.checkpoint_state())
+        self.assertTrue(resumed._integers_relaxed,
+                        msg="a resumed run must know its models are relaxed")
+
+    def test_the_integrality_actually_comes_back(self):
+        m = self._model()
+        self._extension({"s": m}, resumed=False).pre_iter0()
+        self.assertFalse(m.x.is_integer())
+
+        resumed = self._extension({"s": m}, resumed=True)
+        resumed.pre_iter0()
+        resumed._unrelax_integers()
+
+        self.assertTrue(
+            m.x.is_integer(),
+            msg="the resumed run reports that it enforced integrality while "
+                "still solving the relaxation")
+
+    def test_models_that_are_not_relaxed_leave_integrality_alone(self):
+        """A checkpoint carries no extension state, so a run that had already
+        enforced integrality and one that never had this extension look the
+        same from here. Relaxing now would change the algorithm mid-study."""
+        m = self._model()
+        resumed = self._extension({"s": m}, resumed=True)
+        resumed.integer_relaxer = mock.Mock()
+        resumed.pre_iter0()
+
+        resumed.integer_relaxer.apply_to.assert_not_called()
+        self.assertFalse(resumed._integers_relaxed)
+        self.assertTrue(m.x.is_integer())
+
+
+@unittest.skipIf(not solver_available,
+                 "no solver is available for the dynamic rho resume tests")
+class TestDynRhoCachesSurviveResume(unittest.TestCase):
+    """post_iter0 skips the rho recomputation on a resume, but it is also the
+    only thing that seeds primal_conv_cache and the WTracker's first W set --
+    and miditer reads both on the very next pass."""
+
+    STOP = 2
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.ckpt_dir = os.path.join(self._tmp.name, "ckpt")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _sep_rho_options(self, *args, **kwargs):
+        import types
+        options = _options(*args, **kwargs)
+        options["sep_rho_options"] = {"cfg": types.SimpleNamespace()}
+        return options
+
+    def test_a_resumed_run_keeps_iterating(self):
+        stopped = _make_ph(self._sep_rho_options(self.STOP,
+                                                 ckpt_dir=self.ckpt_dir),
+                           extension_name="sep_rho")
+        stopped.ph_main()
+
+        # A non-zero budget is the point: the failure was at the first
+        # miditer of the resumed leg, which a zero-iteration resume never
+        # reaches.
+        resumed = _make_ph(self._sep_rho_options(2,
+                                                 resume_from=self.ckpt_dir),
+                           extension_name="sep_rho")
+        resumed.ph_main()       # must not raise
+
+        self.assertEqual(resumed._PHIter, self.STOP + 2)
+        ext = resumed.extobject
+        self.assertTrue(ext.primal_conv_cache,
+                        msg="the convergence cache was never seeded")
+        self.assertGreaterEqual(
+            len(ext.wt.local_Ws), 2,
+            msg="the WTracker never grabbed a W set on the resumed run")
+
+
+class TestWXBarReaderResume(unittest.TestCase):
+    """pre_iter0 runs after the checkpoint's models are spliced in, so reading
+    an --init-W-fname there overwrites the checkpointed duals with the values
+    the study started from -- and the documented workflow submits the same
+    command every morning, so the flag is still on it."""
+
+    def _reader(self, resumed):
+        import types
+        from mpisppy.utils.w_utils.wxbarreader import WXBarReader
+        reader = WXBarReader.__new__(WXBarReader)
+        reader.not_active = False
+        reader.w_fname = "W0.csv"
+        reader.x_fname = None
+        reader.sep_files = False
+        reader.cylinder_rank = 0
+        reader.PHB = types.SimpleNamespace(_resumed_from_checkpoint=resumed)
+        return reader
+
+    def test_a_resumed_run_does_not_read_the_files(self):
+        import mpisppy.utils.w_utils.wxbarutils as wxbarutils
+        with mock.patch.object(wxbarutils, "set_W_from_file") as set_W:
+            self._reader(resumed=True).pre_iter0()
+        set_W.assert_not_called()
+
+    def test_an_ordinary_run_still_reads_them(self):
+        import mpisppy.utils.w_utils.wxbarutils as wxbarutils
+        reader = self._reader(resumed=False)
+        reader.PHB._reenable_W = mock.Mock()
+        with mock.patch.object(wxbarutils, "set_W_from_file") as set_W:
+            reader.pre_iter0()
+        set_W.assert_called_once()
+
+
+class TestCheckpointingWithoutAHub(unittest.TestCase):
+    """--EF and the three write-only modes branch off ahead of do_decomp, so
+    the hub-side guard never sees them: they accept the checkpoint flags and
+    act on neither, exiting 0."""
+
+    MODES = ("--EF", "--pickle-bundles-dir", "--pickle-scenarios-dir",
+             "--write-scenario-lp-mps-files-dir")
+
+    def _cfg(self, **overrides):
+        cfg = Config()
+        cfg.checkpoint_args()
+        for k, v in overrides.items():
+            setattr(cfg, k, v)
+        return cfg
+
+    def test_checkpoint_dir_is_refused(self):
+        from mpisppy.generic.decomp import refuse_checkpointing_without_a_hub
+        for mode in self.MODES:
+            with self.subTest(mode=mode):
+                with self.assertRaisesRegex(RuntimeError, "--checkpoint-dir"):
+                    refuse_checkpointing_without_a_hub(
+                        self._cfg(checkpoint_dir="/tmp/nope"), mode)
+
+    def test_resume_from_is_refused(self):
+        from mpisppy.generic.decomp import refuse_checkpointing_without_a_hub
+        for mode in self.MODES:
+            with self.subTest(mode=mode):
+                with self.assertRaisesRegex(RuntimeError, "--resume-from"):
+                    refuse_checkpointing_without_a_hub(
+                        self._cfg(resume_from="/tmp/nope"), mode)
+
+    def test_a_run_without_the_flags_is_left_alone(self):
+        from mpisppy.generic.decomp import refuse_checkpointing_without_a_hub
+        for mode in self.MODES:
+            with self.subTest(mode=mode):
+                refuse_checkpointing_without_a_hub(self._cfg(), mode)
 
 
 if __name__ == "__main__":
