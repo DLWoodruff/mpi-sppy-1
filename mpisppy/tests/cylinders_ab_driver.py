@@ -185,11 +185,19 @@ def _spoke_marker(wheel):
     return {
         "cylinder": type(spoke).__name__,
         "restored_incumbent_obj": ext.restored_incumbent_obj,
+        # The iteration a dual cylinder's restored W was written at, or None
+        # on a cylinder that has no such state or did not restore any.
+        "restored_dual_generation": getattr(ext, "restored_dual_generation",
+                                            None),
         # What the loop actually *adopted*, not what the Checkpointer read.
         # The two differ whenever a cursor is read and then refused, and a
         # test that watched the read would score that as a success.
         "applied_loop_state": getattr(spoke, "applied_loop_state", None),
-        "final_loop_state": spoke.checkpoint_loop_state(),
+        # Only the xhatter spokes have a loop with a place in it. The dual
+        # cylinders run PH, whose iterate is not a cursor.
+        "final_loop_state": (spoke.checkpoint_loop_state()
+                             if hasattr(spoke, "checkpoint_loop_state")
+                             else None),
     }
 
 

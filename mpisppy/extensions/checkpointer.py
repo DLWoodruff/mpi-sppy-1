@@ -200,7 +200,15 @@ class Checkpointer(Extension):
         # checkpoint it resumed from.
         from mpisppy.opt.ph import PH
         from mpisppy.utils.xhat_eval import Xhat_Eval
-        self.spoke_mode = not isinstance(opt, PH)
+        # A third kind of cylinder: one that runs PH itself without being the
+        # hub -- relaxed_ph and ph_dual. Its opt is a PHBase, which is neither
+        # the hub's PH nor an xhat spoke's Xhat_Eval, so the cylinder builder
+        # says which it is rather than leaving it to be inferred. It writes W
+        # rather than models (see checkpointing.dual_spoke_state) and restores
+        # it in post_iter0.
+        self.dual_spoke_mode = \
+            options.get("checkpoint_role", "hub") == "dual_spoke"
+        self.spoke_mode = not self.dual_spoke_mode and not isinstance(opt, PH)
         if self.spoke_mode and not isinstance(opt, Xhat_Eval):
             raise RuntimeError(
                 f"Checkpointing supports the synchronous PH hub and the xhat "
@@ -210,6 +218,10 @@ class Checkpointer(Extension):
 
         #: Set once a restored incumbent still needs publishing to the hub.
         self._publish_restored_bound = None
+        #: The iteration a dual cylinder's restored W was written at, or None
+        #: if it started from W=0. Read by tests, which otherwise cannot tell
+        #: a restored W from one the cylinder converged to on its own.
+        self.restored_dual_generation = None
         #: The incumbent objective this spoke restored from disk, or None if
         #: it started without one. Read by tests, which otherwise cannot tell
         #: a restored incumbent from one the spoke happened to re-find.
@@ -228,7 +240,8 @@ class Checkpointer(Extension):
         #: incumbent -- most cursor moves do not improve on the best xhat.
         self._last_written_loop_state = None
 
-        if not self.spoke_mode and self.write_enabled:
+        if not self.spoke_mode and not self.dual_spoke_mode \
+                and self.write_enabled:
             ckpt.require_dill(self.backend)
 
         if not self.write_enabled:
@@ -244,16 +257,24 @@ class Checkpointer(Extension):
 
         # Create and probe the directory now. Discovering only at write time
         # that the path is unwritable would mean the run never checkpoints.
-        # Every rank probes, with a rank-tagged probe file so the ranks do not
-        # remove each other's: on a cluster the checkpoint directory can be
-        # unwritable from some nodes and not others, and that is exactly the
-        # failure worth catching before a multi-hour run rather than at its
-        # first write.
+        # Every rank probes, because on a cluster the checkpoint directory can
+        # be unwritable from some nodes and not others, and that is exactly
+        # the failure worth catching before a multi-hour run rather than at
+        # its first write.
+        #
+        # The probe file is named for the *global* rank, not the cylinder
+        # rank. Several cylinders write into one directory and each of them
+        # numbers its own ranks from zero, so a cylinder-rank name has one
+        # copy per cylinder: whichever probes second removes the file the
+        # first is still using, and that one fails with a FileNotFoundError
+        # naming a directory that is perfectly writable. Global ranks are
+        # unique across the job, which is the scope this needs.
         try:
             os.makedirs(self.ckpt_dir, exist_ok=True)
             probe = os.path.join(
                 self.ckpt_dir,
-                f".mpisppy_write_probe_{int(opt.cylinder_rank):04d}")
+                f".mpisppy_write_probe_"
+                f"{int(getattr(opt, 'global_rank', opt.cylinder_rank)):04d}")
             with open(probe, "w"):
                 pass
             os.remove(probe)
@@ -265,6 +286,11 @@ class Checkpointer(Extension):
             ) from exc
 
     def pre_iter0(self):
+        if self.dual_spoke_mode:
+            # Nothing to prove: this cylinder writes no models, so there is
+            # no dill to probe. Its own restore waits for post_iter0, by
+            # which time PH_Prep has attached the W it writes into.
+            return
         if self.spoke_mode:
             # xhat_prep calls this once, before the spoke's loop starts, which
             # is the spoke's equivalent of the hub's resume branch in Iter0.
@@ -276,6 +302,57 @@ class Checkpointer(Extension):
         # that only found out at its first write would lose exactly the state
         # checkpointing exists to preserve.
         ckpt.probe_model_is_dillable(self.opt)
+
+    def post_iter0(self):
+        """Put a dual cylinder's W back, once there is a W to put it in.
+
+        Iter0 has just solved this cylinder's subproblems from W = 0 and is
+        about to hand the loop an iterate that owes nothing to the study.
+        Overwriting it here rather than skipping the solve keeps the cylinder
+        ordinary -- solvers created, bound reported, prox terms spliced -- at
+        the cost of one solve round that a resumed run throws away.
+        """
+        if not self.dual_spoke_mode:
+            return
+        resume_from = self.opt.options.get("resume_from", None)
+        if not resume_from:
+            return
+        cylinder, strata_rank = self._spoke_identity()
+        rank0 = self.opt.cylinder_rank == 0
+        state = ckpt.load_dual_spoke_state(self.opt, resume_from, cylinder,
+                                           strata_rank)
+        if state is None:
+            global_toc(f"No checkpointed dual weights for {cylinder} in "
+                       f"{resume_from}; this cylinder starts from W=0", rank0)
+            return
+        ckpt.restore_dual_spoke_state(self.opt, state)
+        self.restored_dual_generation = state["generation"]
+        global_toc(f"Restored the checkpointed dual weights for {cylinder} "
+                   f"(written at its iteration {state['generation']})", rank0)
+
+    def _dual_spoke_checkpoint(self):
+        """Write W at the end of a completed iteration of this cylinder.
+
+        Every iteration, with no cadence to divide it: the file is a couple
+        of floats per nonanticipative variable, and the iteration that
+        produced it was a round of subproblem solves. Failures warn for the
+        same reason the other cylinders' do -- losing this file costs a
+        resumed run a dual restart, which is not worth killing a running
+        cylinder over.
+        """
+        if not self.write_enabled:
+            return
+        try:
+            cylinder, strata_rank = self._spoke_identity()
+            ckpt.write_dual_spoke_state(
+                self.opt, self.ckpt_dir, cylinder, strata_rank,
+                generation=int(getattr(self.opt, "_PHIter", 0)))
+        except Exception as exc:
+            global_toc(
+                f"WARNING: this cylinder could not write its dual weights "
+                f"({type(exc).__name__}); the run continues and the next "
+                f"iteration will try again.\n{exc}",
+                self.opt.cylinder_rank == 0)
 
     def _spoke_identity(self):
         """(cylinder name, strata rank) -- what names this spoke's file."""
@@ -460,6 +537,9 @@ class Checkpointer(Extension):
         """
         if self.spoke_mode:
             self._spoke_checkpoint()
+            return
+        if self.dual_spoke_mode:
+            self._dual_spoke_checkpoint()
             return
         if not self.write_enabled:
             return

@@ -1101,3 +1101,143 @@ def restore_spoke_incumbent(opt, state):
 
     opt.best_solution_obj_val = state["best_solution_obj_val"]
     return state["best_solution_obj_val"]
+
+
+# ---------------------------------------------------------------------------
+# The dual cylinders' own PH state.
+#
+# A cylinder that runs PH to produce duals -- relaxed_ph, ph_dual -- keeps the
+# state that matters on its own models, and none of it is in the hub's
+# checkpoint: the hub dills its scenarios, not theirs. So a resumed wheel that
+# restored the hub perfectly still handed it a cylinder starting from W = 0,
+# which under --ph-primal-hub is where the hub's own W comes from.
+#
+# What is written is W and the nonanticipative values, per scenario, and not
+# the models: W is what the next iteration's Update_W adds to, and the values
+# are what its Compute_Xbar averages. Everything else the cylinder needs it
+# rebuilds every run -- rho from the rho setter, xbar from the values, the
+# prox terms from PH_Prep -- so carrying it would be carrying a copy of a
+# derivation. That keeps this file small enough to write at every iteration,
+# which is what a cylinder nobody synchronizes with needs.
+# ---------------------------------------------------------------------------
+
+def dual_spoke_state(opt, cylinder, strata_rank, generation):
+    """The dict written by ``write_dual_spoke_state``.
+
+    W is keyed by ``(ndn, i)`` and the values by variable name -- the two
+    keyings the rest of this module uses, and neither of them an identity.
+    """
+    duals = {}
+    for sname, s in opt.local_scenarios.items():
+        model = s._mpisppy_model
+        nonants = s._mpisppy_data.nonant_indices
+        duals[sname] = {
+            "W": {ndn_i: _as_float_or_none(model.W[ndn_i]._value)
+                  for ndn_i in nonants},
+            "values": {var.name: var._value for var in nonants.values()},
+        }
+    return {
+        "format_version": FORMAT_VERSION,
+        "kind": "dual-spoke-ph-state",
+        "cylinder": str(cylinder),
+        "strata_rank": int(strata_rank),
+        "rank": int(opt.cylinder_rank),
+        # This cylinder's own iteration count, which is not the hub's: the
+        # wheel does not march the cylinders in step and this is not an
+        # attempt to. It is recorded so a log can say how far the cylinder
+        # had got, and it is not compared against anything on the way back in.
+        "generation": int(generation),
+        "geometry": geometry(opt),
+        "structural_fingerprint": structural_fingerprint(opt.options),
+        "duals": duals,
+    }
+
+
+def write_dual_spoke_state(opt, ckpt_dir, cylinder, strata_rank, generation):
+    """Write this cylinder's PH state, latest-wins. Returns the path.
+
+    Temp-then-rename like every other file here, so a kill mid-write leaves
+    the previous iteration's state intact rather than a truncated file.
+    """
+    state = dual_spoke_state(opt, cylinder, strata_rank, generation)
+    spokes_dir = os.path.join(ckpt_dir, SPOKES_SUBDIR)
+    os.makedirs(spokes_dir, exist_ok=True)
+    path = os.path.join(
+        spokes_dir,
+        _spoke_filename(cylinder, strata_rank, opt.cylinder_rank),
+    )
+    _atomic_write_bytes(path, lambda f: pickle.dump(state, f))
+    _fsync_dir(spokes_dir)
+    return path
+
+
+def load_dual_spoke_state(opt, ckpt_dir, cylinder, strata_rank):
+    """Read this cylinder's PH state, or None if it is not there.
+
+    Missing is normal -- the run being resumed may not have reached this
+    cylinder's first completed iteration -- and present but wrong is an
+    error, as everywhere else here.
+    """
+    path = os.path.join(
+        ckpt_dir, SPOKES_SUBDIR,
+        _spoke_filename(cylinder, strata_rank, opt.cylinder_rank),
+    )
+    if not os.path.exists(path):
+        return None
+    with open(path, "rb") as f:
+        state = pickle.load(f)
+
+    if state.get("format_version") != FORMAT_VERSION:
+        raise CheckpointMismatch(
+            f"The cylinder state file '{path}' has format version "
+            f"{state.get('format_version')}, but this mpi-sppy writes "
+            f"version {FORMAT_VERSION}."
+        )
+    if state.get("kind") != "dual-spoke-ph-state":
+        # Spoke files are named for their cylinder class, so this can only
+        # happen if a class changed what it writes between the two runs.
+        raise CheckpointMismatch(
+            f"'{path}' holds {state.get('kind')!r}, not this cylinder's PH "
+            f"state."
+        )
+    if state.get("structural_fingerprint") != structural_fingerprint(opt.options):
+        raise CheckpointMismatch(
+            f"The cylinder state file '{path}' was written by a run "
+            f"configured differently from this one, so its dual weights do "
+            f"not belong to this model."
+        )
+    have = sorted(opt.local_scenarios.keys())
+    want = state["geometry"]["scenario_names"]
+    if have != want:
+        raise CheckpointMismatch(
+            f"Rank {opt.cylinder_rank} of this cylinder owns scenarios "
+            f"{have}, but '{path}' was written with {want} on that rank."
+        )
+    return state
+
+
+def restore_dual_spoke_state(opt, state):
+    """Put W and the nonanticipative values back on this cylinder's models.
+
+    A W entry that no longer resolves is an error rather than a skipped key:
+    a cylinder carrying half the study's duals and half of zero is not a
+    continuation of anything, and it would show up only as a bound that
+    quietly stopped improving.
+    """
+    for sname, s in opt.local_scenarios.items():
+        entry = state["duals"][sname]
+        model = s._mpisppy_model
+        nonants = s._mpisppy_data.nonant_indices
+        saved_w = entry["W"]
+        missing = [ndn_i for ndn_i in nonants if ndn_i not in saved_w]
+        if missing:
+            raise CheckpointMismatch(
+                f"The checkpointed dual weights for scenario '{sname}' are "
+                f"missing {len(missing)} nonanticipative variable(s) this "
+                f"model has (e.g. {missing[:3]}), so they cannot be restored."
+            )
+        by_name = entry["values"]
+        for ndn_i, var in nonants.items():
+            model.W[ndn_i]._value = saved_w[ndn_i]
+            if var.name in by_name:
+                var._value = by_name[var.name]

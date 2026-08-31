@@ -1266,6 +1266,40 @@ as a branch stacked on the 1a PR.
   and a resume with a changed extension or converger set. Each fix was verified
   to be load-bearing by reverting it and watching the matching test fail.
 
+  **Also here: the dual cylinders' own PH state.** `relaxed_ph` and `ph_dual`
+  run PH without being the hub, and the hub's checkpoint dills the hub's
+  scenarios, not theirs — so a resumed wheel restored the hub exactly and then
+  fed it duals from a cylinder starting at W = 0. Under `--ph-primal-hub` that
+  is the hub's own W, so the state the checkpoint most carefully preserved was
+  immediately overwritten by one that had been thrown away. These cylinders now
+  write W and the nonanticipative values, by `(ndn, i)` and by name, to a file
+  in `spokes/` named for the cylinder, at every completed iteration of their own
+  loop — it is a couple of floats per nonant, and the iteration that produced it
+  was a round of subproblem solves, so there is no cadence to divide. The
+  restore is `Checkpointer.post_iter0`: the cylinder's Iter0 runs and solves as
+  usual and its result is then overwritten, which costs one solve round and
+  keeps the cylinder an ordinary PH object with solvers created and prox terms
+  spliced.
+
+  Three things this deliberately does not do. It does not dill the cylinder's
+  models: rho comes back from the rho setter, xbar from the values, the prox
+  terms from `PH_Prep`, and carrying them would be carrying a copy of a
+  derivation. It does not synchronize the cylinder with the hub — the file
+  records the cylinder's own iteration count for the log and nothing compares
+  it to the hub's generation, because these cylinders spin far ahead (62 of
+  their iterations by the hub's third, measured on `sizes`) and §9 item 6 keeps
+  spokes uncoordinated on purpose. And it does not let `--stop-at-iteration-
+  number` reach the cylinder, whose `PHIterLimit` is deliberately enormous: a
+  study bound counts *hub* iterations, and applying it to this loop would stop
+  the cylinder at that count and starve the hub of duals.
+
+  The Checkpointer had two kinds of cylinder and now has three. It could tell
+  the first two apart by the class of the `opt` it was attached to; a dual
+  cylinder's is a `PHBase`, which is neither, so `cfg_vanilla` passes
+  `role="dual_spoke"` and the extension is told. `PHBase.Iter0`'s resume branch
+  refuses the same role: splicing the hub's scenarios into this cylinder would
+  replace its models with a copy of another cylinder's.
+
   **Not done here: the same contract on the spoke side.** §5.5 says the contract
   serves hub and xhatter extensions alike, and the methods are on the base class
   so it does — but the spoke's incumbent file does not gather them, because no

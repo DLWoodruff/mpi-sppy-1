@@ -20,7 +20,8 @@ Nothing else in the checkpointing tests covers any of these:
 * ``PHPrimalHub``. Every other checkpoint test runs ``PHHub``, whose W comes
   from its own subproblem duals. This hub's W arrives from a cylinder, so its
   iterate depends on a cylinder's state as well as its own.
-* ``RelaxedPHSpoke``, which no other resumed run has.
+* ``RelaxedPHSpoke``, which no other resumed run has, and which is the only
+  cylinder that checkpoints PH state of its own rather than an incumbent.
 * ``RelaxedPHFixer``. Phase 3 changed it -- its "the modeler fixed this" set
   now goes through ``was_initially_fixed`` -- with no A/B test behind the
   change. It is a different extension from the ``Fixer`` in
@@ -41,13 +42,12 @@ file is built around that rather than against it. The hub's W arrives from a
 cylinder and its incumbent from an asynchronous one, so how far each gets
 depends on wall-clock timing: two identical uninterrupted legs measured
 bit-identical on a quiet machine and 1.0 apart in a nonant under load. A
-resumed leg differs by more, for a reason that is structural rather than a
-lost restore -- ``RelaxedPHSpoke`` checkpoints nothing, so it starts over and
-hands the primal hub a different W than an uninterrupted run would have at
-that iteration, and the fixer downstream of it fixes a different set of
-variables. Measured on sizes with 10 scenarios: 496 of 3250 recorded state
-entries differ, 30 of them fixedness flags, and the expected objective by
-3.6e-4 relative.
+resumed leg differs by more, and not because a restore was lost: the dual
+cylinder now carries its W, but it counts its own iterations and spins far
+ahead of the hub -- 62 of them by the hub's third -- so the point it resumes
+from is its own, and the fixer downstream of it acts on what that produces.
+Measured on sizes with 10 scenarios: 480 of 3250 recorded state entries
+differ and the expected objective by 4.8e-4 relative.
 
 So this file pins what the determinism contract (design section 7) promises
 for a configuration whose hub reads a cylinder: a valid continuation, an
@@ -73,6 +73,7 @@ is set. The boolean is set here, or the extension under test would not exist.
 import importlib.util
 import json
 import os
+import pickle
 import shutil
 import subprocess
 import sys
@@ -289,6 +290,36 @@ class _ProfileABMixin:
             self.stopped["BestInnerBound"],
             msg="the spoke restored something other than the incumbent its "
                 "own checkpoint held")
+
+    def test_the_dual_cylinder_carried_its_dual_weights(self):
+        """The W the primal hub iterates on is the study's, not a fresh zero.
+
+        This cylinder holds no incumbent, so nothing in the hub checkpoint or
+        in an xhat spoke's file describes it; before it wrote its own, a
+        resumed wheel restored the hub perfectly and then fed it duals from a
+        cylinder starting over.
+        """
+        spokes_dir = os.path.join(self.ckpt_dir, "spokes")
+        names = [f for f in os.listdir(spokes_dir)
+                 if f.startswith("spoke_RelaxedPHSpoke")]
+        self.assertTrue(
+            names,
+            msg=f"the dual cylinder checkpointed nothing: "
+                f"{os.listdir(spokes_dir)}")
+        with open(os.path.join(spokes_dir, names[0]), "rb") as f:
+            state = pickle.load(f)
+        weights = [w for entry in state["duals"].values()
+                   for w in entry["W"].values()]
+        self.assertTrue(
+            any(w for w in weights),
+            msg="the dual cylinder wrote a W of all zeros, which a resume "
+                "cannot be distinguished from starting over")
+        restored = [spoke["restored_dual_generation"]
+                    for spoke in self.resumed["spokes"]
+                    if spoke["cylinder"] == "RelaxedPHSpoke"]
+        self.assertEqual(
+            restored, [state["generation"]],
+            msg="the resumed cylinder did not pick up the W on disk")
 
     def test_the_fixer_ran_on_both_sides_of_the_stop(self):
         """The extension phase 3 changed, exercised across a resume."""

@@ -1304,6 +1304,13 @@ class PHBase(mpisppy.spopt.SPOpt):
         if not ckpt_dir:
             return
 
+        # A dual cylinder runs PH without being the hub, and the hub's
+        # checkpoint is not its: splicing the hub's scenarios in here would
+        # replace this cylinder's models with a copy of another cylinder's.
+        # It restores its own W instead, in Checkpointer.post_iter0.
+        if self.options.get("checkpoint_role", "hub") != "hub":
+            return
+
         # The write side refuses non-PH hubs (Checkpointer.__init__), and this
         # is its read-side counterpart. Without it, `--APH --resume-from`
         # splices a PH checkpoint into APH with no error at startup: APH has
