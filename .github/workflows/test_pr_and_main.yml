@@ -211,6 +211,13 @@ jobs:
         run: |
           coverage run $COV_ARGS -m pytest mpisppy/tests/test_checkpoint_multirank.py -v
 
+      # Same shape, on a user's whole option profile rather than one
+      # mechanism. The uc case takes about a minute per leg; it is skipped
+      # where egret is missing.
+      - name: Test checkpoint/resume on a production option profile
+        run: |
+          coverage run $COV_ARGS -m pytest mpisppy/tests/test_checkpoint_profile.py -v
+
       - name: Test prox_approx end-to-end
         run: |
           coverage run $COV_ARGS -m pytest mpisppy/tests/test_prox_approx_e2e.py -v

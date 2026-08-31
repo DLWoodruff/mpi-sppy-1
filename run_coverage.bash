@@ -215,6 +215,9 @@ run_phase "test_checkpoint_cylinders (spawns mpiexec)" \
 run_phase "test_checkpoint_multirank (spawns mpiexec)" \
     coverage run --rcfile=.coveragerc -m pytest mpisppy/tests/test_checkpoint_multirank.py -v
 
+run_phase "test_checkpoint_profile (spawns mpiexec)" \
+    coverage run --rcfile=.coveragerc -m pytest mpisppy/tests/test_checkpoint_profile.py -v
+
 run_phase "test_iis_on_infeasible (serial)" \
     coverage run --rcfile=.coveragerc -m pytest mpisppy/tests/test_iis_on_infeasible.py -v
 
