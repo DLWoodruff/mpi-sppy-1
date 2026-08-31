@@ -24,13 +24,41 @@ class IntegerRelaxThenEnforce(mpisppy.extensions.extension.Extension):
         options = opt.options.get("integer_relax_then_enforce_options", {})
         # fraction of iterations or time to spend in relaxed mode
         self.ratio = options.get("ratio", 0.5)
+        # Whether the subproblems are relaxed right now. On a resumed run the
+        # models arrive relaxed or not according to what the study did before
+        # the stop, and restore_state puts this back in step with them.
+        self._integers_relaxed = False
 
 
     def pre_iter0(self):
+        if self.opt._resumed_from_checkpoint:
+            # The reloaded models already carry the study's relaxation state.
+            # Relaxing them again would undo an enforcement the study had
+            # already made, so the resumed run would solve relaxed
+            # subproblems where the uninterrupted run solved integral ones --
+            # and enforce a second time later, from a different iterate. The
+            # flag that says which state they are in is restored at the end of
+            # Iter0, which is after this hook by design.
+            return
         global_toc(f"{self.__class__.__name__}: relaxing integrality constraints", self.opt.cylinder_rank == 0)
         for s in self.opt.local_scenarios.values():
             self.integer_relaxer.apply_to(s) 
         self._integers_relaxed = True
+
+    def checkpoint_state(self):
+        """Whether the subproblems were relaxed when the checkpoint was taken.
+
+        The relaxation itself is a model transformation, so it rides in the
+        dill with the models. What no model carries is this object's record of
+        it, and a resumed run builds a fresh extension: one that believed the
+        integers were still relaxed would try to undo a relaxation that is not
+        there, and one that believed they were enforced would leave a relaxed
+        study relaxed for the rest of its life.
+        """
+        return {"integers_relaxed": self._integers_relaxed}
+
+    def restore_state(self, state):
+        self._integers_relaxed = state["integers_relaxed"]
 
     def _unrelax_integers(self):
         for sub in self.opt.local_scenarios.values():
