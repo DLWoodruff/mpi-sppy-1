@@ -1811,8 +1811,14 @@ class TestCheckpointHookPlacement(unittest.TestCase):
 class _SpokeStub:
     """Stands in for the spoke communicator the Checkpointer reads."""
 
-    def __init__(self, strata_rank=2, best_inner_bound=None):
+    def __init__(self, strata_rank=2, best_inner_bound=None,
+                 communicators=None):
         self.strata_rank = strata_rank
+        #: The cylinder list WheelSpinner hands every SPCommunicator, or None
+        #: for a stub driven outside a wheel -- which is then the only
+        #: cylinder of its class as far as the Checkpointer can tell.
+        if communicators is not None:
+            self.communicators = communicators
         self.best_inner_bound = best_inner_bound
         self.sent_bounds = []
         self.sent_xhats = 0
@@ -1884,7 +1890,7 @@ class TestSpokeIncumbentFile(unittest.TestCase):
         self.assertEqual(
             os.path.relpath(path, self.ckpt_dir),
             os.path.join("spokes",
-                         f"spoke_{self.CYLINDER}_strata_02_rank_0000.pkl"))
+                         f"spoke_{self.CYLINDER}_ordinal_02_rank_0000.pkl"))
 
     def test_nothing_written_before_an_incumbent_exists(self):
         opt = _xhat_eval(ckpt_dir=self.ckpt_dir)
@@ -1993,7 +1999,7 @@ class TestCheckpointerSpokeMode(unittest.TestCase):
         ext.maybe_checkpoint()
         path = os.path.join(
             self.ckpt_dir, "spokes",
-            "spoke__SpokeStub_strata_02_rank_0000.pkl")
+            "spoke__SpokeStub_ordinal_00_rank_0000.pkl")
         self.assertTrue(os.path.exists(path))
         first = os.stat(path).st_mtime_ns
 
@@ -2006,7 +2012,7 @@ class TestCheckpointerSpokeMode(unittest.TestCase):
         writer = _xhat_eval(ckpt_dir=self.ckpt_dir)
         _set_and_cache_solution(writer, 11.0)
         checkpointing.write_spoke_incumbent(
-            writer, self.ckpt_dir, "_SpokeStub", 2, best_inner_bound=11.0)
+            writer, self.ckpt_dir, "_SpokeStub", 0, best_inner_bound=11.0)
 
         # --resume-from with no --checkpoint-dir: the spoke still has to
         # restore, which is why the extension is attached for a read too.
@@ -2028,7 +2034,7 @@ class TestCheckpointerSpokeMode(unittest.TestCase):
         writer = _xhat_eval(ckpt_dir=self.ckpt_dir)
         _set_and_cache_solution(writer, 17.0)
         checkpointing.write_spoke_incumbent(
-            writer, self.ckpt_dir, "_SpokeStub", 2, best_inner_bound=17.0)
+            writer, self.ckpt_dir, "_SpokeStub", 0, best_inner_bound=17.0)
 
         opt = _xhat_eval(resume_from=self.ckpt_dir)
         ext, _ = self._attach(opt)
@@ -2046,7 +2052,7 @@ class TestCheckpointerSpokeMode(unittest.TestCase):
         writer = _xhat_eval(ckpt_dir=self.ckpt_dir)
         _set_and_cache_solution(writer, 13.0)
         checkpointing.write_spoke_incumbent(
-            writer, self.ckpt_dir, "_SpokeStub", 2, best_inner_bound=13.0)
+            writer, self.ckpt_dir, "_SpokeStub", 0, best_inner_bound=13.0)
 
         opt = _xhat_eval(resume_from=self.ckpt_dir)
         ext, spoke = self._attach(opt)
@@ -2299,6 +2305,136 @@ class TestCheckpointingWithoutAHub(unittest.TestCase):
         for mode in self.MODES:
             with self.subTest(mode=mode):
                 refuse_checkpointing_without_a_hub(self._cfg(), mode)
+
+
+class TestSpokeIdentitySurvivesADifferentCylinderSet(unittest.TestCase):
+    """Which cylinders run is on the list a resume may change, so a spoke's
+    file cannot be named by its position in the wheel.
+
+    NON_STRUCTURAL_CFG_KEYS carries lagrangian, xhatshuffle, fwph and the
+    rest deliberately: the hub's iterate does not depend on the spokes, so a
+    checkpoint stays valid across a different spoke set. But dropping a
+    cylinder renumbers every cylinder after it, and the spoke file used to be
+    named by that number. One spoke of a class then looked for a file that
+    was not there while its own sat beside it under the old number; two
+    spokes of one class was worse, because the shifted one found the *other*
+    one's file under its own new number and restored an incumbent that was
+    never its. Same class and same models, so the values are feasible and
+    nothing downstream notices.
+    """
+
+    class _Hub:
+        pass
+
+    class _Lagrangian:
+        pass
+
+    class _XhatShuffle:
+        pass
+
+    def _identity(self, classes, strata_rank):
+        """(ordinal, count) for the cylinder at strata_rank in this wheel."""
+        from mpisppy.extensions.checkpointer import Checkpointer
+        ext = Checkpointer.__new__(Checkpointer)
+        spoke = classes[strata_rank].__new__(classes[strata_rank])
+        spoke.strata_rank = strata_rank
+        spoke.communicators = [{"spcomm_class": c} for c in classes]
+        ext.opt = types.SimpleNamespace(spcomm=spoke)
+        return ext._class_ordinal_and_count()
+
+    def test_dropping_an_earlier_cylinder_does_not_move_the_ordinal(self):
+        """The reported failure: resume without --lagrangian and the xhat
+        spoke could not find the incumbent it had written."""
+        wrote = self._identity(
+            [self._Hub, self._Lagrangian, self._XhatShuffle], strata_rank=2)
+        resumed = self._identity(
+            [self._Hub, self._XhatShuffle], strata_rank=1)
+        self.assertEqual(wrote, resumed,
+                         msg="the spoke's file name moved because an "
+                             "unrelated cylinder was dropped")
+
+    def test_two_spokes_of_one_class_stay_apart(self):
+        classes = [self._Hub, self._XhatShuffle, self._XhatShuffle]
+        self.assertEqual(self._identity(classes, strata_rank=1), (0, 2))
+        self.assertEqual(self._identity(classes, strata_rank=2), (1, 2))
+
+    def test_they_stay_apart_when_an_unrelated_cylinder_goes(self):
+        """The cross-assignment: with the ordinal, neither of the two moves
+        onto the other's file."""
+        before = [self._Hub, self._Lagrangian,
+                  self._XhatShuffle, self._XhatShuffle]
+        after = [self._Hub, self._XhatShuffle, self._XhatShuffle]
+        self.assertEqual(self._identity(before, strata_rank=2),
+                         self._identity(after, strata_rank=1))
+        self.assertEqual(self._identity(before, strata_rank=3),
+                         self._identity(after, strata_rank=2))
+
+    def test_a_spoke_outside_a_wheel_is_the_only_one_of_its_class(self):
+        from mpisppy.extensions.checkpointer import Checkpointer
+        ext = Checkpointer.__new__(Checkpointer)
+        ext.opt = types.SimpleNamespace(spcomm=_SpokeStub(strata_rank=2))
+        self.assertEqual(ext._class_ordinal_and_count(), (0, 1))
+
+    def test_the_file_name_carries_the_ordinal_not_the_strata_rank(self):
+        self.assertEqual(
+            checkpointing._spoke_filename("XhatShuffleInnerBound", 1, 0),
+            "spoke_XhatShuffleInnerBound_ordinal_01_rank_0000.pkl")
+
+
+class TestDroppingOneOfTwoSameClassSpokesIsReported(unittest.TestCase):
+    """The one change the ordinal cannot absorb, so it is said out loud.
+
+    Removing one of two same-class spokes makes the survivor's ordinal the
+    removed one's, and it would read that spoke's file without a word. The
+    written file records how many cylinders of its class the wheel carried,
+    which is what makes the difference visible.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.ckpt_dir = os.path.join(self._tmp.name, "ckpt")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _write(self, class_count):
+        opt = _xhat_eval(ckpt_dir=self.ckpt_dir)
+        _set_and_cache_solution(opt, 4.0)
+        checkpointing.write_spoke_incumbent(
+            opt, self.ckpt_dir, "_SpokeStub", 0, best_inner_bound=4.0,
+            class_count=class_count)
+
+    def _resume_with(self, class_count, tocs):
+        from mpisppy.extensions import checkpointer as mod
+        opt = _xhat_eval(resume_from=self.ckpt_dir)
+        # SPBase.spcomm is a weakref, so the stub needs an owner that
+        # outlives this call or it is collected before the extension reads it.
+        self.spoke = _SpokeStub(strata_rank=1)
+        opt.spcomm = self.spoke
+        ext = Checkpointer(opt)
+        ext._class_ordinal_and_count = lambda: (0, class_count)
+        with mock.patch.object(mod, "global_toc",
+                               side_effect=lambda msg, *a, **k: tocs.append(msg)):
+            ext._restore_incumbent()
+        return opt
+
+    def test_a_changed_count_is_reported(self):
+        self._write(class_count=2)
+        tocs = []
+        opt = self._resume_with(1, tocs)
+        self.assertEqual(opt.best_solution_obj_val, 4.0)  # still restored
+        self.assertTrue(
+            any("may be restoring an incumbent that belonged to a different"
+                in m for m in tocs),
+            msg=f"the identity change was not reported: {tocs}")
+
+    def test_an_unchanged_count_says_nothing(self):
+        self._write(class_count=2)
+        tocs = []
+        self._resume_with(2, tocs)
+        self.assertFalse(
+            any("belonged to a different" in m for m in tocs),
+            msg=f"reported an identity change that did not happen: {tocs}")
 
 
 if __name__ == "__main__":
