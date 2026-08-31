@@ -64,28 +64,6 @@ class XhatInnerBoundBase(spoke.InnerBoundNonantSpoke):
 
         return xhatter
 
-    def maybe_checkpoint(self):
-        """Offer the extensions a checkpoint point, once per loop pass.
-
-        The xhatter main loops are not PH iterations and have no ``enditer``
-        to hang a write off, so they call this instead: it is the spoke's
-        half of the hook the hub fires at the end of every iteration, and it
-        is what lets one Checkpointer serve both. The extension decides
-        whether the pass is worth a write -- for a spoke that will mean "has
-        my incumbent improved since the last one" -- so a loop spinning while
-        it waits on the hub costs nothing but the call.
-
-        Call it at the *bottom* of a pass: what a spoke checkpoints is the
-        best xhat it has found, so the pass that finds one has to finish
-        before the write is worth making.
-
-        Nothing writes from here yet -- the Checkpointer still refuses to
-        attach to anything but a PH hub. See section 9, items 6 and 8 of
-        doc/designs/checkpointing_design.md.
-        """
-        if self.opt.extensions is not None:
-            self.opt.extobject.maybe_checkpoint()
-
     def _try_file_xhat(self):
         """Evaluate a file-supplied xhat once, before the main loop.
 

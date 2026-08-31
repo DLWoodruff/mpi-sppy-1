@@ -818,10 +818,14 @@ Touch-points an implementation needs beyond the PoC's extension/subclass hacks:
    — plus once on xhatshuffle's mid-pass kill-signal `return`, the one exit that
    skips it. That is what makes **one `Checkpointer` serve hub and xhatter
    uniformly** (restore already has a home: `pre_iter0`/`post_iter0` fire once
-   in `xhat_prep` in `xhatbase.py`). The other spokes have no checkpoint hook
-   yet: `slam_heuristic` is an inner-bound spoke that is not an xhatter, and the
-   lagrangian/lagranger loops call `enditer` per pass but nothing calls
-   `maybe_checkpoint` for them (§5.6 lists what they would carry).
+   in `xhat_prep` in `xhatbase.py`). Both hooks live on `InnerBoundNonantSpoke`
+   rather than on `XhatInnerBoundBase`, because `cfg_vanilla` attaches the
+   Checkpointer through `_Xhat_Eval_spoke_foundation`, which builds the
+   L-shaped xhatter and the two slammers as well as the four xhat spokes;
+   those three derive from the former and not the latter, and were handed an
+   extension that nothing ever called. The lagrangian/lagranger loops call
+   `enditer` per pass but nothing calls `maybe_checkpoint` for them (§5.6
+   lists what they would carry).
 9. **Most-recent iteration duration kept on `self`.** `iterk_loop` (`phbase.py`)
    times each iteration into a *local* `iteration_start_time`, used only by the
    `display_progress` print. `--checkpoint-before-seconds` needs that duration at
@@ -1067,8 +1071,10 @@ as a branch stacked on the 1a PR.
     Both resume bit-identically on the hub's primal state. The spoke reports
     what it restored, because comparing incumbents alone cannot distinguish a
     restored one from one the spoke re-found — farmer is deterministic.
-  - *Still to do.* Nothing checkpoints the non-xhat inner bounder
-    (`slam_heuristic`) or the outer-bound spokes.
+  - *Still to do.* Nothing checkpoints the outer-bound spokes. The non-xhat
+    inner bounders (`slam_heuristic`, `lshaped_bounder`) do: they get the
+    hooks from `InnerBoundNonantSpoke`, which is what every cylinder handed a
+    Checkpointer derives from.
 
   Tests (the §11.1 A/B harness on cylinders): farmer/`sizes`
   (hub+lagrangian+xhatshuffle) stop+resume — hub primal trajectory compared A
