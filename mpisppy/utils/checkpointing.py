@@ -208,17 +208,26 @@ def _model_filename(rank, sname):
     return f"hub_rank_{rank:04d}_scen_{sanitize_for_filename(sname)}.dill"
 
 
-def _spoke_filename(cylinder, strata_rank, rank):
+def _spoke_filename(cylinder, ordinal, rank):
     """One file per spoke per rank.
 
     The cylinder class name alone is not unique -- a wheel may carry two
-    spokes of the same class configured differently -- so the strata rank,
-    which is the cylinder's own index in the wheel, disambiguates them.
-    Without it the second spoke would silently overwrite the first's
-    incumbent and a resume would hand both the same solution.
+    spokes of the same class configured differently -- so a second number
+    disambiguates them. That number is the spoke's *ordinal among cylinders
+    of its own class*, not its strata rank.
+
+    The strata rank is the cylinder's index in the whole wheel, and which
+    cylinders run is on the list a resume may change (see
+    NON_STRUCTURAL_CFG_KEYS: lagrangian, xhatshuffle, fwph and the rest).
+    Dropping one renumbers every cylinder after it, so a spoke naming its
+    file by strata rank looks for a file that is not there while its own sits
+    beside it under the old number -- and, with two spokes of one class,
+    lands on the *other* one's file under its own new number and restores an
+    incumbent that is not its. The ordinal does not move when an unrelated
+    cylinder is added or removed.
     """
     return (f"spoke_{sanitize_for_filename(cylinder)}"
-            f"_strata_{int(strata_rank):02d}_rank_{int(rank):04d}.pkl")
+            f"_ordinal_{int(ordinal):02d}_rank_{int(rank):04d}.pkl")
 
 
 def _atomic_write_bytes(path, write_callback):
@@ -989,8 +998,8 @@ def load_checkpoint(opt, ckpt_dir):
 ###############################################################################
 
 
-def spoke_incumbent_state(opt, cylinder, strata_rank, best_inner_bound=None,
-                          loop_state=None):
+def spoke_incumbent_state(opt, cylinder, ordinal, best_inner_bound=None,
+                          loop_state=None, class_count=None):
     """The dict written by ``write_spoke_incumbent``, or None if there is
     nothing to write yet (no scenario has an incumbent cached)."""
     solutions = {}
@@ -1011,7 +1020,13 @@ def spoke_incumbent_state(opt, cylinder, strata_rank, best_inner_bound=None,
         "format_version": FORMAT_VERSION,
         "kind": "spoke-incumbent",
         "cylinder": str(cylinder),
-        "strata_rank": int(strata_rank),
+        "ordinal": int(ordinal),
+        # How many cylinders of this class the writing wheel carried. The
+        # ordinal only means the same thing while that is unchanged: drop one
+        # of two same-class spokes and the survivor's ordinal becomes the
+        # removed one's. Recorded so the resume can say so rather than adopt
+        # an incumbent that belonged to a different cylinder.
+        "class_count": None if class_count is None else int(class_count),
         "rank": int(opt.cylinder_rank),
         "geometry": geometry(opt),
         "structural_fingerprint": structural_fingerprint(opt.options),
@@ -1034,8 +1049,9 @@ def spoke_incumbent_state(opt, cylinder, strata_rank, best_inner_bound=None,
     }
 
 
-def write_spoke_incumbent(opt, ckpt_dir, cylinder, strata_rank,
-                          best_inner_bound=None, loop_state=None):
+def write_spoke_incumbent(opt, ckpt_dir, cylinder, ordinal,
+                          best_inner_bound=None, loop_state=None,
+                          class_count=None):
     """Write this spoke's best incumbent, latest-wins. Returns the path, or
     None when there is no incumbent to write.
 
@@ -1045,23 +1061,24 @@ def write_spoke_incumbent(opt, ckpt_dir, cylinder, strata_rank,
     be consistent with, so the rename *is* the commit point -- no manifest is
     involved.
     """
-    state = spoke_incumbent_state(opt, cylinder, strata_rank,
+    state = spoke_incumbent_state(opt, cylinder, ordinal,
                                   best_inner_bound=best_inner_bound,
-                                  loop_state=loop_state)
+                                  loop_state=loop_state,
+                                  class_count=class_count)
     if state is None:
         return None
     spokes_dir = os.path.join(ckpt_dir, SPOKES_SUBDIR)
     os.makedirs(spokes_dir, exist_ok=True)
     path = os.path.join(
         spokes_dir,
-        _spoke_filename(cylinder, strata_rank, opt.cylinder_rank),
+        _spoke_filename(cylinder, ordinal, opt.cylinder_rank),
     )
     _atomic_write_bytes(path, lambda f: pickle.dump(state, f))
     _fsync_dir(spokes_dir)
     return path
 
 
-def load_spoke_incumbent(opt, ckpt_dir, cylinder, strata_rank):
+def load_spoke_incumbent(opt, ckpt_dir, cylinder, ordinal):
     """Read this spoke's incumbent file, or None if it is not there.
 
     A missing file is not an error: the run being resumed may have stopped
@@ -1072,7 +1089,7 @@ def load_spoke_incumbent(opt, ckpt_dir, cylinder, strata_rank):
     """
     path = os.path.join(
         ckpt_dir, SPOKES_SUBDIR,
-        _spoke_filename(cylinder, strata_rank, opt.cylinder_rank),
+        _spoke_filename(cylinder, ordinal, opt.cylinder_rank),
     )
     if not os.path.exists(path):
         return None
@@ -1161,7 +1178,7 @@ def restore_spoke_incumbent(opt, state):
 # which is what a cylinder nobody synchronizes with needs.
 # ---------------------------------------------------------------------------
 
-def dual_spoke_state(opt, cylinder, strata_rank, generation):
+def dual_spoke_state(opt, cylinder, ordinal, generation, class_count=None):
     """The dict written by ``write_dual_spoke_state``.
 
     W is keyed by ``(ndn, i)`` and the values by variable name -- the two
@@ -1180,7 +1197,11 @@ def dual_spoke_state(opt, cylinder, strata_rank, generation):
         "format_version": FORMAT_VERSION,
         "kind": "dual-spoke-ph-state",
         "cylinder": str(cylinder),
-        "strata_rank": int(strata_rank),
+        "ordinal": int(ordinal),
+        # As for the incumbent file: the ordinal means the same thing only
+        # while the wheel carries the same number of cylinders of this
+        # class. Recorded so a resume can say when it does not.
+        "class_count": None if class_count is None else int(class_count),
         "rank": int(opt.cylinder_rank),
         # This cylinder's own iteration count, which is not the hub's: the
         # wheel does not march the cylinders in step and this is not an
@@ -1193,25 +1214,27 @@ def dual_spoke_state(opt, cylinder, strata_rank, generation):
     }
 
 
-def write_dual_spoke_state(opt, ckpt_dir, cylinder, strata_rank, generation):
+def write_dual_spoke_state(opt, ckpt_dir, cylinder, ordinal, generation,
+                           class_count=None):
     """Write this cylinder's PH state, latest-wins. Returns the path.
 
     Temp-then-rename like every other file here, so a kill mid-write leaves
     the previous iteration's state intact rather than a truncated file.
     """
-    state = dual_spoke_state(opt, cylinder, strata_rank, generation)
+    state = dual_spoke_state(opt, cylinder, ordinal, generation,
+                             class_count=class_count)
     spokes_dir = os.path.join(ckpt_dir, SPOKES_SUBDIR)
     os.makedirs(spokes_dir, exist_ok=True)
     path = os.path.join(
         spokes_dir,
-        _spoke_filename(cylinder, strata_rank, opt.cylinder_rank),
+        _spoke_filename(cylinder, ordinal, opt.cylinder_rank),
     )
     _atomic_write_bytes(path, lambda f: pickle.dump(state, f))
     _fsync_dir(spokes_dir)
     return path
 
 
-def load_dual_spoke_state(opt, ckpt_dir, cylinder, strata_rank):
+def load_dual_spoke_state(opt, ckpt_dir, cylinder, ordinal):
     """Read this cylinder's PH state, or None if it is not there.
 
     Missing is normal -- the run being resumed may not have reached this
@@ -1220,7 +1243,7 @@ def load_dual_spoke_state(opt, ckpt_dir, cylinder, strata_rank):
     """
     path = os.path.join(
         ckpt_dir, SPOKES_SUBDIR,
-        _spoke_filename(cylinder, strata_rank, opt.cylinder_rank),
+        _spoke_filename(cylinder, ordinal, opt.cylinder_rank),
     )
     if not os.path.exists(path):
         return None

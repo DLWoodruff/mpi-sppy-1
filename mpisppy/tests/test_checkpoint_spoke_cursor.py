@@ -234,7 +234,7 @@ class TestSpokeWritesWhenTheCursorMoves(unittest.TestCase):
     def _spoke_file(self):
         return os.path.join(
             self.ckpt_dir, "spokes",
-            "spoke__CursorSpokeStub_strata_02_rank_0000.pkl")
+            "spoke__CursorSpokeStub_ordinal_00_rank_0000.pkl")
 
     def test_a_pass_that_changes_nothing_writes_nothing(self):
         ext = self._checkpointer()

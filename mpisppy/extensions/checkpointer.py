@@ -323,14 +323,22 @@ class Checkpointer(Extension):
         resume_from = self.opt.options.get("resume_from", None)
         if not resume_from:
             return
-        cylinder, strata_rank = self._spoke_identity()
+        cylinder, ordinal = self._spoke_identity()
         rank0 = self.opt.cylinder_rank == 0
         state = ckpt.load_dual_spoke_state(self.opt, resume_from, cylinder,
-                                           strata_rank)
+                                           ordinal)
         if state is None:
             global_toc(f"No checkpointed dual weights for {cylinder} in "
                        f"{resume_from}; this cylinder starts from W=0", rank0)
             return
+        was = state.get("class_count")
+        now = self._class_ordinal_and_count()[1]
+        if was is not None and was != now:
+            global_toc(
+                f"WARNING: the checkpoint was written by a wheel carrying "
+                f"{was} {cylinder} cylinder(s) and this run has {now}, so "
+                f"this cylinder may be restoring dual weights that belonged "
+                f"to a different one.", rank0)
         ckpt.restore_dual_spoke_state(self.opt, state)
         self.restored_dual_generation = state["generation"]
         global_toc(f"Restored the checkpointed dual weights for {cylinder} "
@@ -349,10 +357,11 @@ class Checkpointer(Extension):
         if not self.write_enabled:
             return
         try:
-            cylinder, strata_rank = self._spoke_identity()
+            cylinder, ordinal = self._spoke_identity()
             ckpt.write_dual_spoke_state(
-                self.opt, self.ckpt_dir, cylinder, strata_rank,
-                generation=int(getattr(self.opt, "_PHIter", 0)))
+                self.opt, self.ckpt_dir, cylinder, ordinal,
+                generation=int(getattr(self.opt, "_PHIter", 0)),
+                class_count=self._class_ordinal_and_count()[1])
         except Exception as exc:
             global_toc(
                 f"WARNING: this cylinder could not write its dual weights "
@@ -361,7 +370,15 @@ class Checkpointer(Extension):
                 self.opt.cylinder_rank == 0)
 
     def _spoke_identity(self):
-        """(cylinder name, strata rank) -- what names this spoke's file."""
+        """(cylinder name, ordinal among cylinders of that class).
+
+        The ordinal names this spoke's file. Its strata rank would be the
+        obvious choice and is the wrong one: that is the cylinder's index in
+        the whole wheel, and which cylinders run is on the list a resume may
+        change, so dropping a lagrangian renumbers every cylinder after it.
+        Counting only cylinders of this spoke's own class gives a number that
+        an unrelated cylinder coming or going does not move.
+        """
         spoke = self.opt.spcomm
         if spoke is None:
             raise RuntimeError(
@@ -370,7 +387,24 @@ class Checkpointer(Extension):
                 "extension is attached by cfg_vanilla to cylinders run by "
                 "WheelSpinner."
             )
-        return type(spoke).__name__, getattr(spoke, "strata_rank", 0)
+        return type(spoke).__name__, self._class_ordinal_and_count()[0]
+
+    def _class_ordinal_and_count(self):
+        """(this spoke's ordinal among its own class, how many of that class).
+
+        Read from the cylinder list WheelSpinner hands every SPCommunicator.
+        A spoke built without one -- a test stub, or a spoke driven outside
+        the wheel -- is the only cylinder as far as it can tell, which is the
+        right answer for the single-spoke case and the only one available.
+        """
+        spoke = self.opt.spcomm
+        cylinder = type(spoke).__name__
+        communicators = getattr(spoke, "communicators", None)
+        strata_rank = getattr(spoke, "strata_rank", 0)
+        if not communicators:
+            return 0, 1
+        names = [d["spcomm_class"].__name__ for d in communicators]
+        return names[:strata_rank].count(cylinder), names.count(cylinder)
 
     def _restore_incumbent(self):
         """Load this spoke's checkpointed incumbent, if a resume asked for one.
@@ -382,14 +416,28 @@ class Checkpointer(Extension):
         resume_from = self.opt.options.get("resume_from", None)
         if not resume_from:
             return
-        cylinder, strata_rank = self._spoke_identity()
+        cylinder, ordinal = self._spoke_identity()
         rank0 = self.opt.cylinder_rank == 0
         state = ckpt.load_spoke_incumbent(self.opt, resume_from, cylinder,
-                                          strata_rank)
+                                          ordinal)
         if state is None:
             global_toc(f"No checkpointed incumbent for {cylinder} in "
                        f"{resume_from}; this spoke starts without one", rank0)
             return
+        # The ordinal is stable when an unrelated cylinder comes or goes, but
+        # not when one of two same-class spokes does: the survivor's ordinal
+        # becomes the removed one's, and it would read that spoke's file
+        # without a word. The values are feasible for the same model, so
+        # nothing downstream would notice.
+        was = state.get("class_count")
+        now = self._class_ordinal_and_count()[1]
+        if was is not None and was != now:
+            global_toc(
+                f"WARNING: the checkpoint was written by a wheel carrying "
+                f"{was} {cylinder} cylinder(s) and this run has {now}, so "
+                f"this spoke may be restoring an incumbent that belonged to a "
+                f"different one. It is a feasible solution for the same "
+                f"model either way.", rank0)
         obj = ckpt.restore_spoke_incumbent(self.opt, state)
         self.restored_incumbent_obj = obj
         self.opt.spcomm.best_inner_bound = state["best_inner_bound"]
@@ -662,11 +710,12 @@ class Checkpointer(Extension):
                 and progress == self._last_written_loop_progress):
             return
         try:
-            cylinder, strata_rank = self._spoke_identity()
+            cylinder, ordinal = self._spoke_identity()
             path = ckpt.write_spoke_incumbent(
-                self.opt, self.ckpt_dir, cylinder, strata_rank,
+                self.opt, self.ckpt_dir, cylinder, ordinal,
                 best_inner_bound=getattr(spoke, "best_inner_bound", None),
-                loop_state=loop_state)
+                loop_state=loop_state,
+                class_count=self._class_ordinal_and_count()[1])
         except Exception as exc:
             global_toc(
                 f"WARNING: this spoke could not write its incumbent "
