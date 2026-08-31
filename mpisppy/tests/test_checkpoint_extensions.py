@@ -452,6 +452,24 @@ class _IntegerRelaxMixin(_ABMixin):
         leaf = _read_leaf(self.ckpt_dir, generation)
         return leaf["extension_state"]["extensions"]["IntegerRelaxThenEnforce"]
 
+    def assert_objective_agrees(self, reference, _stopped, resumed):
+        """The comparison a MIP supports, in place of bit-identity.
+
+        These are the only classes in this file on a MIP rather than on
+        farmer: alternate optima mean a resumed run can land on a different
+        solution of equal value than the uninterrupted one found, which moves
+        the iterate without anything having gone wrong -- and which solver is
+        installed decides whether it does. The objective walking away is what
+        would mean something went wrong, so that is what is pinned, at the
+        tolerance `test_checkpoint_multirank.py` already uses for `sizes`.
+        """
+        want, got = reference.Eobjective(), resumed.Eobjective()
+        scale = max(1.0, abs(want))
+        self.assertLessEqual(
+            abs(want - got), 1e-3 * scale,
+            msg=f"the resumed run's expected objective is {got}, the "
+                f"uninterrupted run's is {want}")
+
     def _flag(self, ph):
         from mpisppy.extensions.integer_relax_then_enforce import (
             IntegerRelaxThenEnforce)
@@ -507,8 +525,7 @@ class TestIntegerRelaxThenEnforceEnforcedAtTheStop(_IntegerRelaxMixin,
             [set()] * (self.N - self.STOP))
 
     def test_resume_matches_the_uninterrupted_run(self):
-        reference, _, resumed = self.run_ab()
-        self.assert_bit_identical(reference, resumed)
+        self.assert_objective_agrees(*self.run_ab())
 
 
 @unittest.skipIf(not solver_available, "no solver is available")
@@ -544,8 +561,7 @@ class TestIntegerRelaxThenEnforceRelaxedAtTheStop(_IntegerRelaxMixin,
         self.assertTrue(self._flag(resumed))
 
     def test_resume_matches_the_uninterrupted_run(self):
-        reference, _, resumed = self.run_ab()
-        self.assert_bit_identical(reference, resumed)
+        self.assert_objective_agrees(*self.run_ab())
 
 
 def _read_leaf(ckpt_dir, generation):
