@@ -524,7 +524,10 @@ at startup when either ``--checkpoint-dir`` or ``--resume-from`` is given, as
 are an unwritable directory (checked from every rank -- on a cluster a path can
 be writable from some nodes and not others), an unimplemented backend, scenario
 names that would collide once made filename-safe, and any configuration where
-the checkpointing extension would not actually be attached. The intent is that
+the checkpointing extension would not actually be attached. ``--EF`` and the
+write-only modes (``--pickle-bundles-dir``, ``--pickle-scenarios-dir``,
+``--write-scenario-lp-mps-files-dir``) are refused for the same reason: none of
+them runs the iterative algorithm a checkpoint describes. The intent is that
 checkpointing either works or says so at startup, rather than running for hours
 and writing nothing.
 
@@ -557,6 +560,11 @@ Two things this does not cover:
 If you resume with a *different* set of extensions than the checkpoint was
 written with, that is allowed -- the hub's iterate is still valid -- and the run
 reports each piece of state it could not hand to anybody.
+
+**W and xbar input files are not read on a resumed run.** ``--init-W-fname``
+and ``--init-Xbar-fname`` initialize a study; a resumed run takes both from the
+checkpoint. Leaving the flags on the command you resubmit each morning is
+harmless -- they are skipped, with a line in the log saying so.
 
 **The order you attach extensions in does not affect what is checkpointed.**
 The write happens at a dedicated point in the iteration loop, after every
