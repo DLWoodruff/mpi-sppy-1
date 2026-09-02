@@ -233,11 +233,21 @@ def main():
                 json.dump(snapshot, f)
         with open(f"{out_path}.hubrank{wheel.cylinder_rank:04d}", "w") as f:
             json.dump(snapshot, f)
-    elif wheel.cylinder_rank == 0:
+    else:
         marker = _spoke_marker(wheel)
-        if marker is not None:
+        if marker is None:
+            return
+        # Rank 0's marker lands at the ".spoke<strata>" name the
+        # single-rank-per-cylinder harnesses read. The per-rank copies go
+        # under a different prefix on purpose: those harnesses collect
+        # everything named ".spoke*", and a second file per spoke would
+        # arrive there as a second spoke.
+        if wheel.cylinder_rank == 0:
             with open(f"{out_path}.spoke{wheel.strata_rank}", "w") as f:
                 json.dump(marker, f)
+        with open(f"{out_path}.cyl{wheel.strata_rank}"
+                  f"rank{wheel.cylinder_rank:04d}", "w") as f:
+            json.dump(marker, f)
 
 
 if __name__ == "__main__":

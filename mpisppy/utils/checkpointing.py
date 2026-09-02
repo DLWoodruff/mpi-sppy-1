@@ -339,6 +339,72 @@ def _first_failing_rank(comm, rank, failed):
     return None if int(worst[0]) == _NO_FAILURE else int(worst[0])
 
 
+def agree_spoke_restore(opt, state):
+    """Agree across a spoke's ranks on the parts of a restore that are shared.
+
+    Each rank of a multi-rank spoke reads its own incumbent file, because each
+    owns different scenarios. Two of the things in that file describe the
+    cylinder rather than the rank, though, and the files need not agree on
+    them: each rank writes at the bottom of its own pass, so a stop lands
+    between two of those writes, and a rank whose scenarios never produced an
+    incumbent writes no file at all.
+
+    The loop cursor is the expensive one. The xhatshuffle loop is collective:
+    every rank picks the same scenario and ``_try_one`` broadcasts its nonants
+    from the rank that owns it. Ranks resuming from different cursors pick
+    different scenarios, so the broadcast has a different root on each rank
+    and the objective the hub is handed blends several scenarios' solutions
+    instead of reporting any one of them. It arrives as an ordinary feasible
+    inner bound -- no error, no warning, exit 0.
+
+    The cached solution values are the exception: they stay rank-local,
+    because each rank owns different scenarios and there is nothing to
+    broadcast. What has to be agreed about them is whether they all came from
+    the same pass, since an xhat assembled out of two passes is not a solution
+    any run found. The objective of the cached solution answers that.
+
+    Returns ``(state, warning)``: rank 0's cursor and bound written into this
+    rank's own state, or ``(None, message)`` where the files do not describe
+    one incumbent -- some ranks having none, or the ranks disagreeing about
+    which one it is.
+
+    Collective. Every rank of the cylinder must call it, including the ranks
+    whose ``state`` is None.
+    """
+    comm = _cylinder_comm(opt)
+    if comm is None:
+        return state, None
+    have = comm.allreduce(1 if state is not None else 0, op=MPI.SUM)
+    if have == 0:
+        return None, None
+    if have < comm.Get_size():
+        return None, (
+            f"only {have} of {comm.Get_size()} ranks of this spoke have a "
+            f"checkpointed incumbent, so none of them restores one: an "
+            f"incumbent assembled from some ranks and not others is not a "
+            f"solution this study ever found")
+    # Every rank reads this number out of the same Eobjective reduction, so
+    # ranks holding one incumbent hold the identical double and an exact
+    # comparison is the right one. A difference means the files were written
+    # at different passes. Gathered rather than reduced so the warning can
+    # name the values that disagree, which is what a user needs to see.
+    objectives = comm.allgather(state.get("best_solution_obj_val"))
+    if len(set(objectives)) != 1:
+        return None, (
+            f"the ranks of this spoke checkpointed different incumbents "
+            f"(objectives {objectives}), so none of them restores one: the "
+            f"files were written at different passes, and half of one xhat "
+            f"beside half of another is not a solution this study ever found")
+    # Rank 0's, on every rank. Which rank is arbitrary -- what matters is
+    # that they stop differing -- so it is the one every other agreement
+    # here already uses.
+    loop_state, best_inner_bound = comm.bcast(
+        (state.get("loop_state"), state.get("best_inner_bound")), root=0)
+    state["loop_state"] = loop_state
+    state["best_inner_bound"] = best_inner_bound
+    return state, None
+
+
 def require_dill(backend):
     if backend == DILL_RELOAD_BACKEND and not dill_available:
         raise RuntimeError(

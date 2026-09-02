@@ -420,6 +420,14 @@ class Checkpointer(Extension):
         rank0 = self.opt.cylinder_rank == 0
         state = ckpt.load_spoke_incumbent(self.opt, resume_from, cylinder,
                                           ordinal)
+        # Collective, and reached whether or not this rank found a file: the
+        # cursor and the bound in there belong to the cylinder, not to a
+        # rank, and ranks that resume from different cursors go on to
+        # broadcast from different roots. See agree_spoke_restore.
+        state, disagreement = ckpt.agree_spoke_restore(self.opt, state)
+        if disagreement is not None:
+            global_toc(f"WARNING: {disagreement}", rank0)
+            return
         if state is None:
             global_toc(f"No checkpointed incumbent for {cylinder} in "
                        f"{resume_from}; this spoke starts without one", rank0)

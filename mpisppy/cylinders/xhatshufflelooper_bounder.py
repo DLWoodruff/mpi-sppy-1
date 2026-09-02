@@ -236,7 +236,16 @@ class XhatShuffleInnerBound(_PreLoopXhatMixin, XhatInnerBoundBase):
         return warnings
 
     def _restore_loop_state_if_resuming(self):
-        """Ask the Checkpointer for a restored cursor, if this is a resume."""
+        """Ask the Checkpointer for a restored cursor, if this is a resume.
+
+        The ranks of a multi-rank spoke walk this cursor together, so they
+        have to adopt the same one. They do, and not by luck: the Checkpointer
+        agreed the cursor across them when it read the files
+        (``checkpointing.agree_spoke_restore``), and everything below is a
+        function of that cursor and of the scenario order, which is drawn from
+        one seed and so is identical on every rank. Do not make this a
+        rank-local decision again.
+        """
         state = self._checkpointed_loop_state()
         if state is None:
             return

@@ -41,6 +41,7 @@ wrapper is where a resume has the most to get wrong.
 
 import json
 import os
+import pickle
 import shutil
 import subprocess
 import sys
@@ -104,6 +105,20 @@ def _hub_ranks(out_path):
             with open(os.path.join(directory, fname)) as f:
                 snapshots.append(json.load(f))
     return sorted(snapshots, key=lambda s: s["cylinder_rank"])
+
+
+def _spoke_ranks(out_path, cylinder):
+    """Every rank's marker for one spoke cylinder, ordered by rank."""
+    directory = os.path.dirname(out_path)
+    prefix = f"{os.path.basename(out_path)}.cyl"
+    markers = []
+    for fname in sorted(os.listdir(directory)):
+        if fname.startswith(prefix):
+            with open(os.path.join(directory, fname)) as f:
+                marker = json.load(f)
+            if marker["cylinder"] == cylinder:
+                markers.append(marker)
+    return markers
 
 
 def _published_generation(ckpt_dir):
@@ -809,3 +824,138 @@ class TestDeadlineOnOneRankDoesNotHangTheOthers(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipIf(not solver_available, "no solver is available")
+@unittest.skipIf(not mpiexec_available, "mpiexec is not available")
+class TestMultiRankSpokeCursorAgreement(unittest.TestCase):
+    """A multi-rank xhat spoke resumes onto one cursor, not one per rank.
+
+    The ranks of an xhatshuffle spoke explore together: they pick the same
+    scenario and ``_try_one`` broadcasts its nonants from the rank that owns
+    it. Each rank writes its own checkpoint file at the bottom of its own
+    pass, though, so a stop can land between two of those writes and leave
+    files whose cursors disagree -- and a rank that never found an incumbent
+    writes no file at all. Resuming each rank onto whatever its own file says
+    makes the ranks pick different scenarios and broadcast from different
+    roots, and the objective that reaches the hub is then a blend of several
+    scenarios' solutions, reported as an ordinary feasible inner bound with
+    no error and no warning.
+
+    Both tests manufacture the disagreement by editing what the stopped leg
+    wrote. Racing the two ranks' writes would produce it only sometimes,
+    which is no way to guard against it.
+    """
+
+    NP = 6
+    MODULE = _FARMER
+    MODEL_ARGS = ("--num-scens", "6", "--default-rho", "1")
+    SPOKE_ARGS = ("--lagrangian", "--xhatshuffle")
+    STOP = 2
+    RESUME_FOR = 2
+    SPOKE = "XhatShuffleInnerBound"
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.ckpt_dir = os.path.join(self._tmp.name, "ckpt")
+        _run_leg(self._tmp.name, "B1", self.NP, self.MODULE, self.MODEL_ARGS,
+                 self.SPOKE_ARGS,
+                 ("--max-iterations", str(self.STOP),
+                  "--checkpoint-dir", self.ckpt_dir))
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _spoke_files(self):
+        """This spoke's checkpoint files, one per rank, ordered by rank."""
+        spokes_dir = os.path.join(self.ckpt_dir, "spokes")
+        names = sorted(f for f in os.listdir(spokes_dir)
+                       if f.startswith(f"spoke_{self.SPOKE}"))
+        self.assertGreater(
+            len(names), 1,
+            msg=f"expected one file per spoke rank, got {names}")
+        return [os.path.join(spokes_dir, n) for n in names]
+
+    def _resume(self):
+        result, out_path = _run_leg(
+            self._tmp.name, "B2", self.NP, self.MODULE, self.MODEL_ARGS,
+            self.SPOKE_ARGS,
+            ("--max-iterations", str(self.RESUME_FOR),
+             "--resume-from", self.ckpt_dir))
+        return result, _spoke_ranks(out_path, self.SPOKE)
+
+    def test_the_ranks_adopt_one_cursor(self):
+        paths = self._spoke_files()
+        with open(paths[-1], "rb") as f:
+            state = pickle.load(f)
+        self.assertIsNotNone(
+            state["loop_state"],
+            msg="the stopped leg checkpointed no cursor, so this test would "
+                "pass without exercising anything")
+        # Wind the last rank's file back a pass: what a stop that landed
+        # between the two ranks' writes leaves behind.
+        state["loop_state"]["xh_iter"] = int(state["loop_state"]["xh_iter"]) - 1
+        cursor = state["loop_state"]["cursor"]
+        cursor["cycle_idx"] = max(0, int(cursor["cycle_idx"]) - 1)
+        with open(paths[-1], "wb") as f:
+            pickle.dump(state, f)
+
+        _, markers = self._resume()
+        self.assertGreater(len(markers), 1,
+                           msg=f"expected a marker per spoke rank: {markers}")
+        adopted = [m["applied_loop_state"] for m in markers]
+        for marker in markers:
+            self.assertIsNotNone(
+                marker["applied_loop_state"],
+                msg="a spoke rank adopted no cursor at all")
+        distinct = {json.dumps(a, sort_keys=True) for a in adopted}
+        self.assertEqual(
+            len(distinct), 1,
+            msg=f"the spoke's ranks resumed onto {len(distinct)} different "
+                f"cursors: {adopted}")
+
+    def test_ranks_holding_different_incumbents_stop_the_whole_restore(self):
+        """Half of one xhat beside half of another is not a solution.
+
+        The cached values cannot be agreed by broadcast -- each rank owns
+        different scenarios -- so what is agreed is whether they all came
+        from the same pass. The objective of the cached solution says so:
+        every rank reads it out of the same reduction.
+        """
+        paths = self._spoke_files()
+        with open(paths[-1], "rb") as f:
+            state = pickle.load(f)
+        self.assertIsNotNone(
+            state["best_solution_obj_val"],
+            msg="the stopped leg checkpointed no incumbent, so this test "
+                "would pass without exercising anything")
+        # An incumbent from a different pass: what a stop landing between the
+        # two ranks' writes leaves when one of them has just improved.
+        state["best_solution_obj_val"] = \
+            float(state["best_solution_obj_val"]) - 1.0
+        with open(paths[-1], "wb") as f:
+            pickle.dump(state, f)
+
+        result, markers = self._resume()
+        for marker in markers:
+            self.assertIsNone(
+                marker["restored_incumbent_obj"],
+                msg="a spoke rank restored values from a pass that another "
+                    "rank of the same spoke did not checkpoint")
+        self.assertIn("checkpointed different incumbents", result.stdout,
+                      msg="the run declined to restore without saying so")
+
+    def test_a_rank_without_a_file_stops_the_whole_restore(self):
+        """Half an incumbent is not a solution the study ever found."""
+        paths = self._spoke_files()
+        os.remove(paths[-1])
+
+        result, markers = self._resume()
+        for marker in markers:
+            self.assertIsNone(
+                marker["restored_incumbent_obj"],
+                msg="a spoke rank restored an incumbent although another "
+                    "rank of the same spoke had no file to restore from")
+        self.assertIn("ranks of this spoke have a checkpointed incumbent",
+                      result.stdout,
+                      msg="the run declined to restore without saying so")
