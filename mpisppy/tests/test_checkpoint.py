@@ -1845,6 +1845,56 @@ class TestSpokeIncumbentFile(unittest.TestCase):
         self.assertFalse(os.path.exists(
             os.path.join(self.ckpt_dir, "spokes")))
 
+    def test_the_file_carries_the_incumbents_own_objective(self):
+        """Not the objective of whatever this spoke solved most recently.
+
+        ``inner_bound`` moves on every solve while the cached values move
+        only on an improvement, so a file that reads it live pairs this
+        incumbent's variable values with a later solve's objective -- and
+        the resumed spoke republishes that pair to the hub, where the
+        trailing per-scenario objective in BEST_XHAT is what grad rho reads.
+        """
+        opt = _xhat_eval(ckpt_dir=self.ckpt_dir)
+        _set_and_cache_solution(opt, 10.0)
+        incumbent = {sname: s._mpisppy_data.inner_bound
+                     for sname, s in opt.local_scenarios.items()}
+
+        # A later solve that does not improve on the incumbent: nothing else
+        # in the file moves, so this is the whole difference.
+        for offset, s in enumerate(opt.local_scenarios.values()):
+            s._mpisppy_data.inner_bound = 9999.0 + offset
+
+        state = checkpointing.spoke_incumbent_state(opt, self.CYLINDER, 2)
+        for sname, entry in state["solutions"].items():
+            self.assertEqual(
+                entry["inner_bound"], incumbent[sname],
+                msg=f"{sname}: the file carries the objective of a solve "
+                    "that came after the incumbent it stores")
+
+    def test_the_restored_objective_is_the_one_the_spoke_republishes(self):
+        """send_best_xhat reads the live attribute, and a resumed spoke
+        publishes before it has solved anything of its own."""
+        opt = _xhat_eval(ckpt_dir=self.ckpt_dir)
+        _set_and_cache_solution(opt, 10.0)
+        incumbent = {sname: s._mpisppy_data.inner_bound
+                     for sname, s in opt.local_scenarios.items()}
+        # Same later solve as above, so this test also fails if the write
+        # goes back to reading the live attribute.
+        for offset, s in enumerate(opt.local_scenarios.values()):
+            s._mpisppy_data.inner_bound = 9999.0 + offset
+        path = checkpointing.write_spoke_incumbent(
+            opt, self.ckpt_dir, self.CYLINDER, 2, best_inner_bound=-42.0)
+        self.assertIsNotNone(path)
+
+        fresh = _xhat_eval(resume_from=self.ckpt_dir)
+        state = checkpointing.load_spoke_incumbent(
+            fresh, self.ckpt_dir, self.CYLINDER, 2)
+        checkpointing.restore_spoke_incumbent(fresh, state)
+        for sname, s in fresh.local_scenarios.items():
+            self.assertEqual(s._mpisppy_data.inner_bound, incumbent[sname])
+            self.assertEqual(s._mpisppy_data.best_solution_inner_bound,
+                             incumbent[sname])
+
     def test_restores_every_variable_onto_fresh_models(self):
         """The load-bearing test: a *different* set of models, built by the
         scenario_creator exactly as a resumed spoke builds them, ends up
