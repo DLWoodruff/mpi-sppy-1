@@ -80,7 +80,9 @@ import sys
 import tempfile
 import unittest
 
-from mpisppy.tests.utils import get_solver
+import pyomo.environ as pyo
+
+from mpisppy.tests.utils import get_solver, solver_takes_model_size
 
 solver_available, solver_name, persistent_available, persistent_solver_name = \
     get_solver()
@@ -94,10 +96,34 @@ _UC = "mpisppy.tests.examples.uc.uc_funcs"
 
 mpiexec_available = shutil.which("mpiexec") is not None
 egret_available = importlib.util.find_spec("egret") is not None
-#: The uc case below is minutes rather than seconds. It runs by default,
-#: including in CI, because a case that never runs covers nothing; set this to
-#: skip it while working on the fast ones.
+#: The uc case below is minutes rather than seconds. It runs by default
+#: wherever the solver can take it, because a case that never runs covers
+#: nothing; set this to skip it while working on the fast ones.
 skip_slow = os.environ.get("MPISPPY_SKIP_SLOW_TESTS", "") not in ("", "0")
+
+
+def _skip_unless_the_solver_takes_a_uc_scenario():
+    """Skip where the available solver is a size-limited build.
+
+    A uc scenario is tens of thousands of rows and columns, which is past
+    what the community editions of cplex, gurobi and xpress accept -- and
+    those are what CI installs, so this case runs on a developer's or a
+    cluster's solver rather than on GitHub's. The size is read off the
+    scenario rather than written down here, and the probe that asks the
+    solver about it is a trivial LP of that size, so the two together cost
+    about four seconds.
+    """
+    from mpisppy.tests.examples.uc import uc_funcs
+    scenario = uc_funcs.scenario_creator("Scenario1")
+    num_vars = sum(1 for _ in scenario.component_data_objects(pyo.Var,
+                                                             active=True))
+    num_cons = sum(1 for _ in scenario.component_data_objects(pyo.Constraint,
+                                                             active=True))
+    if not solver_takes_model_size(solver_name, num_vars, num_cons):
+        raise unittest.SkipTest(
+            f"{solver_name} did not solve a model the size of a uc scenario "
+            f"({num_vars} variables, {num_cons} constraints)")
+
 
 #: The user's profile, minus the solver-specific and early-exit options named
 #: in the module docstring. Four cylinders: the primal hub plus lagrangian,
@@ -431,6 +457,11 @@ class TestUCProfileResumeAB(_ProfileABMixin, unittest.TestCase):
     N = 4
     STOP = 2
     OBJECTIVE_RTOL = None
+
+    @classmethod
+    def setUpClass(cls):
+        _skip_unless_the_solver_takes_a_uc_scenario()
+        super().setUpClass()
 
 
 if __name__ == "__main__":

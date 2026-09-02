@@ -213,7 +213,8 @@ jobs:
 
       # Same shape, on a user's whole option profile rather than one
       # mechanism. The uc case takes about a minute per leg; it is skipped
-      # where egret is missing.
+      # where egret is missing, and here, because the solvers pip installs
+      # are community editions that refuse a model that size.
       - name: Test checkpoint/resume on a production option profile
         run: |
           coverage run $COV_ARGS -m pytest mpisppy/tests/test_checkpoint_profile.py -v

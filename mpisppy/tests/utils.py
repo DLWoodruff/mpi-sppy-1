@@ -50,3 +50,35 @@ def get_solver(persistent_OK=True):
 
 def round_pos_sig(x, sig=1):
     return round(x, sig-int(floor(log10(abs(x))))-1)
+
+
+def solver_takes_model_size(solver_name, num_vars, num_cons):
+    """Can `solver_name` solve a model with this many variables and constraints?
+
+    The pip-installed community editions of cplex, gurobi and xpress -- which
+    is what CI has -- cap model size, and they report the cap as a license
+    error partway through a solve rather than up front, so the only way to
+    ask is to hand one over. The probe is a trivial bounded LP of the
+    requested size; it says nothing about difficulty, only about size.
+
+    A solver that is not installed at all also answers False, so check
+    availability first where the two answers differ.
+    """
+    model = pyo.ConcreteModel()
+    model.varset = pyo.RangeSet(num_vars)
+    model.x = pyo.Var(model.varset, bounds=(0, 1))
+    model.conset = pyo.RangeSet(num_cons)
+    model.c = pyo.Constraint(
+        model.conset, rule=lambda m, j: m.x[(j - 1) % num_vars + 1] <= 1)
+    model.obj = pyo.Objective(expr=sum(model.x[i] for i in model.varset))
+    try:
+        solver = pyo.SolverFactory(solver_name)
+        if sputils.is_persistent(solver):
+            # The legacy persistent interface refuses solve(model).
+            solver.set_instance(model)
+            solver.solve()
+        else:
+            solver.solve(model)
+    except Exception:
+        return False
+    return True
