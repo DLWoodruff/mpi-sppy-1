@@ -905,6 +905,26 @@ Touch-points an implementation needs beyond the PoC's extension/subclass hacks:
    to hang at the first write barrier, turning a clear refusal into a silent
    stall.
 
+   *And so is every other refusal on the setup and restore paths.* The probe
+   was fixed on its own, and then the same defect was found and fixed at the
+   spoke's load, and then at the dual cylinder's — three rounds, each moving
+   it rather than removing it, with the tests green in between. The rule is
+   therefore a property of the paths and not of any call on them: **every
+   local step of setting a checkpoint up or restoring one runs inside
+   `checkpointing.run_agreed`**, which calls it on every rank of the cylinder,
+   exchanges whether it raised, and raises on all of them or on none, naming
+   how many could not do it and what each said. Steps swept: the setup
+   refusals in `Checkpointer.__init__` (dill, filename collisions, the
+   directory write probe), the hub's splice (`PHBase._splice_checkpoint`), an
+   xhat spoke's incumbent load and restore, extension state on the hub and on
+   a spoke, and a dual cylinder's W load and restore. Anything added to these
+   paths belongs inside it, and `TestEveryCheckpointStepOnThosePathsIsAgreed`
+   fails when something is written beside it instead;
+   `TestNoRankLocalRaiseOnTheCheckpointPaths` fails one step inside each
+   agreement on one rank and requires the job to end with the agreement's
+   message. An extension's `restore_state` must therefore not be collective:
+   it runs inside one of these agreements.
+
    The *spoke* incumbent write stays uncoordinated (item 6). Each rank writes
    only its own file, and the incumbent objective that gates the write comes
    from an all-reduced objective evaluation, so the ranks are already in step
