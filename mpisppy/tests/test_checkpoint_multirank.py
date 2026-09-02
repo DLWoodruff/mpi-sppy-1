@@ -821,6 +821,8 @@ class TestEveryCheckpointStepOnThosePathsIsAgreed(unittest.TestCase):
         ("Checkpointer._restore_incumbent", Checkpointer._restore_incumbent),
         ("PHBase._restore_from_checkpoint_if_resuming",
          PHBase._restore_from_checkpoint_if_resuming),
+        ("PHBase._restore_extension_state_if_resuming",
+         PHBase._restore_extension_state_if_resuming),
     )
 
     #: Checkpointing calls that agree across the cylinder themselves, so they
@@ -828,6 +830,13 @@ class TestEveryCheckpointStepOnThosePathsIsAgreed(unittest.TestCase):
     AGREE_THEMSELVES = frozenset({
         "run_agreed",
         "probe_model_is_dillable",
+    })
+
+    #: And calls that need no agreement because there is nothing in them for
+    #: one rank to fail at: they read what is already in memory and return an
+    #: answer. Nothing that touches a file or a model belongs here.
+    CANNOT_FAIL_ON_ONE_RANK = frozenset({
+        "converger_state_is_carried",
     })
 
     #: Doing any of these inline is doing a rank's own work: the write probe
@@ -883,15 +892,19 @@ class TestEveryCheckpointStepOnThosePathsIsAgreed(unittest.TestCase):
         for name, func in self.PATHS:
             wrapped, bare = self._agreed_and_bare(func)
             for _, called in self._checkpointing_calls(func):
-                if called in self.AGREE_THEMSELVES or called in wrapped:
+                if (called in self.AGREE_THEMSELVES
+                        or called in self.CANNOT_FAIL_ON_ONE_RANK
+                        or called in wrapped):
                     continue
                 with self.subTest(path=name, step=called):
                     self.fail(
                         f"{name} calls checkpointing.{called} outside "
-                        f"run_agreed. If it cannot fail on one rank alone, "
-                        f"say so by adding it to AGREE_THEMSELVES; otherwise "
-                        f"the rank it fails on leaves the rest of the "
-                        f"cylinder waiting in the next collective.")
+                        f"run_agreed. If it agrees across the ranks itself, "
+                        f"or reads nothing a single rank can fail at, say so "
+                        f"by naming it in AGREE_THEMSELVES or "
+                        f"CANNOT_FAIL_ON_ONE_RANK; otherwise the rank it "
+                        f"fails on leaves the rest of the cylinder waiting "
+                        f"in the next collective.")
 
     def test_no_path_does_a_rank_s_own_file_handling_inline(self):
         for name, func in self.PATHS:

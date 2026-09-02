@@ -1275,7 +1275,16 @@ class PHBase(mpisppy.spopt.SPOpt):
             return
         state = self._checkpoint_leaf_state.get("extension_state")
         rank0 = self.cylinder_rank == 0
-        for message in checkpointing.restore_extension_state(self, state):
+        # Agreed, like every other step of a restore: an extension puts its
+        # state back on the models *this* rank owns, so one that cannot is a
+        # refusal one rank makes alone -- and the iteration waiting after this
+        # is collective. An extension's restore_state must therefore not be
+        # collective itself; the hook says so.
+        messages = checkpointing.run_agreed(
+            self, lambda: checkpointing.restore_extension_state(self, state),
+            "hand their extensions the checkpointed state, so none of them "
+            "resumes")
+        for message in messages:
             global_toc(f"WARNING: {message}", rank0)
         if not checkpointing.converger_state_is_carried(self, state):
             global_toc(
