@@ -162,11 +162,12 @@ class WTracker():
         first = min(self.local_Ws)
         if -1 not in self.local_Ws:
             self.local_Ws[-1] = self.local_Ws[first]
-        # A resumed run has no W history from before the iteration it resumed
-        # at, so its first passes have nothing to difference against and
-        # report the zero difference an uninterrupted run reports at its own
-        # first iterations. A checkpoint does not carry a rho updater's
-        # history; doc/src/checkpointing.rst says so.
+        # A rho updater that carries its tracker across a checkpoint
+        # (Dyn_Rho_extension_base.checkpoint_state) restores the two entries
+        # read here. One that does not resumes with no W history from before
+        # the iteration it resumed at, so its first passes have nothing to
+        # difference against and report the zero difference an uninterrupted
+        # run reports at its own first iterations.
         curr_Ws = self.local_Ws.get(cI, self.local_Ws[first])
         prev_Ws = self.local_Ws.get(cI - 1, curr_Ws)
         global_diff = np.zeros(1)

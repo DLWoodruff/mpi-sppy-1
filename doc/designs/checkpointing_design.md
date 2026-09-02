@@ -1152,7 +1152,8 @@ as a branch stacked on the 1a PR.
   of dropping it silently. `MultiExtension` is flattened away as the container it
   is. Implemented for `NormRhoUpdater`, `MultRhoUpdater`, `Dyn_Rho_extension_base`
   (so `sep_rho`/`sensi_rho`/`grad_rho` at once), `fixer`, `slammer`,
-  `integer_relax_then_enforce` and `primal_dual_converger`;
+  `integer_relax_then_enforce`, `wtracker_extension` (the last `wlen + 1` W
+  sets, which its end-of-run report reads) and `primal_dual_converger`;
   `norm_rho_converger` and `fracintsnotconv` recompute everything each
   iteration and correctly have none.
 
