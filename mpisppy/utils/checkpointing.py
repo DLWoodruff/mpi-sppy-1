@@ -388,6 +388,51 @@ def agree_one_write(opt, state, key):
     return "agreed", values[0]
 
 
+def load_agreed(opt, load):
+    """Run a per-rank load, and agree on whether it worked before acting.
+
+    The loaders raise for a file that is present and does not match this
+    run, and that check is inherently per-rank: it compares the file against
+    the scenarios *this* rank owns, and looks for a file named after this
+    rank. Resume with a different rank count and some ranks raise while
+    others do not -- the added rank simply finds no file. The ranks that did
+    not raise then walk into the agreement collective that follows and wait
+    for ranks that have already gone.
+
+    So agree first. Every rank raises or none does, and the message names
+    how many ranks could not read theirs and what they said, which is the
+    diagnosis a rank-local raise loses: it aborts the job holding one rank's
+    traceback while the collective's own explanation never runs.
+
+    Anything the load raises is reported, not only ``CheckpointMismatch``:
+    an unreadable file or a short read strands the other ranks in exactly
+    the same way. The type is kept in the message.
+    """
+    try:
+        state, failure = load(), None
+    except Exception as exc:
+        state, failure = None, f"{type(exc).__name__}: {exc}"
+    comm = _cylinder_comm(opt)
+    if comm is None:
+        if failure is not None:
+            raise CheckpointMismatch(failure)
+        return state
+    failures = comm.allgather(failure)
+    by_message = {}
+    for rank, message in enumerate(failures):
+        if message is not None:
+            by_message.setdefault(message, []).append(rank)
+    if by_message:
+        detail = "; ".join(
+            f"{len(ranks)} rank(s), lowest {min(ranks)}: {message}"
+            for message, ranks in by_message.items())
+        raise CheckpointMismatch(
+            f"{sum(len(r) for r in by_message.values())} of "
+            f"{comm.Get_size()} ranks of this cylinder could not read their "
+            f"checkpoint, so none of them uses one. {detail}")
+    return state
+
+
 def agree_spoke_restore(opt, state):
     """Agree across an xhat spoke's ranks on the parts of a restore that are
     the cylinder's rather than a rank's.

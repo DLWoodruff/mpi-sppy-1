@@ -325,8 +325,11 @@ class Checkpointer(Extension):
             return
         cylinder, ordinal = self._spoke_identity()
         rank0 = self.opt.cylinder_rank == 0
-        state = ckpt.load_dual_spoke_state(self.opt, resume_from, cylinder,
-                                           ordinal)
+        # Collective, for the reason given at the xhat spoke's load.
+        state = ckpt.load_agreed(
+            self.opt,
+            lambda: ckpt.load_dual_spoke_state(self.opt, resume_from,
+                                               cylinder, ordinal))
         # Collective, and reached whether or not this rank found a file: W is
         # per rank, but the iteration it belongs to is the cylinder's, and
         # ranks restoring different iterations blend them in Compute_Xbar.
@@ -427,8 +430,13 @@ class Checkpointer(Extension):
             return
         cylinder, ordinal = self._spoke_identity()
         rank0 = self.opt.cylinder_rank == 0
-        state = ckpt.load_spoke_incumbent(self.opt, resume_from, cylinder,
-                                          ordinal)
+        # Collective: the load refuses per rank -- it checks the file
+        # against the scenarios this rank owns -- and the agreement below is
+        # collective, so a rank-local refusal would strand the others there.
+        state = ckpt.load_agreed(
+            self.opt,
+            lambda: ckpt.load_spoke_incumbent(self.opt, resume_from,
+                                              cylinder, ordinal))
         # Collective, and reached whether or not this rank found a file: the
         # cursor and the bound in there belong to the cylinder, not to a
         # rank, and ranks that resume from different cursors go on to

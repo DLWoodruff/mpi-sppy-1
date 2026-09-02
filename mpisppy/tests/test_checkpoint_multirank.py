@@ -941,6 +941,38 @@ class TestMultiRankSpokeCursorAgreement(unittest.TestCase):
         self.assertIn("checkpointed different incumbents", result.stdout,
                       msg="the run declined to restore without saying so")
 
+    def test_a_file_that_does_not_match_stops_every_rank(self):
+        """A load that refuses on some ranks and not others.
+
+        The refusal is per rank -- the file is named after the rank and
+        checked against the scenarios that rank owns -- and the agreement
+        that follows is collective, so a rank-local raise leaves the others
+        waiting for a rank that has gone. The plainest way in is a resume
+        with a different rank count; this manufactures the same split
+        directly, which does not depend on how ranks divide scenarios.
+        """
+        paths = self._spoke_files()
+        os.remove(paths[0])
+        with open(paths[-1], "rb") as f:
+            state = pickle.load(f)
+        state["format_version"] = 0
+        with open(paths[-1], "wb") as f:
+            pickle.dump(state, f)
+
+        result, _ = _run_leg(
+            self._tmp.name, "B2", self.NP, self.MODULE, self.MODEL_ARGS,
+            self.SPOKE_ARGS,
+            ("--max-iterations", str(self.RESUME_FOR),
+             "--resume-from", self.ckpt_dir),
+            check=False)
+        self.assertNotEqual(result.returncode, 0,
+                            msg="a checkpoint that does not match this run "
+                                "was accepted")
+        self.assertIn(
+            "could not read their checkpoint", result.stdout + result.stderr,
+            msg="the run died on one rank's traceback without the agreement "
+                "saying how many ranks could not read theirs")
+
     def test_a_rank_without_a_file_stops_the_whole_restore(self):
         """Half an incumbent is not a solution the study ever found."""
         paths = self._spoke_files()
