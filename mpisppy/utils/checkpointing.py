@@ -360,8 +360,10 @@ def run_agreed(opt, work, what):
     scenarios this rank owns, or writes from the node this rank is on. So
     each of them can fail on one rank and succeed on the others -- and the
     step after it is collective. A rank that raised on its own has left the
-    others waiting at a collective it will never reach, and the job stops
-    without stopping: no traceback, no exit, just the wall-clock limit.
+    others waiting at a collective it will never reach, and neither way that
+    ends is the one wanted: ``python -m mpi4py`` aborts the whole job holding
+    that one rank's traceback, and a plain ``python`` launch leaves it sitting
+    in the collective until its wall-clock limit with nothing in the log.
 
     So agree first. ``work`` is called on every rank, the ranks exchange
     whether it raised, and either all of them raise or none does. The message
