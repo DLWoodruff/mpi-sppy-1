@@ -25,10 +25,6 @@ class Wtracker_extension(mpisppy.extensions.extension.Extension):
                 that are scenario names and values that are ranks
     """
 
-    #: Nothing to carry across a resume. The history it reports on lives
-    #: in the WTracker it holds, which is rebuilt from the models; nothing
-    #: here decides what it does next.
-    checkpoint_stateless = True
     def __init__(self, opt, comm=None):
         super().__init__(opt)
         self.cylinder_rank = self.opt.cylinder_rank
@@ -49,6 +45,30 @@ class Wtracker_extension(mpisppy.extensions.extension.Extension):
 
     def enditer(self):
         self.wtracker.grab_local_Ws()
+
+    def checkpoint_state(self):
+        """The W sets the end-of-run report reads.
+
+        `report_by_moving_stats` reads `local_Ws` at the last `wlen + 1`
+        iterations (`compute_moving_stats` goes from `li - wlen` through
+        `li`). A resumed run holds only the sets it grabbed itself, so its
+        report reaches back past the stop whenever the resumed leg is shorter
+        than the window -- and then died with a KeyError out of
+        `post_everything`, after every solve had been paid for.
+
+        Carry the last `wlen + 1` sets, not the whole history, which grows by
+        scenarios times nonants of floats per iteration.
+        """
+        local_Ws = self.wtracker.local_Ws
+        if not local_Ws:
+            return None
+        keep = sorted(local_Ws)[-(self.wlen + 1):]
+        return {"local_Ws": {k: local_Ws[k] for k in keep},
+                "ph_iter": self.wtracker.ph_iter}
+
+    def restore_state(self, state):
+        self.wtracker.local_Ws.update(state["local_Ws"])
+        self.wtracker.ph_iter = state["ph_iter"]
 
     def post_everything(self):
         reportlen = self.options.get("reportlen")

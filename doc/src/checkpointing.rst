@@ -544,7 +544,8 @@ and writing nothing.
 **Extension and converger state is part of a checkpoint.** Extensions that
 accumulate their own state across iterations carry it across a stop: the rho
 updaters (``--norm-rho``, ``--mult-rho``, ``--sep-rho``, ``--sensi-rho``,
-``--grad-rho``), ``fixer``, ``slammer``, and the primal-dual converger. So a
+``--grad-rho``), ``fixer``, ``slammer``, the W tracker (``--wtracker``), and
+the primal-dual converger. So a
 resumed run using one of them follows the same trajectory an uninterrupted run
 would, rather than merely continuing correctly from the right models.
 

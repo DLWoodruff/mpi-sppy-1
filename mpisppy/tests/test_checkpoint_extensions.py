@@ -310,6 +310,69 @@ class TestSepRhoResume(_ABMixin, unittest.TestCase):
 
 
 @unittest.skipIf(not solver_available, "no solver is available")
+class TestWtrackerResume(_ABMixin, unittest.TestCase):
+    """The W tracker reports moving statistics over the last ``wlen``
+    iterations when the run ends. A resumed run holds only the W sets it
+    grabbed itself, so a window wider than the resumed leg reached back past
+    the stop and the run died with a KeyError in ``post_everything`` -- after
+    every solve had been paid for. The extension now carries the window's
+    worth of W sets, and the resumed run's reports match the uninterrupted
+    run's.
+    """
+
+    N = 5
+    STOP = 3
+    #: Wider than the resumed leg (two iterations), so the report reads
+    #: iterations the resumed run never saw.
+    WLEN = 3
+
+    def ext_classes(self):
+        from mpisppy.extensions.wtracker_extension import Wtracker_extension
+        return [Wtracker_extension]
+
+    def setUp(self):
+        super().setUp()
+        self._legs = 0
+
+    def _ph(self, max_iters, **ckpt_kwargs):
+        # The report files are named for the iteration they close at, which
+        # is the same for the reference and the resumed leg; a prefix per leg
+        # keeps them apart.
+        self._legs += 1
+        prefix = os.path.join(self._tmp.name, f"leg{self._legs}")
+        options = _options(max_iters, **ckpt_kwargs)
+        options["wtracker_options"] = {"wlen": self.WLEN,
+                                       "file_prefix": prefix}
+        return _make_ph(options, self.ext_classes())
+
+    def _report(self, leg, kind, ph):
+        path = os.path.join(self._tmp.name,
+                            f"leg{leg}_{kind}_iter{self.N}_rank{ph.global_rank}.csv")
+        with open(path) as f:
+            return f.read()
+
+    def test_the_window_reaches_back_past_the_stop(self):
+        self.assertGreater(self.WLEN + 1, self.N - self.STOP,
+                           msg="the window must be wider than the resumed "
+                               "leg for this test to say anything")
+        reference, _, resumed = self.run_ab()
+        for kind in ("stdev", "cv"):
+            self.assertEqual(self._report(3, kind, resumed),
+                             self._report(1, kind, reference),
+                             msg=f"the resumed run's {kind} report differs "
+                                 f"from the uninterrupted run's")
+
+    def test_the_windows_worth_is_carried_and_no_more(self):
+        from mpisppy.extensions.wtracker_extension import Wtracker_extension
+        _, stopped, resumed = self.run_ab()
+        state = _extension(stopped, Wtracker_extension).checkpoint_state()
+        self.assertEqual(sorted(state["local_Ws"]),
+                         list(range(1, self.STOP + 1))[-(self.WLEN + 1):])
+        carried = _extension(resumed, Wtracker_extension).wtracker.local_Ws
+        self.assertEqual(sorted(carried), list(range(1, self.N + 1)))
+
+
+@unittest.skipIf(not solver_available, "no solver is available")
 class TestFixerResume(_ABMixin, unittest.TestCase):
     """The fixer's per-variable countdowns, on a MIP that actually fixes.
 
