@@ -78,7 +78,9 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
+from unittest import mock
 
 import pyomo.environ as pyo
 
@@ -110,8 +112,14 @@ def _skip_unless_the_solver_takes_a_uc_scenario():
     those are what CI installs, so this case runs on a developer's or a
     cluster's solver rather than on GitHub's. The size is read off the
     scenario rather than written down here, and the probe that asks the
-    solver about it is a trivial LP of that size, so the two together cost
-    about four seconds.
+    solver about it is a trivial LP of that size: about 6.6 seconds together
+    on a fast machine with a full licence (2.0 s to build the scenario, 2.1 s
+    for the probe, the rest importing egret), against the minutes a leg takes.
+
+    The skip says what the solver actually did. Being refused for size and
+    being unable to solve at all are both reasons this case cannot run, and
+    an expired licence reported as "the model is too big" would send whoever
+    reads it looking in the wrong place.
     """
     from mpisppy.tests.examples.uc import uc_funcs
     scenario = uc_funcs.scenario_creator("Scenario1")
@@ -119,10 +127,11 @@ def _skip_unless_the_solver_takes_a_uc_scenario():
                                                              active=True))
     num_cons = sum(1 for _ in scenario.component_data_objects(pyo.Constraint,
                                                              active=True))
-    if not solver_takes_model_size(solver_name, num_vars, num_cons):
+    solved, why = solver_takes_model_size(solver_name, num_vars, num_cons)
+    if not solved:
         raise unittest.SkipTest(
-            f"{solver_name} did not solve a model the size of a uc scenario "
-            f"({num_vars} variables, {num_cons} constraints)")
+            f"a uc scenario is {num_vars} variables and {num_cons} "
+            f"constraints, and {why}")
 
 
 #: The user's profile, minus the solver-specific and early-exit options named
@@ -462,6 +471,75 @@ class TestUCProfileResumeAB(_ProfileABMixin, unittest.TestCase):
     def setUpClass(cls):
         _skip_unless_the_solver_takes_a_uc_scenario()
         super().setUpClass()
+
+
+class TestSolverSizeProbe(unittest.TestCase):
+    """The probe that decides whether the uc case can run at all.
+
+    Its whole job is to tell "this solver will not take a model this big"
+    from "this solver worked". Getting that wrong in the permissive
+    direction puts the uc legs back in front of a solver that cannot run
+    them, which is the CI failure the guard exists to remove; getting it
+    wrong in the other direction silently turns off the only uc coverage
+    there is.
+    """
+
+    SIZE = (10, 10)
+
+    class _Results:
+        def __init__(self, condition):
+            self.solver = types.SimpleNamespace(
+                termination_condition=condition)
+
+    class _Solver:
+        """A non-persistent solver interface that returns without solving."""
+        def __init__(self, results=None, raises=None):
+            self._results = results
+            self._raises = raises
+            self.options = {}
+
+        def solve(self, model, **kwargs):
+            if self._raises is not None:
+                raise self._raises
+            return self._results
+
+    def _probe_with(self, solver):
+        with mock.patch("pyomo.environ.SolverFactory",
+                        return_value=solver):
+            return solver_takes_model_size("stand-in", *self.SIZE)
+
+    def test_a_refusal_reported_through_the_results_is_not_a_solve(self):
+        # Some solvers raise on a refusal and some report it in the results
+        # object -- xpress is recorded doing the latter. A probe that asked
+        # only whether solve() raised would call this a success.
+        solved, why = self._probe_with(
+            self._Solver(results=self._Results("maxTimeLimit")))
+        self.assertFalse(solved)
+        self.assertIn("maxTimeLimit", why)
+
+    def test_an_optimal_solve_is_a_solve(self):
+        solved, why = self._probe_with(
+            self._Solver(results=self._Results("optimal")))
+        self.assertTrue(solved)
+        self.assertIsNone(why)
+
+    def test_a_raised_error_is_reported_in_the_solvers_own_words(self):
+        solved, why = self._probe_with(
+            self._Solver(raises=RuntimeError("size limits exceeded")))
+        self.assertFalse(solved)
+        self.assertIn("size limits exceeded", why)
+        self.assertIn("RuntimeError", why)
+
+    @unittest.skipIf(not solver_available, "no solver is available")
+    def test_the_available_solver_solves_a_small_model(self):
+        """Whatever the interface, a real solver answers yes to a tiny LP.
+
+        Without this the three above could all pass while the probe was
+        broken for every real solver -- the persistent interfaces need
+        set_instance, and their results object is shaped differently.
+        """
+        solved, why = solver_takes_model_size(solver_name, *self.SIZE)
+        self.assertTrue(solved, msg=why)
 
 
 if __name__ == "__main__":
