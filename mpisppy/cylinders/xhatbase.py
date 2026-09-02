@@ -80,13 +80,25 @@ class XhatInnerBoundBase(spoke.InnerBoundNonantSpoke):
         if ext is None:
             return
         candidates = list(getattr(ext, "extdict", {}).values()) + [ext]
+        state = None
         for candidate in candidates:
             state = getattr(candidate, "restored_extension_state", None)
-            if state is None:
-                continue
-            for message in ckpt.restore_extension_state(self.opt, state):
-                global_toc(f"WARNING: {message}", self.cylinder_rank == 0)
-            return
+            if state is not None:
+                break
+        # Agreed, and reached whether or not this rank has state to hand
+        # over: an extension puts its state back on the models this rank
+        # owns, so one that cannot is a refusal one rank makes alone, and
+        # the spoke's loop that follows is collective. What there is to
+        # restore was agreed when the file was read (agree_spoke_restore),
+        # so the ranks arrive here with the same answer.
+        messages = ckpt.run_agreed(
+            self.opt,
+            lambda: [] if state is None
+            else ckpt.restore_extension_state(self.opt, state),
+            "hand their extensions the checkpointed state, so none of them "
+            "resumes")
+        for message in messages:
+            global_toc(f"WARNING: {message}", self.cylinder_rank == 0)
 
     def _checkpointed_loop_state(self):
         """The loop state a resume read for this spoke, or None.

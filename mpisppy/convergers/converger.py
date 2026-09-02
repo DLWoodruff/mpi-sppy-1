@@ -69,5 +69,8 @@ class Converger:
             Called once at the end of Iter0, after the converger has been
             constructed. Matched by class name, so a run resumed with a
             different converger is never handed the old one's state.
+
+            Not collective, for the reason Extension.restore_state gives:
+            the restore runs inside an agreement across the cylinder's ranks.
         '''
         pass

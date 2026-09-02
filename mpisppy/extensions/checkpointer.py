@@ -246,14 +246,30 @@ class Checkpointer(Extension):
         #: incumbent -- most cursor moves do not improve on the best xhat.
         self._last_written_loop_progress = None
 
-        if not self.spoke_mode and not self.dual_spoke_mode \
-                and self.write_enabled:
-            ckpt.require_dill(self.backend)
-
         if not self.write_enabled:
             # Nothing below is about reading, and a restore-only run must not
             # inherit refusals that only protect a write.
             return
+
+        # Everything the setup refusals below look at is per rank -- which
+        # scenarios this rank owns, what this rank's node can write, whether
+        # dill imports here -- so each of them can refuse on one rank and
+        # pass on the others. The run's next collective would then be waiting
+        # for a rank that has already raised, and a refusal meant to arrive
+        # in the first second of the run becomes a job that hangs until its
+        # wall-clock limit instead. Every rank raises or none does.
+        ckpt.run_agreed(opt, self._refuse_a_run_that_cannot_checkpoint,
+                        "be set up to checkpoint, so the run is refused")
+
+    def _refuse_a_run_that_cannot_checkpoint(self):
+        """The setup refusals that are this rank's own to make.
+
+        Local by nature and agreed by the caller; see
+        ``checkpointing.run_agreed``.
+        """
+        opt = self.opt
+        if not self.spoke_mode and not self.dual_spoke_mode:
+            ckpt.require_dill(self.backend)
 
         # Two scenario names that sanitize to the same file name would
         # silently overwrite each other's model files; refuse now rather than
@@ -261,35 +277,7 @@ class Checkpointer(Extension):
         # carry the rank, so only names sharing a rank can collide.
         ckpt.check_filename_collisions(opt.local_scenarios)
 
-        # Create and probe the directory now. Discovering only at write time
-        # that the path is unwritable would mean the run never checkpoints.
-        # Every rank probes, because on a cluster the checkpoint directory can
-        # be unwritable from some nodes and not others, and that is exactly
-        # the failure worth catching before a multi-hour run rather than at
-        # its first write.
-        #
-        # The probe file is named for the *global* rank, not the cylinder
-        # rank. Several cylinders write into one directory and each of them
-        # numbers its own ranks from zero, so a cylinder-rank name has one
-        # copy per cylinder: whichever probes second removes the file the
-        # first is still using, and that one fails with a FileNotFoundError
-        # naming a directory that is perfectly writable. Global ranks are
-        # unique across the job, which is the scope this needs.
-        try:
-            os.makedirs(self.ckpt_dir, exist_ok=True)
-            probe = os.path.join(
-                self.ckpt_dir,
-                f".mpisppy_write_probe_"
-                f"{int(getattr(opt, 'global_rank', opt.cylinder_rank)):04d}")
-            with open(probe, "w"):
-                pass
-            os.remove(probe)
-        except OSError as exc:
-            raise RuntimeError(
-                f"Cannot write to the checkpoint directory "
-                f"'{self.ckpt_dir}' from rank {opt.cylinder_rank} "
-                f"({type(exc).__name__}: {exc})."
-            ) from exc
+        ckpt.probe_directory_is_writable(opt, self.ckpt_dir)
 
     def pre_iter0(self):
         if self.dual_spoke_mode:
@@ -326,10 +314,12 @@ class Checkpointer(Extension):
         cylinder, ordinal = self._spoke_identity()
         rank0 = self.opt.cylinder_rank == 0
         # Collective, for the reason given at the xhat spoke's load.
-        state = ckpt.load_agreed(
+        state = ckpt.run_agreed(
             self.opt,
             lambda: ckpt.load_dual_spoke_state(self.opt, resume_from,
-                                               cylinder, ordinal))
+                                               cylinder, ordinal),
+            "read their checkpointed dual weights, so none of them restores "
+            "any")
         # Collective, and reached whether or not this rank found a file: W is
         # per rank, but the iteration it belongs to is the cylinder's, and
         # ranks restoring different iterations blend them in Compute_Xbar.
@@ -351,7 +341,16 @@ class Checkpointer(Extension):
                 f"{was} {cylinder} cylinder(s) and this run has {now}, so "
                 f"this cylinder may be restoring dual weights that belonged "
                 f"to a different one.", rank0)
-        ckpt.restore_dual_spoke_state(self.opt, state)
+        # Agreed like the load: putting W back resolves the file's entries
+        # against the nonants of this rank's own models, so it is a refusal
+        # one rank can make while the others walk into Compute_Xbar's
+        # allreduce. The agreement above has already settled that every rank
+        # has a state, so all of them reach this.
+        ckpt.run_agreed(
+            self.opt,
+            lambda: ckpt.restore_dual_spoke_state(self.opt, state),
+            "put their checkpointed dual weights back on their models, so "
+            "none of them restores any")
         self.restored_dual_generation = state["generation"]
         global_toc(f"Restored the checkpointed dual weights for {cylinder} "
                    f"(written at its iteration {state['generation']})", rank0)
@@ -430,13 +429,15 @@ class Checkpointer(Extension):
             return
         cylinder, ordinal = self._spoke_identity()
         rank0 = self.opt.cylinder_rank == 0
-        # Collective: the load refuses per rank -- it checks the file
-        # against the scenarios this rank owns -- and the agreement below is
-        # collective, so a rank-local refusal would strand the others there.
-        state = ckpt.load_agreed(
+        # Collective: the load refuses per rank -- it reads the file named
+        # after this rank and checks it against the scenarios this rank owns
+        # -- and everything after it is collective, so a rank-local refusal
+        # would strand the others there. Every rank refuses or none does.
+        state = ckpt.run_agreed(
             self.opt,
             lambda: ckpt.load_spoke_incumbent(self.opt, resume_from,
-                                              cylinder, ordinal))
+                                              cylinder, ordinal),
+            "read their checkpointed incumbent, so none of them restores one")
         # Collective, and reached whether or not this rank found a file: the
         # cursor and the bound in there belong to the cylinder, not to a
         # rank, and ranks that resume from different cursors go on to
@@ -445,25 +446,37 @@ class Checkpointer(Extension):
         if disagreement is not None:
             global_toc(f"WARNING: {disagreement}", rank0)
             return
+        if state is not None:
+            # The ordinal is stable when an unrelated cylinder comes or goes,
+            # but not when one of two same-class spokes does: the survivor's
+            # ordinal becomes the removed one's, and it would read that
+            # spoke's file without a word. The values are feasible for the
+            # same model, so nothing downstream would notice.
+            was = state.get("class_count")
+            now = self._class_ordinal_and_count()[1]
+            if was is not None and was != now:
+                global_toc(
+                    f"WARNING: the checkpoint was written by a wheel carrying "
+                    f"{was} {cylinder} cylinder(s) and this run has {now}, so "
+                    f"this spoke may be restoring an incumbent that belonged "
+                    f"to a different one. It is a feasible solution for the "
+                    f"same model either way.", rank0)
+        # Agreed too: putting the values back is per rank -- it resolves the
+        # file's variable names against this rank's own models -- so it is a
+        # refusal one rank can make alone, and the ranks that did restore
+        # would carry on into the loop without it. The agreement above has
+        # already settled whether there is a state to restore, so every rank
+        # reaches this with the same answer.
+        obj = ckpt.run_agreed(
+            self.opt,
+            lambda: None if state is None
+            else ckpt.restore_spoke_incumbent(self.opt, state),
+            "put their checkpointed incumbent back on their models, so none "
+            "of them restores one")
         if state is None:
             global_toc(f"No checkpointed incumbent for {cylinder} in "
                        f"{resume_from}; this spoke starts without one", rank0)
             return
-        # The ordinal is stable when an unrelated cylinder comes or goes, but
-        # not when one of two same-class spokes does: the survivor's ordinal
-        # becomes the removed one's, and it would read that spoke's file
-        # without a word. The values are feasible for the same model, so
-        # nothing downstream would notice.
-        was = state.get("class_count")
-        now = self._class_ordinal_and_count()[1]
-        if was is not None and was != now:
-            global_toc(
-                f"WARNING: the checkpoint was written by a wheel carrying "
-                f"{was} {cylinder} cylinder(s) and this run has {now}, so "
-                f"this spoke may be restoring an incumbent that belonged to a "
-                f"different one. It is a feasible solution for the same "
-                f"model either way.", rank0)
-        obj = ckpt.restore_spoke_incumbent(self.opt, state)
         self.restored_incumbent_obj = obj
         self.opt.spcomm.best_inner_bound = state["best_inner_bound"]
         # Held rather than applied: the spoke's loop -- and the cursor this

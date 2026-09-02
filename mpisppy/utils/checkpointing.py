@@ -294,6 +294,15 @@ def _fsync_dir(path):
 #   manifest's promise -- that it names a *complete* checkpoint -- true across
 #   ranks and not just within one.
 #
+# * **A refusal is agreed on too.** Setting a checkpoint up and restoring one
+#   are per-rank work throughout -- this rank's scenario names, this rank's
+#   node, the file named after this rank -- so every refusal on those paths is
+#   one a single rank can make while the others walk on into the next
+#   collective. ``run_agreed`` runs each such step on every rank and raises on
+#   all of them or on none, which is what turns a rank-local refusal into an
+#   error message. Anything added to those paths belongs inside it;
+#   ``test_checkpoint_multirank.py`` checks that nothing sits beside it.
+#
 # The write *trigger* needs no such agreement. It is a pure function of the
 # absolute iteration number and the iteration limit (see
 # ``Checkpointer._should_write``), both of which are identical on every rank of
@@ -388,49 +397,62 @@ def agree_one_write(opt, state, key):
     return "agreed", values[0]
 
 
-def load_agreed(opt, load):
-    """Run a per-rank load, and agree on whether it worked before acting.
+def run_agreed(opt, work, what):
+    """Run one local step of checkpoint setup or restore, and agree on it.
 
-    The loaders raise for a file that is present and does not match this
-    run, and that check is inherently per-rank: it compares the file against
-    the scenarios *this* rank owns, and looks for a file named after this
-    rank. Resume with a different rank count and some ranks raise while
-    others do not -- the added rank simply finds no file. The ranks that did
-    not raise then walk into the agreement collective that follows and wait
-    for ranks that have already gone.
+    Every step of setting a checkpoint up and of restoring one is inherently
+    per rank: it reads a file named after this rank, checks it against the
+    scenarios this rank owns, or writes from the node this rank is on. So
+    each of them can fail on one rank and succeed on the others -- and the
+    step after it is collective. A rank that raised on its own has left the
+    others waiting at a collective it will never reach, and the job stops
+    without stopping: no traceback, no exit, just the wall-clock limit.
 
-    So agree first. Every rank raises or none does, and the message names
-    how many ranks could not read theirs and what they said, which is the
-    diagnosis a rank-local raise loses: it aborts the job holding one rank's
-    traceback while the collective's own explanation never runs.
+    So agree first. ``work`` is called on every rank, the ranks exchange
+    whether it raised, and either all of them raise or none does. The message
+    names how many ranks failed and what each of them said, which is the
+    diagnosis a rank-local raise loses -- it aborts the job holding one
+    rank's traceback while the collective's own explanation never runs -- and
+    the raise on a rank that did fail chains its own exception underneath.
 
-    Anything the load raises is reported, not only ``CheckpointMismatch``:
-    an unreadable file or a short read strands the other ranks in exactly
-    the same way. The type is kept in the message.
+    Anything ``work`` raises is reported, not only ``CheckpointMismatch``: an
+    unreadable file, a full disk or a short read strand the other ranks in
+    exactly the same way. The type is kept in the message.
+
+    ``what`` completes the sentence "N of M ranks of this cylinder could
+    not ...", so it reads as a verb phrase and says what follows from the
+    failure ("read their checkpoint, so none of them uses one").
+
+    Returns whatever ``work`` returns. Collective: every rank of the cylinder
+    must call it, and none of them may skip it on a condition the other ranks
+    do not share.
     """
     try:
-        state, failure = load(), None
+        result, failure = work(), None
     except Exception as exc:
-        state, failure = None, f"{type(exc).__name__}: {exc}"
+        result, failure = None, exc
     comm = _cylinder_comm(opt)
     if comm is None:
         if failure is not None:
-            raise CheckpointMismatch(failure)
-        return state
-    failures = comm.allgather(failure)
+            # One rank, so there is nobody to agree with and nothing to add:
+            # the caller's own exception, with its own type and traceback.
+            raise failure
+        return result
+    failures = comm.allgather(
+        None if failure is None else f"{type(failure).__name__}: {failure}")
     by_message = {}
     for rank, message in enumerate(failures):
         if message is not None:
             by_message.setdefault(message, []).append(rank)
-    if by_message:
-        detail = "; ".join(
-            f"{len(ranks)} rank(s), lowest {min(ranks)}: {message}"
-            for message, ranks in by_message.items())
-        raise CheckpointMismatch(
-            f"{sum(len(r) for r in by_message.values())} of "
-            f"{comm.Get_size()} ranks of this cylinder could not read their "
-            f"checkpoint, so none of them uses one. {detail}")
-    return state
+    if not by_message:
+        return result
+    detail = "; ".join(
+        f"{len(ranks)} rank(s), lowest {min(ranks)}: {message}"
+        for message, ranks in by_message.items())
+    raise CheckpointMismatch(
+        f"{sum(len(r) for r in by_message.values())} of {comm.Get_size()} "
+        f"ranks of this cylinder could not {what}. {detail}"
+    ) from failure
 
 
 def agree_spoke_restore(opt, state):
@@ -526,6 +548,41 @@ def require_dill(backend):
 
 
 
+
+def probe_directory_is_writable(opt, ckpt_dir):
+    """Create the checkpoint directory and prove this rank can write in it.
+
+    Called once at setup. Discovering only at write time that the path is
+    unwritable would mean the run never checkpoints. Every rank probes,
+    because on a cluster the checkpoint directory can be unwritable from some
+    nodes and not others, and that is exactly the failure worth catching
+    before a multi-hour run rather than at its first write.
+
+    Per rank, and so a step the caller has to agree on: see
+    :func:`run_agreed`.
+
+    The probe file is named for the *global* rank, not the cylinder rank.
+    Several cylinders write into one directory and each of them numbers its
+    own ranks from zero, so a cylinder-rank name has one copy per cylinder:
+    whichever probes second removes the file the first is still using, and
+    that one fails with a FileNotFoundError naming a directory that is
+    perfectly writable. Global ranks are unique across the job, which is the
+    scope this needs.
+    """
+    try:
+        os.makedirs(ckpt_dir, exist_ok=True)
+        probe = os.path.join(
+            ckpt_dir,
+            f".mpisppy_write_probe_"
+            f"{int(getattr(opt, 'global_rank', opt.cylinder_rank)):04d}")
+        with open(probe, "w"):
+            pass
+        os.remove(probe)
+    except OSError as exc:
+        raise RuntimeError(
+            f"Cannot write to the checkpoint directory '{ckpt_dir}' from "
+            f"rank {opt.cylinder_rank} ({type(exc).__name__}: {exc})."
+        ) from exc
 
 def probe_model_is_dillable(opt):
     """Serialize every local scenario to memory to prove checkpointing works.

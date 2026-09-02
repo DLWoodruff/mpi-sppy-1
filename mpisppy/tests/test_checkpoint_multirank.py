@@ -39,6 +39,8 @@ scenarios spread evenly and unevenly, proper bundles (section 8.1), the
 wrapper is where a resume has the most to get wrong.
 """
 
+import ast
+import inspect
 import json
 import os
 import pickle
@@ -46,8 +48,13 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import textwrap
 import unittest
 
+import mpisppy.tests.multirank_agreement_driver as agreement_driver
+from mpisppy.cylinders.xhatbase import XhatInnerBoundBase
+from mpisppy.extensions.checkpointer import Checkpointer
+from mpisppy.phbase import PHBase
 from mpisppy.tests.utils import get_solver
 
 solver_available, solver_name, persistent_available, persistent_solver_name = \
@@ -57,6 +64,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 _DRIVER = os.path.join(_HERE, "cylinders_ab_driver.py")
 _FAILURE_DRIVER = os.path.join(_HERE, "multirank_failure_driver.py")
 _DEADLINE_DRIVER = os.path.join(_HERE, "multirank_deadline_driver.py")
+_AGREEMENT_DRIVER = os.path.join(_HERE, "multirank_agreement_driver.py")
 #: generic_cylinders resolves --module-name with importlib, so these are dotted
 #: names rather than paths -- which also makes the legs independent of the
 #: directory mpiexec starts in.
@@ -1093,6 +1101,279 @@ class TestMultiRankDualWeightAgreement(unittest.TestCase):
                       result.stdout,
                       msg="the run declined to restore without saying so")
 
+
+@unittest.skipIf(not solver_available, "no solver is available")
+@unittest.skipIf(not mpiexec_available, "mpiexec is not available")
+class TestNoRankLocalRaiseOnTheCheckpointPaths(unittest.TestCase):
+    """A failure in setting a checkpoint up or restoring one ends the job.
+
+    Every step of both paths is per rank by nature: it reads the file named
+    after this rank, checks it against the scenarios this rank owns, or writes
+    from the node this rank is on. So each of them can fail on one rank and
+    pass on the others -- and what follows is collective. A rank that raises
+    on its own leaves the rest of its cylinder waiting in that collective for
+    a rank that has already gone. How that ends is up to the launcher and
+    neither ending is the one wanted: under ``python -m mpi4py`` the whole
+    job is aborted holding one rank's traceback, taking down the cylinders
+    that were mid-write with it, and under a plain ``python`` launch the job
+    sits in the collective until its wall-clock limit with nothing in the log.
+
+    Written as a sweep rather than as one case per bug on purpose. Each of
+    these paths has had this defect, and fixing the instance a review happened
+    to reach moved it rather than removed it, three rounds running; the
+    property is that *no* step on them raises alone, so the test asks it of
+    every agreement on them. ``multirank_agreement_driver.STEPS`` names one
+    step inside each, and
+    ``TestEveryCheckpointStepOnThosePathsIsAgreed`` is what keeps a step
+    added later from quietly falling outside the sweep.
+
+    Two things are asserted of each run, and the first is most of the point:
+    the job **ends** (a hang shows up here as the subprocess timeout), and it
+    ends saying how many ranks could not do the step -- the diagnosis a
+    rank-local raise loses, since it kills the job holding one rank's
+    traceback while the agreement's own explanation never runs.
+    """
+
+    #: Three cylinders of two ranks each, which is what it takes for one run
+    #: to reach every path: the hub's, an xhat spoke's and a dual cylinder's.
+    #: No lagrangian beside them -- it checkpoints nothing, and a bound spoke
+    #: cannot choose between two cylinders publishing the nonants it reads.
+    NP = 6
+    RANKS_PER_CYLINDER = 2
+    MODULE = _FARMER
+    MODEL_ARGS = ("--num-scens", "6", "--default-rho", "1")
+    SPOKE_ARGS = ("--xhatshuffle", "--relaxed-ph")
+    #: The rank of its own cylinder that the injected step fails on. Any rank
+    #: but 0: rank 0 is the one that publishes and prints, so a failure there
+    #: is the case least likely to go unnoticed.
+    FAIL_ON = 1
+    #: A farmer LP leg is seconds; this is a timeout on whether the job comes
+    #: back at all, which is what a rank-local raise takes away.
+    TIMEOUT = 300
+
+    @classmethod
+    def setUpClass(cls):
+        """One stopped leg, so the restore steps have a checkpoint to read."""
+        cls._tmp = tempfile.TemporaryDirectory()
+        cls.ckpt_dir = os.path.join(cls._tmp.name, "ckpt")
+        _run_leg(cls._tmp.name, "B1", cls.NP, cls.MODULE, cls.MODEL_ARGS,
+                 cls.SPOKE_ARGS,
+                 ("--max-iterations", "2", "--checkpoint-dir", cls.ckpt_dir))
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._tmp.cleanup()
+
+    def _run_with(self, step):
+        """Resume with ``step`` failing on one rank of every cylinder that
+        runs it. Writing is on as well as reading, so the setup path is live
+        too -- into its own directory, so the checkpoint the other steps read
+        is left as the stopped leg wrote it."""
+        cmd = [
+            "mpiexec", "-np", str(self.NP),
+            sys.executable, "-m", "mpi4py", _AGREEMENT_DRIVER,
+            "--break-step", step,
+            "--on-cylinder-rank", str(self.FAIL_ON),
+            "--module-name", self.MODULE, *self.MODEL_ARGS,
+            "--solver-name", solver_name, *self.SPOKE_ARGS,
+            "--intra-hub-conv-thresh", "-1",
+            "--rel-gap", "0.0", "--abs-gap", "0.0",
+            "--max-iterations", "3",
+            "--resume-from", self.ckpt_dir,
+            "--checkpoint-dir", os.path.join(self._tmp.name, f"w_{step}"),
+        ]
+        try:
+            return subprocess.run(cmd, capture_output=True, text=True,
+                                  timeout=self.TIMEOUT, check=False)
+        except subprocess.TimeoutExpired:
+            self.fail(
+                f"the job never came back after {step} failed on one rank: "
+                f"the ranks that did not fail are still waiting in a "
+                f"collective for the rank that raised, which is the hang "
+                f"this agreement exists to prevent")
+
+    def test_every_agreement_on_these_paths_ends_the_job(self):
+        for step in agreement_driver.STEPS:
+            with self.subTest(step=step):
+                result = self._run_with(step)
+                output = result.stdout + result.stderr
+                self.assertIn(
+                    agreement_driver.INJECTED, output,
+                    msg=f"{step} was never reached, so this ran the "
+                        f"unsabotaged job and proved nothing")
+                self.assertNotEqual(
+                    result.returncode, 0,
+                    msg=f"a rank that could not {step} was ignored and the "
+                        f"run reported success:\n{output[-4000:]}")
+                self.assertIn(
+                    f"1 of {self.RANKS_PER_CYLINDER} ranks of this cylinder "
+                    f"could not",
+                    output,
+                    msg=f"the job died on one rank's traceback rather than on "
+                        f"the agreement, which is what leaves the other ranks "
+                        f"in a collective:\n{output[-4000:]}")
+
+
+class TestEveryCheckpointStepOnThosePathsIsAgreed(unittest.TestCase):
+    """Nothing local happens on the setup or restore paths outside an
+    agreement.
+
+    The companion to the sweep above, and the half that survives a refactor.
+    That one proves the agreements that exist do their job; this one proves
+    there is no step beside them -- a new call, or a few lines of file
+    handling written inline, as the directory write probe once was -- that a
+    rank can fail on its own.
+
+    Reads the source rather than running anything, because what it is asking
+    about is the shape of these functions: which of the steps they take are
+    inside ``run_agreed`` and which are not. The config refusals they also
+    make are not in scope and do not need to be: they are pure functions of
+    the options and the cylinder's class, so every rank makes them or none
+    does.
+    """
+
+    #: The functions on these paths that run *outside* an agreement -- so
+    #: everything local they do must be inside one. A function called through
+    #: ``run_agreed`` is not here: it is already inside.
+    PATHS = (
+        ("Checkpointer.__init__", Checkpointer.__init__),
+        ("Checkpointer.pre_iter0", Checkpointer.pre_iter0),
+        ("Checkpointer._restore_incumbent", Checkpointer._restore_incumbent),
+        ("PHBase._restore_from_checkpoint_if_resuming",
+         PHBase._restore_from_checkpoint_if_resuming),
+        ("PHBase._restore_extension_state_if_resuming",
+         PHBase._restore_extension_state_if_resuming),
+        ("Checkpointer.post_iter0", Checkpointer.post_iter0),
+        ("XhatInnerBoundBase._restore_extension_state_if_resuming",
+         XhatInnerBoundBase._restore_extension_state_if_resuming),
+    )
+
+    #: Checkpointing calls that agree across the cylinder themselves, so they
+    #: may be called from a path directly. Each one is collective inside.
+    AGREE_THEMSELVES = frozenset({
+        "run_agreed",
+        "probe_model_is_dillable",
+        "agree_spoke_restore",
+        "agree_dual_spoke_restore",
+    })
+
+    #: And calls that need no agreement because there is nothing in them for
+    #: one rank to fail at: they read what is already in memory and return an
+    #: answer. Nothing that touches a file or a model belongs here.
+    CANNOT_FAIL_ON_ONE_RANK = frozenset({
+        "converger_state_is_carried",
+    })
+
+    #: Doing any of these inline is doing a rank's own work: the write probe
+    #: was exactly this, four lines of ``os`` and ``open`` in a constructor,
+    #: and it hung two real jobs before it was found.
+    LOCAL_WORK = frozenset({
+        "open", "makedirs", "remove", "rename", "replace", "load", "dump",
+        "dumps", "loads",
+    })
+
+    def _agreed_and_bare(self, func):
+        """(what is called inside run_agreed, what is called outside it)."""
+        tree = ast.parse(textwrap.dedent(inspect.getsource(func)))
+        agreed = set()
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            if self._called_name(node) != "run_agreed":
+                continue
+            for inner in ast.walk(node):
+                if isinstance(inner, ast.Call):
+                    agreed.add(id(inner))
+        bare, wrapped = [], []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                (wrapped if id(node) in agreed else bare).append(
+                    self._called_name(node))
+        return wrapped, bare
+
+    @staticmethod
+    def _called_name(node):
+        func = node.func
+        if isinstance(func, ast.Attribute):
+            return func.attr
+        if isinstance(func, ast.Name):
+            return func.id
+        return ""
+
+    @staticmethod
+    def _checkpointing_calls(func):
+        """The names called on the checkpointing module in ``func``."""
+        tree = ast.parse(textwrap.dedent(inspect.getsource(func)))
+        names = []
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id in ("ckpt", "checkpointing")):
+                names.append((node, node.func.attr))
+        return names
+
+    def test_no_checkpointing_step_is_called_outside_an_agreement(self):
+        for name, func in self.PATHS:
+            wrapped, bare = self._agreed_and_bare(func)
+            for _, called in self._checkpointing_calls(func):
+                if (called in self.AGREE_THEMSELVES
+                        or called in self.CANNOT_FAIL_ON_ONE_RANK
+                        or called in wrapped):
+                    continue
+                with self.subTest(path=name, step=called):
+                    self.fail(
+                        f"{name} calls checkpointing.{called} outside "
+                        f"run_agreed. If it agrees across the ranks itself, "
+                        f"or reads nothing a single rank can fail at, say so "
+                        f"by naming it in AGREE_THEMSELVES or "
+                        f"CANNOT_FAIL_ON_ONE_RANK; otherwise the rank it "
+                        f"fails on leaves the rest of the cylinder waiting "
+                        f"in the next collective.")
+
+    def test_no_path_does_a_rank_s_own_file_handling_inline(self):
+        for name, func in self.PATHS:
+            _, bare = self._agreed_and_bare(func)
+            for called in bare:
+                if called in self.LOCAL_WORK:
+                    with self.subTest(path=name, call=called):
+                        self.fail(
+                            f"{name} calls {called}() outside run_agreed. "
+                            f"Reading or writing a file is this rank's own "
+                            f"work and can fail on this rank alone; move it "
+                            f"inside the agreement.")
+
+    def test_the_sweep_covers_every_agreement_on_these_paths(self):
+        """Each ``run_agreed`` on the paths has a step in the driver's list.
+
+        Without this, an agreement added later is never exercised by the
+        sweep above and its first failure is a hung job.
+        """
+        for name, func in self.PATHS:
+            wrapped, _ = self._agreed_and_bare(func)
+            agreements = [c for c in wrapped
+                          if c and c not in ("run_agreed",)]
+            if not agreements:
+                continue
+            covered = [c for c in agreements
+                       if c in agreement_driver.STEPS
+                       or self._reaches_a_step(c)]
+            with self.subTest(path=name):
+                self.assertTrue(
+                    covered,
+                    msg=f"{name} agrees on {agreements}, none of which "
+                        f"multirank_agreement_driver.STEPS can make fail, so "
+                        f"nothing checks that this agreement works")
+
+    @staticmethod
+    def _reaches_a_step(called):
+        """Whether an agreed call runs one of the driver's steps inside it."""
+        func = getattr(Checkpointer, called, None) \
+            or getattr(PHBase, called, None)
+        if func is None:
+            return False
+        source = inspect.getsource(func)
+        return any(step in source for step in agreement_driver.STEPS)
 
 if __name__ == "__main__":
     unittest.main()

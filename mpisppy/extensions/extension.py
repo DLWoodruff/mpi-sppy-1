@@ -230,6 +230,12 @@ class Extension:
             produced; entries are matched to extensions by class name, so an
             extension that was not attached when the checkpoint was written
             is never called.
+
+            Not collective. Every restore runs inside an agreement across
+            the cylinder's ranks (checkpointing.run_agreed), which is what
+            keeps a restore that fails on one rank from stranding the others
+            in the next collective -- and an MPI call in here would be that
+            collective, reached by some ranks and not others.
         '''
         pass
 
