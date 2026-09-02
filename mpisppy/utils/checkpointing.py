@@ -715,7 +715,11 @@ def restore_extension_state(opt, state):
                 f"which is not attached to this run; it was dropped. If this "
                 f"run was meant to continue the earlier one, attach it.")
             continue
-        ext.restore_state(ext_state)
+        # An extension may return a sentence about what it could not put
+        # back exactly; it goes out with the rest of the resume's warnings.
+        message = ext.restore_state(ext_state)
+        if message:
+            warnings.append(f"{name}: {message}")
 
     saved = state.get("converger")
     convobject = getattr(opt, "convobject", None)

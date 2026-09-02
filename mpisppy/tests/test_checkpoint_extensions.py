@@ -34,6 +34,8 @@ siblings *crashed* on the first iteration after a resume, and the fixer's
 per-variable counts were being zeroed by its own setup hook on the way back in.
 """
 
+import contextlib
+import io
 import json
 import os
 import pickle
@@ -361,6 +363,59 @@ class TestWtrackerResume(_ABMixin, unittest.TestCase):
                              self._report(1, kind, reference),
                              msg=f"the resumed run's {kind} report differs "
                                  f"from the uninterrupted run's")
+
+    def test_a_wider_window_on_the_resumed_leg_says_so(self):
+        """The window carried was sized by the run that wrote it.
+
+        Ask for a longer one on the resumed leg and the report covers less
+        than an uninterrupted run of the same length would -- which reads as
+        the study having gone quiet rather than as the two legs having been
+        asked different questions.
+        """
+        from mpisppy.extensions.wtracker_extension import Wtracker_extension
+        _, stopped, _ = self.run_ab()
+        ext = _extension(stopped, Wtracker_extension)
+        state = ext.checkpoint_state()
+
+        self.assertIsNone(ext.restore_state(state),
+                          msg="the same wlen has nothing to report")
+
+        ext.wlen = self.WLEN + 5        # what a wider --wlen would ask for
+        message = ext.restore_state(state)
+        self.assertIsNotNone(
+            message, msg="the resumed leg asked for a window the checkpoint "
+                         "cannot fill, and said nothing")
+        self.assertIn("shorter window", message)
+
+    def test_the_resume_prints_what_the_extension_reports(self):
+        """The plumbing: a sentence returned by restore_state comes out with
+        the resume's other warnings, rather than being dropped."""
+        from mpisppy.extensions.wtracker_extension import Wtracker_extension
+        _, stopped, _ = self.run_ab()
+        ext = _extension(stopped, Wtracker_extension)
+        state = ext.checkpoint_state()
+        ext.wlen = self.WLEN + 5
+        warnings = checkpointing.restore_extension_state(
+            stopped, {"extensions": {"Wtracker_extension": state}})
+        self.assertTrue(
+            any("shorter window" in w for w in warnings),
+            msg=f"the extension's message never reached the user: {warnings}")
+
+    def test_what_it_costs_is_said_once(self):
+        """The window is the user's option, so its cost is theirs to see --
+        and it does not change between writes, so it is said once."""
+        from mpisppy.extensions.wtracker_extension import Wtracker_extension
+        _, stopped, _ = self.run_ab()
+        ext = _extension(stopped, Wtracker_extension)
+        ext._size_tocced = False
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            ext.checkpoint_state()
+            ext.checkpoint_state()
+        said = [line for line in out.getvalue().splitlines()
+                if "Wtracker carries" in line]
+        self.assertEqual(len(said), 1, msg=out.getvalue())
+        self.assertIn(f"wlen {self.WLEN}", said[0])
 
     def test_the_windows_worth_is_carried_and_no_more(self):
         from mpisppy.extensions.wtracker_extension import Wtracker_extension
