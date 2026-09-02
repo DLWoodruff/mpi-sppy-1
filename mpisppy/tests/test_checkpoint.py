@@ -1802,6 +1802,41 @@ def _set_and_cache_solution(opt, base):
     opt.update_best_solution_if_improving(float(base))
 
 
+def _publish_best_xhat(opt):
+    """What ``send_best_xhat`` puts in the buffer, per scenario.
+
+    Returns one list per scenario: its nonant values followed by the
+    objective published with them. The spoke object itself is stubbed --
+    what is under test is the method, and standing up a real cylinder would
+    need a wheel and an MPI window to read one array back.
+    """
+    import numpy as np
+    from mpisppy.cylinders.spoke import InnerBoundNonantSpoke
+    from mpisppy.cylinders.spwindow import Field
+
+    per_scenario = [len(s._mpisppy_data.nonant_indices) + 1
+                    for s in opt.local_scenarios.values()]
+
+    class _Stub:
+        def __init__(self):
+            self.opt = opt
+            self.send_buffers = {Field.BEST_XHAT: np.zeros(sum(per_scenario))}
+            self.sent = None
+
+        def put_send_buffer(self, buf, field):
+            self.sent = (field, list(buf))
+
+    stub = _Stub()
+    InnerBoundNonantSpoke.send_best_xhat(stub)
+    field, values = stub.sent
+    assert field is Field.BEST_XHAT
+    out, at = [], 0
+    for width in per_scenario:
+        out.append(values[at:at + width])
+        at += width
+    return out
+
+
 def _solution_by_name(opt):
     import pyomo.environ as pyo
     return {
@@ -1877,8 +1912,15 @@ class TestSpokeIncumbentFile(unittest.TestCase):
                     "that came after the incumbent it stores")
 
     def test_the_restored_objective_is_the_one_the_spoke_republishes(self):
-        """send_best_xhat reads the live attribute, and a resumed spoke
-        publishes before it has solved anything of its own."""
+        """And it stays that one once the resumed spoke starts working.
+
+        The republish is deferred to the spoke's first checkpoint point,
+        which is the *bottom* of a loop pass -- so an xhat evaluation has
+        already run by then and overwritten the live ``inner_bound``. Asking
+        only what the restore put on the models cannot see that: this asks
+        what ``send_best_xhat`` actually puts in the buffer, after such an
+        evaluation, which is what reaches FWPH.
+        """
         opt = _xhat_eval(ckpt_dir=self.ckpt_dir)
         _set_and_cache_solution(opt, 10.0)
         incumbent = {sname: s._mpisppy_data.inner_bound
@@ -1899,6 +1941,52 @@ class TestSpokeIncumbentFile(unittest.TestCase):
             self.assertEqual(s._mpisppy_data.inner_bound, incumbent[sname])
             self.assertEqual(s._mpisppy_data.best_solution_inner_bound,
                              incumbent[sname])
+
+        # The pass that carries the republish evaluates an xhat of its own
+        # first, and a worse one leaves the incumbent alone -- and the live
+        # attribute on every scenario changed.
+        for offset, s in enumerate(fresh.local_scenarios.values()):
+            s._mpisppy_data.inner_bound = 5555.0 + offset
+
+        published = _publish_best_xhat(fresh)
+        self.assertEqual(
+            [entry[-1] for entry in published],
+            [incumbent[sname] for sname in fresh.local_scenarios],
+            msg="the spoke republished its restored xhat with the objectives "
+                "of the evaluation it happened to run first")
+
+    def test_the_published_objective_belongs_to_the_published_xhat(self):
+        """On a fresh run too, and this is where it is consumed.
+
+        FWPH reads each scenario's block back as one column of its QP: the
+        values are the column and the trailing objective is that column's
+        recourse cost. Pairing an incumbent with a later evaluation's
+        objective is a wrong coefficient in someone else's optimization,
+        with nothing anywhere to reveal it.
+        """
+        opt = _xhat_eval(ckpt_dir=self.ckpt_dir)
+        _set_and_cache_solution(opt, 10.0)
+        incumbent = {sname: s._mpisppy_data.inner_bound
+                     for sname, s in opt.local_scenarios.items()}
+        cached = _solution_by_name(opt)
+
+        # An evaluation that does not improve on the incumbent: the cache
+        # stands and the live objectives move.
+        for offset, s in enumerate(opt.local_scenarios.values()):
+            s._mpisppy_data.inner_bound = 9999.0 + offset
+
+        published = _publish_best_xhat(opt)
+        for entry, (sname, s) in zip(published, opt.local_scenarios.items()):
+            self.assertEqual(
+                entry[-1], incumbent[sname],
+                msg=f"{sname}: the published objective is a later "
+                    f"evaluation's, not the published xhat's")
+            # And the values really are the incumbent's, so the pair is one
+            # solution rather than two halves that happen to agree.
+            nonants = s._mpisppy_data.nonant_indices.values()
+            self.assertEqual(
+                list(entry[:-1]),
+                [cached[sname][var.name] for var in nonants])
 
     def test_restores_every_variable_onto_fresh_models(self):
         """The load-bearing test: a *different* set of models, built by the

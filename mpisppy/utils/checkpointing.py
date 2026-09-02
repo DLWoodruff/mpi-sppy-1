@@ -1073,9 +1073,11 @@ def restore_spoke_incumbent(opt, state):
                 f"(e.g. {sorted(missing)[:3]}), so it cannot be restored."
             )
         s._mpisppy_data.best_solution_cache = cache
-        # Both, and to the same number: send_best_xhat reads the live
-        # attribute, and the resumed spoke publishes this incumbent before
-        # it has solved anything of its own.
+        # Both, and to the same number. The first is the one that goes back
+        # out: send_best_xhat publishes the objective snapshotted with the
+        # values. The second leaves this scenario reading as it did when the
+        # incumbent was found, which is what it means before this spoke has
+        # solved anything of its own.
         s._mpisppy_data.best_solution_inner_bound = entry["inner_bound"]
         s._mpisppy_data.inner_bound = entry["inner_bound"]
 

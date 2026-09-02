@@ -264,6 +264,23 @@ class InnerBoundSpoke(_BoundSpoke):
         self._incumbent_write_counter = counter + 1
 
     def send_best_xhat(self):
+        """Publish the incumbent xhat and, per scenario, its own objective.
+
+        The trailing value has to be the objective *of the xhat in this
+        buffer*: FWPH reads the pair back as one column of its QP, taking
+        the values as the column and the objective as that column's recourse
+        cost (``FWPH_Cylinder._add_QP_columns_from_buf`` ->
+        ``FWPH._add_QP_column``), so an objective belonging to some other
+        xhat is a wrong coefficient with nothing to reveal it.
+
+        So it is ``best_solution_inner_bound``, the objective snapshotted
+        with the values, and not the live ``inner_bound``, which every solve
+        overwrites. The two are the same number on the ordinary path, where
+        this is called straight after the solve that improved the incumbent
+        -- and they are not when a resumed spoke republishes the incumbent it
+        restored, which happens at the bottom of a loop pass, after that
+        pass's own evaluation has moved the live one.
+        """
         best_xhat_buf = self.send_buffers[Field.BEST_XHAT]
         ci = 0
         for s in self.opt.local_scenarios.values():
@@ -271,7 +288,7 @@ class InnerBoundSpoke(_BoundSpoke):
             for ndn_varid in s._mpisppy_data.varid_to_nonant_index:
                 best_xhat_buf[ci] = solution_cache[ndn_varid][1]
                 ci += 1
-            best_xhat_buf[ci] = s._mpisppy_data.inner_bound
+            best_xhat_buf[ci] = s._mpisppy_data.best_solution_inner_bound
             ci += 1
         # print(f"{self.cylinder_rank=} sending {best_xhat_buf.value_array()=}")
         self.put_send_buffer(best_xhat_buf, Field.BEST_XHAT)
