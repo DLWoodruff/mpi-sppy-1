@@ -586,6 +586,7 @@ def probe_directory_is_writable(opt, ckpt_dir):
             f"rank {opt.cylinder_rank} ({type(exc).__name__}: {exc})."
         ) from exc
 
+
 def probe_model_is_dillable(opt):
     """Serialize every local scenario to memory to prove checkpointing works.
 
