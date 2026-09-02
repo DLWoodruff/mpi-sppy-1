@@ -1312,6 +1312,25 @@ class PHBase(mpisppy.spopt.SPOpt):
                 f"--resume-from, or run PH."
             )
 
+        # The splice below is this rank's own work from end to end: it reads
+        # the file named after this rank and checks it against the scenarios
+        # this rank owns, so it refuses on the ranks the checkpoint does not
+        # match and returns on the others. The next thing Iter0 does is
+        # collective, so a rank-local refusal would leave the rest of the
+        # cylinder waiting for a rank that has already gone -- the resume
+        # would hang instead of refusing. Every rank refuses or none does.
+        checkpointing.run_agreed(
+            self, lambda: self._splice_checkpoint(ckpt_dir),
+            "restore the checkpoint into this run, so none of them resumes")
+
+    def _splice_checkpoint(self, ckpt_dir):
+        """Load this rank's checkpoint and put it in place of the fresh run.
+
+        Local by nature and agreed by the caller; see
+        ``checkpointing.run_agreed``. Nothing in here may be collective, for
+        the same reason: the ranks it would synchronize have not agreed yet
+        that they are all still here.
+        """
         leaf, models = checkpointing.load_checkpoint(self, ckpt_dir)
 
         for sname, model in models.items():

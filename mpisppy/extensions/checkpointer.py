@@ -198,13 +198,30 @@ class Checkpointer(Extension):
         #: incumbent is not rewritten on every pass of a loop that spins.
         self._last_written_obj = None
 
-        if not self.spoke_mode and self.write_enabled:
-            ckpt.require_dill(self.backend)
-
         if not self.write_enabled:
             # Nothing below is about reading, and a restore-only run must not
             # inherit refusals that only protect a write.
             return
+
+        # Everything the setup refusals below look at is per rank -- which
+        # scenarios this rank owns, what this rank's node can write, whether
+        # dill imports here -- so each of them can refuse on one rank and
+        # pass on the others. The run's next collective would then be waiting
+        # for a rank that has already raised, and a refusal meant to arrive
+        # in the first second of the run becomes a job that hangs until its
+        # wall-clock limit instead. Every rank raises or none does.
+        ckpt.run_agreed(opt, self._refuse_a_run_that_cannot_checkpoint,
+                        "be set up to checkpoint, so the run is refused")
+
+    def _refuse_a_run_that_cannot_checkpoint(self):
+        """The setup refusals that are this rank's own to make.
+
+        Local by nature and agreed by the caller; see
+        ``checkpointing.run_agreed``.
+        """
+        opt = self.opt
+        if not self.spoke_mode:
+            ckpt.require_dill(self.backend)
 
         # Two scenario names that sanitize to the same file name would
         # silently overwrite each other's model files; refuse now rather than
@@ -212,27 +229,7 @@ class Checkpointer(Extension):
         # carry the rank, so only names sharing a rank can collide.
         ckpt.check_filename_collisions(opt.local_scenarios)
 
-        # Create and probe the directory now. Discovering only at write time
-        # that the path is unwritable would mean the run never checkpoints.
-        # Every rank probes, with a rank-tagged probe file so the ranks do not
-        # remove each other's: on a cluster the checkpoint directory can be
-        # unwritable from some nodes and not others, and that is exactly the
-        # failure worth catching before a multi-hour run rather than at its
-        # first write.
-        try:
-            os.makedirs(self.ckpt_dir, exist_ok=True)
-            probe = os.path.join(
-                self.ckpt_dir,
-                f".mpisppy_write_probe_{int(opt.cylinder_rank):04d}")
-            with open(probe, "w"):
-                pass
-            os.remove(probe)
-        except OSError as exc:
-            raise RuntimeError(
-                f"Cannot write to the checkpoint directory "
-                f"'{self.ckpt_dir}' from rank {opt.cylinder_rank} "
-                f"({type(exc).__name__}: {exc})."
-            ) from exc
+        ckpt.probe_directory_is_writable(opt, self.ckpt_dir)
 
     def pre_iter0(self):
         if self.spoke_mode:
@@ -296,27 +293,45 @@ class Checkpointer(Extension):
             return
         cylinder, ordinal = self._spoke_identity()
         rank0 = self.opt.cylinder_rank == 0
-        state = ckpt.load_spoke_incumbent(self.opt, resume_from, cylinder,
-                                          ordinal)
+        # Collective: the load refuses per rank -- it reads the file named
+        # after this rank and checks it against the scenarios this rank owns
+        # -- and the spoke's loop is collective, so a rank-local refusal
+        # would strand the others in it. Every rank refuses or none does.
+        state = ckpt.run_agreed(
+            self.opt,
+            lambda: ckpt.load_spoke_incumbent(self.opt, resume_from,
+                                              cylinder, ordinal),
+            "read their checkpointed incumbent, so none of them restores one")
+        if state is not None:
+            # The ordinal is stable when an unrelated cylinder comes or goes,
+            # but not when one of two same-class spokes does: the survivor's
+            # ordinal becomes the removed one's, and it would read that
+            # spoke's file without a word. The values are feasible for the
+            # same model, so nothing downstream would notice.
+            was = state.get("class_count")
+            now = self._class_ordinal_and_count()[1]
+            if was is not None and was != now:
+                global_toc(
+                    f"WARNING: the checkpoint was written by a wheel carrying "
+                    f"{was} {cylinder} cylinder(s) and this run has {now}, so "
+                    f"this spoke may be restoring an incumbent that belonged "
+                    f"to a different one. It is a feasible solution for the "
+                    f"same model either way.", rank0)
+        # Collective too, and reached whether or not this rank found a file:
+        # putting the values back is per rank -- it resolves the file's
+        # variable names against this rank's own models -- so it is a refusal
+        # one rank can make alone, and the ranks that did restore would carry
+        # on into the loop without it.
+        obj = ckpt.run_agreed(
+            self.opt,
+            lambda: None if state is None
+            else ckpt.restore_spoke_incumbent(self.opt, state),
+            "put their checkpointed incumbent back on their models, so none "
+            "of them restores one")
         if state is None:
             global_toc(f"No checkpointed incumbent for {cylinder} in "
                        f"{resume_from}; this spoke starts without one", rank0)
             return
-        # The ordinal is stable when an unrelated cylinder comes or goes, but
-        # not when one of two same-class spokes does: the survivor's ordinal
-        # becomes the removed one's, and it would read that spoke's file
-        # without a word. The values are feasible for the same model, so
-        # nothing downstream would notice.
-        was = state.get("class_count")
-        now = self._class_ordinal_and_count()[1]
-        if was is not None and was != now:
-            global_toc(
-                f"WARNING: the checkpoint was written by a wheel carrying "
-                f"{was} {cylinder} cylinder(s) and this run has {now}, so "
-                f"this spoke may be restoring an incumbent that belonged to a "
-                f"different one. It is a feasible solution for the same "
-                f"model either way.", rank0)
-        obj = ckpt.restore_spoke_incumbent(self.opt, state)
         self.restored_incumbent_obj = obj
         self.opt.spcomm.best_inner_bound = state["best_inner_bound"]
         # _last_written_obj means "what the file in self.ckpt_dir already
