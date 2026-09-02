@@ -42,7 +42,11 @@ import mpisppy.utils.pickle_bundle as pickle_bundle
 dill, dill_available = attempt_import("dill")
 
 # Bump when the on-disk layout changes in a way older readers cannot handle.
-FORMAT_VERSION = 1
+#: Bumped when the on-disk shape changes. Version 2 replaced the spoke
+#: incumbent file's per-scenario ``inner_bound`` -- read live at write time,
+#: so it could describe a later solve than the values beside it -- with the
+#: objective cached when the incumbent itself was.
+FORMAT_VERSION = 2
 
 DILL_RELOAD_BACKEND = "dill-reload"
 LEAF_BACKEND = "leaf"
@@ -828,8 +832,11 @@ def spoke_incumbent_state(opt, cylinder, ordinal, best_inner_bound=None,
         # restored incumbent without it would send whatever the fresh models
         # happen to hold, which is None.
         solutions[sname] = {
+            # The objective of the cached solution, snapshotted with it in
+            # _cache_best_solution -- not the live inner_bound, which the
+            # next solve overwrites while the values beside it stay put.
             "inner_bound": _as_float_or_none(
-                getattr(s._mpisppy_data, "inner_bound", None)),
+                getattr(s._mpisppy_data, "best_solution_inner_bound", None)),
             "values": {var.name: value for var, value in cache.items()},
         }
     return {
@@ -961,6 +968,10 @@ def restore_spoke_incumbent(opt, state):
                 f"(e.g. {sorted(missing)[:3]}), so it cannot be restored."
             )
         s._mpisppy_data.best_solution_cache = cache
+        # Both, and to the same number: send_best_xhat reads the live
+        # attribute, and the resumed spoke publishes this incumbent before
+        # it has solved anything of its own.
+        s._mpisppy_data.best_solution_inner_bound = entry["inner_bound"]
         s._mpisppy_data.inner_bound = entry["inner_bound"]
 
     opt.best_solution_obj_val = state["best_solution_obj_val"]
