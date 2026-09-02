@@ -822,10 +822,6 @@ class TestDeadlineOnOneRankDoesNotHangTheOthers(unittest.TestCase):
             self.assertEqual(snap["resume_iteration"], self.SKEW_AT)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 @unittest.skipIf(not solver_available, "no solver is available")
 @unittest.skipIf(not mpiexec_available, "mpiexec is not available")
 class TestMultiRankSpokeCursorAgreement(unittest.TestCase):
@@ -959,3 +955,112 @@ class TestMultiRankSpokeCursorAgreement(unittest.TestCase):
         self.assertIn("ranks of this spoke have a checkpointed incumbent",
                       result.stdout,
                       msg="the run declined to restore without saying so")
+
+
+@unittest.skipIf(not solver_available, "no solver is available")
+@unittest.skipIf(not mpiexec_available, "mpiexec is not available")
+class TestMultiRankDualWeightAgreement(unittest.TestCase):
+    """A multi-rank dual cylinder restores one iteration's W, not one each.
+
+    W is per scenario and so per rank, and there is nothing to broadcast --
+    but the iteration it belongs to is the cylinder's. Ranks that restore W
+    from different iterations hand ``Compute_Xbar`` an allreduce over values
+    from two points of the run, and under ``--ph-primal-hub`` that blended W
+    is what the hub's W is built from. Like the xhat case, it costs no error
+    and no warning.
+
+    Each rank writes at the bottom of its own iteration and a failed write
+    warns and carries on, so the files really can disagree; the tests
+    manufacture that by editing what the stopped leg wrote.
+    """
+
+    NP = 4
+    MODULE = _FARMER
+    MODEL_ARGS = ("--num-scens", "6", "--default-rho", "1")
+    SPOKE_ARGS = ("--relaxed-ph",)
+    STOP = 2
+    RESUME_FOR = 2
+    CYLINDER = "RelaxedPHSpoke"
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        # Removed here rather than in tearDown, which unittest does not call
+        # when setUp raises -- and the leg below raises on a failed run.
+        self.addCleanup(self._tmp.cleanup)
+        self.ckpt_dir = os.path.join(self._tmp.name, "ckpt")
+        _run_leg(self._tmp.name, "B1", self.NP, self.MODULE, self.MODEL_ARGS,
+                 self.SPOKE_ARGS,
+                 ("--max-iterations", str(self.STOP),
+                  "--checkpoint-dir", self.ckpt_dir))
+
+    def _dual_files(self):
+        """This cylinder's checkpoint files, one per rank, ordered by rank."""
+        spokes_dir = os.path.join(self.ckpt_dir, "spokes")
+        names = sorted(f for f in os.listdir(spokes_dir)
+                       if f.startswith(f"spoke_{self.CYLINDER}"))
+        self.assertGreater(
+            len(names), 1,
+            msg=f"expected one file per cylinder rank, got {names}")
+        return [os.path.join(spokes_dir, n) for n in names]
+
+    def _resume(self):
+        result, out_path = _run_leg(
+            self._tmp.name, "B2", self.NP, self.MODULE, self.MODEL_ARGS,
+            self.SPOKE_ARGS,
+            ("--max-iterations", str(self.RESUME_FOR),
+             "--resume-from", self.ckpt_dir))
+        markers = _spoke_ranks(out_path, self.CYLINDER)
+        self.assertGreater(
+            len(markers), 1,
+            msg=f"expected a marker per cylinder rank: {markers}")
+        return result, markers
+
+    def test_the_ranks_restore_the_same_iteration(self):
+        """The undisturbed case, so the tests below cannot pass vacuously."""
+        _, markers = self._resume()
+        generations = {m["restored_dual_generation"] for m in markers}
+        self.assertEqual(
+            len(generations), 1,
+            msg=f"the cylinder's ranks restored W from {len(generations)} "
+                f"different iterations: {generations}")
+        self.assertNotIn(None, generations,
+                         msg="no rank restored any dual weights at all")
+
+    def test_ranks_holding_different_iterations_stop_the_whole_restore(self):
+        paths = self._dual_files()
+        with open(paths[-1], "rb") as f:
+            state = pickle.load(f)
+        self.assertIsNotNone(state["generation"])
+        # W from the iteration before: what a stop landing between the two
+        # ranks' writes leaves behind.
+        state["generation"] = int(state["generation"]) - 1
+        with open(paths[-1], "wb") as f:
+            pickle.dump(state, f)
+
+        result, markers = self._resume()
+        for marker in markers:
+            self.assertIsNone(
+                marker["restored_dual_generation"],
+                msg="a rank restored W from an iteration another rank of the "
+                    "same cylinder did not checkpoint")
+        self.assertIn("dual weights from different iterations",
+                      result.stdout,
+                      msg="the run declined to restore without saying so")
+
+    def test_a_rank_without_a_file_stops_the_whole_restore(self):
+        paths = self._dual_files()
+        os.remove(paths[-1])
+
+        result, markers = self._resume()
+        for marker in markers:
+            self.assertIsNone(
+                marker["restored_dual_generation"],
+                msg="a rank restored W although another rank of the same "
+                    "cylinder had no file to restore from")
+        self.assertIn("ranks of this cylinder have checkpointed dual weights",
+                      result.stdout,
+                      msg="the run declined to restore without saying so")
+
+
+if __name__ == "__main__":
+    unittest.main()

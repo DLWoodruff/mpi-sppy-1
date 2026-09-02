@@ -327,6 +327,15 @@ class Checkpointer(Extension):
         rank0 = self.opt.cylinder_rank == 0
         state = ckpt.load_dual_spoke_state(self.opt, resume_from, cylinder,
                                            ordinal)
+        # Collective, and reached whether or not this rank found a file: W is
+        # per rank, but the iteration it belongs to is the cylinder's, and
+        # ranks restoring different iterations blend them in Compute_Xbar.
+        # See agree_dual_spoke_restore.
+        state, disagreement = ckpt.agree_dual_spoke_restore(self.opt, state)
+        if disagreement is not None:
+            global_toc(f"WARNING: {disagreement}; {cylinder} starts from "
+                       f"W=0", rank0)
+            return
         if state is None:
             global_toc(f"No checkpointed dual weights for {cylinder} in "
                        f"{resume_from}; this cylinder starts from W=0", rank0)
