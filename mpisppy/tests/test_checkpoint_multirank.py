@@ -1273,9 +1273,15 @@ class TestEveryCheckpointStepOnThosePathsIsAgreed(unittest.TestCase):
     })
 
     def _agreed_and_bare(self, func):
-        """(what is called inside run_agreed, what is called outside it)."""
+        """(what is named inside run_agreed, what is called outside it).
+
+        The first is not only calls: an agreement whose work is a method
+        handed over by name -- ``run_agreed(opt, self._do_the_thing, ...)``
+        -- names it without calling it there, and it is inside the agreement
+        just the same.
+        """
         tree = ast.parse(textwrap.dedent(inspect.getsource(func)))
-        agreed = set()
+        agreed, wrapped = set(), []
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue
@@ -1284,11 +1290,13 @@ class TestEveryCheckpointStepOnThosePathsIsAgreed(unittest.TestCase):
             for inner in ast.walk(node):
                 if isinstance(inner, ast.Call):
                     agreed.add(id(inner))
-        bare, wrapped = [], []
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Call):
-                (wrapped if id(node) in agreed else bare).append(
-                    self._called_name(node))
+                    wrapped.append(self._called_name(inner))
+                elif isinstance(inner, ast.Attribute):
+                    wrapped.append(inner.attr)
+                elif isinstance(inner, ast.Name):
+                    wrapped.append(inner.id)
+        bare = [self._called_name(node) for node in ast.walk(tree)
+                if isinstance(node, ast.Call) and id(node) not in agreed]
         return wrapped, bare
 
     @staticmethod
@@ -1351,8 +1359,11 @@ class TestEveryCheckpointStepOnThosePathsIsAgreed(unittest.TestCase):
         """
         for name, func in self.PATHS:
             wrapped, _ = self._agreed_and_bare(func)
+            # What is left after the agreement's own name, the module it is
+            # reached through and the objects handed to it: what it agrees on.
             agreements = [c for c in wrapped
-                          if c and c not in ("run_agreed",)]
+                          if c and c not in ("run_agreed", "ckpt",
+                                             "checkpointing", "opt", "self")]
             if not agreements:
                 continue
             covered = [c for c in agreements
