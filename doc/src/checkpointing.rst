@@ -331,20 +331,50 @@ them runs the iterative algorithm a checkpoint describes. The intent is that
 checkpointing either works or says so at startup, rather than running for hours
 and writing nothing.
 
-**Extension and converger state is not yet part of a checkpoint.** Extensions
-that accumulate their own state across iterations -- the rho updaters,
-``fixer``, ``slammer`` -- start fresh on a resumed run, and so does a
-converger given with ``ph_converger`` (the resume warns about the latter in
-the log). The restored *model* state is correct, and the run continues
-correctly from it, but a resumed run using one of these will not follow the
-same trajectory as an uninterrupted one. The rho-setting extensions
-(``--sep-rho``, ``--coeff-rho``, ``--sensi-rho``, ``--grad-rho``) do not
-recompute rho at the resume itself: the checkpointed rho -- including
-whatever adaptation had happened by the write -- carries over, and the
-extensions go on adapting it from there. Their own histories still start
-empty, so the first iteration or two after a resume have nothing to measure a
-change against and recommend no update; an uninterrupted run would have had
-several iterations of history at that point.
+**Extension and converger state is part of a checkpoint.** Extensions that
+accumulate their own state across iterations carry it across a stop: the rho
+updaters (``--norm-rho``, ``--mult-rho``, ``--sep-rho``, ``--sensi-rho``,
+``--grad-rho``), ``fixer``, ``slammer``, the W tracker (``--wtracker``), and
+the primal-dual converger. So a
+resumed run using one of them follows the same trajectory an uninterrupted run
+would, rather than merely continuing correctly from the right models.
+
+The rho-setting extensions do not *recompute* rho at the resume itself: the
+checkpointed rho -- including whatever adaptation had happened by the write --
+carries over, and the extensions resume their per-iteration updates from there.
+
+Two things this does not cover:
+
+* **Your own extension carries nothing unless you say so.** If it keeps state
+  on itself that decides what it does next -- a history, a counter, a record of
+  what it has already changed -- implement ``checkpoint_state()`` and
+  ``restore_state(state)`` on it. Return plain data keyed by variable *name* or
+  by ``(node name, index)``, never Pyomo objects: a resume replaces every
+  model, so a saved variable reference addresses something that no longer
+  exists. If it keeps no such state, set ``checkpoint_stateless = True`` on the
+  class instead.
+
+  Do one or the other. A resumed run names every attached extension that has
+  done neither, because from the outside "keeps nothing" and "nobody decided"
+  look the same, and the second one is a run that quietly stops retracing an
+  uninterrupted one. The declaration is deliberately not inherited: a subclass
+  that adds state to a stateless parent is named rather than covered by its
+  parent's answer.
+
+  Some of the shipped extensions are in that unanswered set and say so at the
+  resume -- ``PrimalDualRho``, ``WOscillationMonitor``, ``ReducedCostsFixer``,
+  ``RelaxedPHFixer``, ``CrossScenarioExtension``, ``TimedMIPGapCB``,
+  ``PHTracker`` and ``XhatFeasibilityCutExtension``. Using one across a resume
+  works and continues from the right models; it will not retrace an
+  uninterrupted run.
+* **A converger with no such implementation still starts fresh**, and the resume
+  says so in the log. That matters more than it sounds: a converger decides when
+  the run stops, so one that accumulates history can terminate a resumed run at a
+  different iteration than an uninterrupted one.
+
+If you resume with a *different* set of extensions than the checkpoint was
+written with, that is allowed -- the hub's iterate is still valid -- and the run
+reports each piece of state it could not hand to anybody.
 
 **W and xbar input files are not read on a resumed run.** ``--init-W-fname``
 and ``--init-Xbar-fname`` initialize a study; a resumed run takes both from the

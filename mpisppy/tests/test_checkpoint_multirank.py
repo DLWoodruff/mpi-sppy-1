@@ -837,6 +837,8 @@ class TestEveryCheckpointStepOnThosePathsIsAgreed(unittest.TestCase):
         ("Checkpointer._restore_incumbent", Checkpointer._restore_incumbent),
         ("PHBase._restore_from_checkpoint_if_resuming",
          PHBase._restore_from_checkpoint_if_resuming),
+        ("PHBase._restore_extension_state_if_resuming",
+         PHBase._restore_extension_state_if_resuming),
     )
 
     #: Every agreement reached from those paths, by the function it is
@@ -851,6 +853,8 @@ class TestEveryCheckpointStepOnThosePathsIsAgreed(unittest.TestCase):
         "Checkpointer._restore_incumbent": ("load_spoke_incumbent",
                                             "restore_spoke_incumbent"),
         "PHBase._restore_from_checkpoint_if_resuming": ("load_checkpoint",),
+        "PHBase._restore_extension_state_if_resuming":
+            ("restore_extension_state",),
     }
 
     #: The raises reached from these paths that every rank of a cylinder
@@ -879,6 +883,13 @@ class TestEveryCheckpointStepOnThosePathsIsAgreed(unittest.TestCase):
         "probe_model_is_dillable",
     })
 
+    #: And calls that need no agreement because there is nothing in them for
+    #: one rank to fail at: they read what is already in memory and return an
+    #: answer. Nothing that touches a file or a model belongs here.
+    CANNOT_FAIL_ON_ONE_RANK = frozenset({
+        "converger_state_is_carried",
+    })
+
     #: Modules whose callables do this rank's own work: they touch the file
     #: system or turn bytes into objects, and either can fail on one rank
     #: alone. Named as modules rather than as functions so that the next
@@ -887,7 +898,7 @@ class TestEveryCheckpointStepOnThosePathsIsAgreed(unittest.TestCase):
     #: jobs before it was found.
     LOCAL_WORK_MODULES = frozenset({
         "os", "posix", "nt", "shutil", "pickle", "dill", "json", "io",
-        "_io", "pathlib", "tempfile", "glob",
+        "_io", "pathlib", "tempfile", "glob"
     })
 
     #: And the same idea reached through an object, where there is no module
@@ -1056,17 +1067,21 @@ class TestEveryCheckpointStepOnThosePathsIsAgreed(unittest.TestCase):
         for name, entry in self.PATHS:
             for qualname, func, tree, agreed, ns in self._closure(entry):
                 for node, called in self._checkpointing_calls(func, tree, ns):
-                    if called in self.AGREE_THEMSELVES or id(node) in agreed:
+                    if (called in self.AGREE_THEMSELVES
+                            or called in self.CANNOT_FAIL_ON_ONE_RANK
+                            or id(node) in agreed):
                         continue
                     with self.subTest(path=name, function=qualname,
                                       step=called):
                         self.fail(
                             f"{qualname}, reached from {name}, calls "
                             f"checkpointing.{called} outside run_agreed. If "
-                            f"it agrees across the ranks itself, say so by "
-                            f"naming it in AGREE_THEMSELVES; otherwise the "
-                            f"rank it fails on leaves the rest of the "
-                            f"cylinder waiting in the next collective.")
+                            f"it agrees across the ranks itself, or reads "
+                            f"nothing a single rank can fail at, say so by "
+                            f"naming it in AGREE_THEMSELVES or "
+                            f"CANNOT_FAIL_ON_ONE_RANK; otherwise the rank it "
+                            f"fails on leaves the rest of the cylinder "
+                            f"waiting in the next collective.")
 
     def test_no_path_does_a_rank_s_own_file_handling_inline(self):
         for name, entry in self.PATHS:

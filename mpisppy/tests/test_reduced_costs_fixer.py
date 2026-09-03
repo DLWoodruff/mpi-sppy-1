@@ -101,6 +101,16 @@ def _build(specs, minimizing=True, fix_fraction=1.0, zero_rc_tol=1e-9, bound_tol
     opt = _make_opt(minimizing, fix_fraction, zero_rc_tol, bound_tol)
     opt.local_scenarios = {"Scen1": scenario}
     opt.nonant_length = n
+    # Mirror SPOpt's record of which nonants were fixed when the run started.
+    # The fixer asks this rather than reading xvar.fixed, because on a run
+    # resumed from a checkpoint every mid-run fixing is already applied and
+    # xvar.fixed would file the extension's own earlier fixings as the
+    # modeler's -- never to be unfixed again. Captured here, before any
+    # heuristic fixing below, which is when SPOpt captures it.
+    initially_fixed = ComponentSet(
+        var for var in nonant_indices.values() if var.fixed)
+    opt._initial_fixed_varibles = initially_fixed
+    opt.was_initially_fixed = initially_fixed.__contains__
 
     ext = ReducedCostsFixer(opt)
     ext.pre_iter0()
