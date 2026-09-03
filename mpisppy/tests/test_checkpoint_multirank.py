@@ -40,6 +40,7 @@ wrapper is where a resume has the most to get wrong.
 """
 
 import ast
+import importlib
 import inspect
 import json
 import os
@@ -52,6 +53,7 @@ import textwrap
 import unittest
 
 import mpisppy.tests.multirank_agreement_driver as agreement_driver
+import mpisppy.utils.checkpointing as checkpointing
 from mpisppy.cylinders.xhatbase import XhatInnerBoundBase
 from mpisppy.extensions.checkpointer import Checkpointer
 from mpisppy.phbase import PHBase
@@ -1220,21 +1222,35 @@ class TestEveryCheckpointStepOnThosePathsIsAgreed(unittest.TestCase):
 
     The companion to the sweep above, and the half that survives a refactor.
     That one proves the agreements that exist do their job; this one proves
-    there is no step beside them -- a new call, or a few lines of file
-    handling written inline, as the directory write probe once was -- that a
-    rank can fail on its own.
+    there is no step beside them -- a new call, a raise, or a few lines of
+    file handling written inline, as the directory write probe once was --
+    that a rank can fail on its own.
 
     Reads the source rather than running anything, because what it is asking
     about is the shape of these functions: which of the steps they take are
-    inside ``run_agreed`` and which are not. The config refusals they also
-    make are not in scope and do not need to be: they are pure functions of
-    the options and the cylinder's class, so every rank makes them or none
-    does.
+    inside ``run_agreed`` and which are not. It reads the source of what they
+    *call*, too. A helper called from one of these paths outside an agreement
+    is doing this rank's own work exactly as inline code is -- the write
+    probe could be moved into a method of its own and this would have gone
+    quiet -- so the closure of bare calls is what is checked, not the four
+    functions alone.
+
+    Three things it deliberately does not do by name-matching, because each
+    was demonstrated evading a version that did:
+
+    * calls are resolved to the *object* they name, so the same call written
+      ``from ... import probe_directory_is_writable as _p; _p(...)``, or
+      fully dotted, or through a renamed module alias, is the same call here;
+    * a call is inside an agreement when that call *node* is inside one, not
+      when some other call of the same name is;
+    * doing a rank's own file handling is decided by the module the callable
+      comes from, so ``os.mkdir`` cannot pass where ``os.makedirs`` fails.
     """
 
-    #: The functions on these paths that run *outside* an agreement -- so
-    #: everything local they do must be inside one. A function called through
-    #: ``run_agreed`` is not here: it is already inside.
+    #: The entry points: the functions on these paths that run *outside* an
+    #: agreement. A function called through ``run_agreed`` is not here -- it
+    #: is already inside one -- but a function called beside one is reached
+    #: through the closure below.
     PATHS = (
         ("Checkpointer.__init__", Checkpointer.__init__),
         ("Checkpointer.pre_iter0", Checkpointer.pre_iter0),
@@ -1247,6 +1263,46 @@ class TestEveryCheckpointStepOnThosePathsIsAgreed(unittest.TestCase):
         ("XhatInnerBoundBase._restore_extension_state_if_resuming",
          XhatInnerBoundBase._restore_extension_state_if_resuming),
     )
+
+    #: Every agreement reached from those paths, by the function it is
+    #: written in and in the order it appears there, named by the step
+    #: ``multirank_agreement_driver`` breaks to exercise it. Declared rather
+    #: than inferred: two cylinders take the same step through the same
+    #: function name, so which agreement a step exercises is not something
+    #: the name can say. An agreement added without a step here fails this,
+    #: and so does a step the driver stops naming.
+    AGREEMENTS = {
+        "Checkpointer.__init__": ("probe_directory_is_writable",),
+        "Checkpointer._restore_incumbent": ("load_spoke_incumbent",
+                                            "restore_spoke_incumbent"),
+        "PHBase._restore_from_checkpoint_if_resuming": ("load_checkpoint",),
+        "PHBase._restore_extension_state_if_resuming":
+            ("restore_extension_state",),
+        "Checkpointer.post_iter0": ("load_dual_spoke_state",
+                                    "restore_dual_spoke_state"),
+        "XhatInnerBoundBase._restore_extension_state_if_resuming":
+            ("restore_extension_state_on_a_spoke",),
+    }
+
+    #: The raises reached from these paths that every rank of a cylinder
+    #: makes or none does, with how many there are and what makes them the
+    #: same on every rank. A raise that reads a file, a model, or anything
+    #: else only this rank can see does not belong here -- it belongs inside
+    #: an agreement, which is the whole subject of this class.
+    RANK_INDEPENDENT_RAISES = {
+        "Checkpointer.__init__": (
+            5, "the options and the cylinder's class: an --checkpoint-every "
+               "below 1, a --checkpoint-before-seconds that is not positive, "
+               "neither writing nor resuming, a backend it does not know, "
+               "and spoke mode on something that is not an Xhat_Eval. Every "
+               "rank of the wheel is given the same command line."),
+        "Checkpointer._spoke_identity": (
+            1, "the cylinder has no spcomm, which is a property of how the "
+               "wheel was built rather than of anything this rank read."),
+        "PHBase._restore_from_checkpoint_if_resuming": (
+            1, "this hub is not a PH, which is the same object on every rank "
+               "of the cylinder."),
+    }
 
     #: Checkpointing calls that agree across the cylinder themselves, so they
     #: may be called from a path directly. Each one is collective inside.
@@ -1264,40 +1320,143 @@ class TestEveryCheckpointStepOnThosePathsIsAgreed(unittest.TestCase):
         "converger_state_is_carried",
     })
 
-    #: Doing any of these inline is doing a rank's own work: the write probe
-    #: was exactly this, four lines of ``os`` and ``open`` in a constructor,
-    #: and it hung two real jobs before it was found.
-    LOCAL_WORK = frozenset({
-        "open", "makedirs", "remove", "rename", "replace", "load", "dump",
-        "dumps", "loads",
+    #: Modules whose callables do this rank's own work: they touch the file
+    #: system or turn bytes into objects, and either can fail on one rank
+    #: alone. Named as modules rather than as functions so that the next
+    #: spelling of the same idea is caught too -- the write probe was four
+    #: lines of ``os`` and ``open`` in a constructor, and it hung two real
+    #: jobs before it was found.
+    LOCAL_WORK_MODULES = frozenset({
+        "os", "posix", "nt", "shutil", "pickle", "dill", "json", "io",
+        "_io", "pathlib", "tempfile", "glob"
     })
 
-    def _agreed_and_bare(self, func):
-        """(what is named inside run_agreed, what is called outside it).
+    #: And the same idea reached through an object, where there is no module
+    #: to resolve: ``some_path.read_text()`` names nothing this can look up.
+    LOCAL_WORK_METHODS = frozenset({
+        "open", "read_text", "write_text", "read_bytes", "write_bytes",
+        "mkdir", "unlink", "rmdir", "touch", "iterdir", "samefile",
+    })
 
-        The first is not only calls: an agreement whose work is a method
-        handed over by name -- ``run_agreed(opt, self._do_the_thing, ...)``
-        -- names it without calling it there, and it is inside the agreement
-        just the same.
+    # ---- reading the source -------------------------------------------
+
+    @classmethod
+    def _owner_classes(cls):
+        """The classes the paths are methods of, for resolving ``self.x``."""
+        classes = []
+        for _, func in cls.PATHS:
+            owner = func.__globals__.get(func.__qualname__.split(".")[0])
+            if owner is not None and owner not in classes:
+                classes.append(owner)
+        return classes
+
+    @staticmethod
+    def _namespace(func, tree):
+        """What names mean inside ``func``: its module's, plus its own.
+
+        A function that imports what it needs where it needs it --
+        ``from mpisppy.utils.checkpointing import probe_directory_is_writable
+        as _p`` -- binds a name that is in no module namespace, and reading
+        only the module's left that call invisible.
         """
-        tree = ast.parse(textwrap.dedent(inspect.getsource(func)))
-        agreed, wrapped = set(), []
+        namespace = dict(func.__globals__)
         for node in ast.walk(tree):
-            if not isinstance(node, ast.Call):
+            try:
+                if isinstance(node, ast.Import):
+                    for alias in node.names:
+                        top = alias.name.split(".")[0]
+                        namespace[alias.asname or top] = importlib.import_module(
+                            alias.name if alias.asname else top)
+                elif isinstance(node, ast.ImportFrom) and node.module \
+                        and not node.level:
+                    module = importlib.import_module(node.module)
+                    for alias in node.names:
+                        namespace[alias.asname or alias.name] = getattr(
+                            module, alias.name, None)
+            except ImportError:
                 continue
-            if self._called_name(node) != "run_agreed":
-                continue
-            for inner in ast.walk(node):
-                if isinstance(inner, ast.Call):
-                    agreed.add(id(inner))
-                    wrapped.append(self._called_name(inner))
-                elif isinstance(inner, ast.Attribute):
-                    wrapped.append(inner.attr)
-                elif isinstance(inner, ast.Name):
-                    wrapped.append(inner.id)
-        bare = [self._called_name(node) for node in ast.walk(tree)
-                if isinstance(node, ast.Call) and id(node) not in agreed]
-        return wrapped, bare
+        return namespace
+
+    @classmethod
+    def _resolve(cls, node, namespace, owner):
+        """The object an expression names, or None if it names nothing here.
+
+        Handles a bare name, a dotted chain from a module, and a method
+        reached through ``self``/``opt``/``cls`` -- looked for on the class
+        the call is written in first, since two of these classes have a
+        method of the same name.
+        """
+        if isinstance(node, ast.Name):
+            return namespace.get(node.id)
+        if not isinstance(node, ast.Attribute):
+            return None
+        base = node.value
+        if isinstance(base, ast.Name) and base.id in ("self", "opt", "cls"):
+            ordered = ([owner] if owner is not None else []) + [
+                c for c in cls._owner_classes() if c is not owner]
+            for candidate in ordered:
+                got = getattr(candidate, node.attr, None)
+                if got is not None:
+                    return got
+            return None
+        parent = cls._resolve(base, namespace, owner)
+        return getattr(parent, node.attr, None) if parent is not None else None
+
+    @staticmethod
+    def _agreed_call_ids(tree):
+        """The ids of the call nodes that sit inside a ``run_agreed``.
+
+        By node rather than by name: a second, bare call of something an
+        agreement elsewhere in the same function happens to name is not
+        inside an agreement, and used to read as though it were.
+        """
+        agreed = set()
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "run_agreed"):
+                for inner in ast.walk(node):
+                    if isinstance(inner, ast.Call) and inner is not node:
+                        agreed.add(id(inner))
+        return agreed
+
+    @classmethod
+    def _closure(cls, func):
+        """``func`` and everything it calls outside an agreement.
+
+        Returns [(qualname, function, tree, agreed call ids, namespace)], in
+        the order reached. Only functions mpi-sppy defines are followed: the point is
+        this library's own steps, and the standard library is where the
+        local work being looked for comes *from*.
+        """
+        found, seen = [], set()
+
+        def walk(f):
+            qualname = getattr(f, "__qualname__", None)
+            if qualname is None or qualname in seen:
+                return
+            seen.add(qualname)
+            try:
+                tree = ast.parse(textwrap.dedent(inspect.getsource(f)))
+            except (OSError, TypeError):       # a builtin, or no source
+                return
+            owner = f.__globals__.get(qualname.split(".")[0])
+            namespace = cls._namespace(f, tree)
+            agreed = cls._agreed_call_ids(tree)
+            found.append((qualname, f, tree, agreed, namespace))
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call) or id(node) in agreed:
+                    continue
+                if cls._called_name(node) in cls.AGREE_THEMSELVES:
+                    continue
+                target = cls._resolve(node.func, namespace, owner)
+                module = getattr(target, "__module__", None) or ""
+                if (target is not None and module.startswith("mpisppy")
+                        and not inspect.isclass(target)):
+                    walk(target)
+
+        walk(func)
+        return found
 
     @staticmethod
     def _called_name(node):
@@ -1308,83 +1467,201 @@ class TestEveryCheckpointStepOnThosePathsIsAgreed(unittest.TestCase):
             return func.id
         return ""
 
-    @staticmethod
-    def _checkpointing_calls(func):
-        """The names called on the checkpointing module in ``func``."""
-        tree = ast.parse(textwrap.dedent(inspect.getsource(func)))
-        names = []
+    @classmethod
+    def _checkpointing_calls(cls, func, tree, namespace):
+        """(node, real name) for each checkpointing function called here.
+
+        The name is the function's own, so an import renamed on the way in
+        is reported as what it actually is. Classes are left out: raising
+        ``ckpt.CheckpointMismatch`` is a raise, and the raise test is what
+        has something to say about it.
+        """
+        owner = func.__globals__.get(
+            getattr(func, "__qualname__", "").split(".")[0])
+        out = []
         for node in ast.walk(tree):
-            if (isinstance(node, ast.Call)
-                    and isinstance(node.func, ast.Attribute)
-                    and isinstance(node.func.value, ast.Name)
-                    and node.func.value.id in ("ckpt", "checkpointing")):
-                names.append((node, node.func.attr))
-        return names
+            if not isinstance(node, ast.Call):
+                continue
+            target = cls._resolve(node.func, namespace, owner)
+            if target is None or inspect.isclass(target):
+                continue
+            if getattr(target, "__module__", None) != checkpointing.__name__:
+                continue
+            out.append((node, getattr(target, "__name__",
+                                      cls._called_name(node))))
+        return out
+
+    # ---- the properties ------------------------------------------------
 
     def test_no_checkpointing_step_is_called_outside_an_agreement(self):
-        for name, func in self.PATHS:
-            wrapped, bare = self._agreed_and_bare(func)
-            for _, called in self._checkpointing_calls(func):
-                if (called in self.AGREE_THEMSELVES
-                        or called in self.CANNOT_FAIL_ON_ONE_RANK
-                        or called in wrapped):
-                    continue
-                with self.subTest(path=name, step=called):
-                    self.fail(
-                        f"{name} calls checkpointing.{called} outside "
-                        f"run_agreed. If it agrees across the ranks itself, "
-                        f"or reads nothing a single rank can fail at, say so "
-                        f"by naming it in AGREE_THEMSELVES or "
-                        f"CANNOT_FAIL_ON_ONE_RANK; otherwise the rank it "
-                        f"fails on leaves the rest of the cylinder waiting "
-                        f"in the next collective.")
+        for name, entry in self.PATHS:
+            for qualname, func, tree, agreed, ns in self._closure(entry):
+                for node, called in self._checkpointing_calls(func, tree, ns):
+                    if (called in self.AGREE_THEMSELVES
+                            or called in self.CANNOT_FAIL_ON_ONE_RANK
+                            or id(node) in agreed):
+                        continue
+                    with self.subTest(path=name, function=qualname,
+                                      step=called):
+                        self.fail(
+                            f"{qualname}, reached from {name}, calls "
+                            f"checkpointing.{called} outside run_agreed. If "
+                            f"it agrees across the ranks itself, or reads "
+                            f"nothing a single rank can fail at, say so by "
+                            f"naming it in AGREE_THEMSELVES or "
+                            f"CANNOT_FAIL_ON_ONE_RANK; otherwise the rank it "
+                            f"fails on leaves the rest of the cylinder "
+                            f"waiting in the next collective.")
 
     def test_no_path_does_a_rank_s_own_file_handling_inline(self):
-        for name, func in self.PATHS:
-            _, bare = self._agreed_and_bare(func)
-            for called in bare:
-                if called in self.LOCAL_WORK:
-                    with self.subTest(path=name, call=called):
+        for name, entry in self.PATHS:
+            for qualname, func, tree, agreed, ns in self._closure(entry):
+                owner = func.__globals__.get(qualname.split(".")[0])
+                for node in ast.walk(tree):
+                    if not isinstance(node, ast.Call) or id(node) in agreed:
+                        continue
+                    called = self._called_name(node)
+                    target = self._resolve(node.func, ns, owner)
+                    module = getattr(target, "__module__", None)
+                    if (module not in self.LOCAL_WORK_MODULES
+                            and called not in self.LOCAL_WORK_METHODS):
+                        continue
+                    with self.subTest(path=name, function=qualname,
+                                      call=called):
                         self.fail(
-                            f"{name} calls {called}() outside run_agreed. "
-                            f"Reading or writing a file is this rank's own "
-                            f"work and can fail on this rank alone; move it "
-                            f"inside the agreement.")
+                            f"{qualname}, reached from {name}, calls "
+                            f"{called}() outside run_agreed. Reading or "
+                            f"writing a file is this rank's own work and can "
+                            f"fail on this rank alone; move it inside the "
+                            f"agreement.")
 
-    def test_the_sweep_covers_every_agreement_on_these_paths(self):
-        """Each ``run_agreed`` on the paths has a step in the driver's list.
+    def test_no_path_raises_on_one_rank_alone(self):
+        """Every raise reached from these paths is one every rank makes.
 
-        Without this, an agreement added later is never exercised by the
-        sweep above and its first failure is a hung job.
+        The refusals these paths make are pure functions of the options and
+        the cylinder's class, so they arrive on every rank or on none. That
+        is a property of the ones written today, not of raising, and nothing
+        made it hold: this asks that each one be named, with what makes it
+        rank-independent, so that a raise which reads a file or a model has
+        to be argued for rather than added.
         """
-        for name, func in self.PATHS:
-            wrapped, _ = self._agreed_and_bare(func)
-            # What is left after the agreement's own name, the module it is
-            # reached through and the objects handed to it: what it agrees on.
-            agreements = [c for c in wrapped
-                          if c and c not in ("run_agreed", "ckpt",
-                                             "checkpointing", "opt", "self")]
-            if not agreements:
-                continue
-            covered = [c for c in agreements
-                       if c in agreement_driver.STEPS
-                       or self._reaches_a_step(c)]
-            with self.subTest(path=name):
-                self.assertTrue(
-                    covered,
-                    msg=f"{name} agrees on {agreements}, none of which "
-                        f"multirank_agreement_driver.STEPS can make fail, so "
-                        f"nothing checks that this agreement works")
+        counted = {}
+        for name, entry in self.PATHS:
+            for qualname, _, tree, _agreed, _ns in self._closure(entry):
+                raises = [node for node in ast.walk(tree)
+                          if isinstance(node, ast.Raise)]
+                if raises:
+                    counted[qualname] = (name, len(raises))
 
-    @staticmethod
-    def _reaches_a_step(called):
-        """Whether an agreed call runs one of the driver's steps inside it."""
-        func = getattr(Checkpointer, called, None) \
-            or getattr(PHBase, called, None)
-        if func is None:
-            return False
-        source = inspect.getsource(func)
-        return any(step in source for step in agreement_driver.STEPS)
+        for qualname, (name, count) in sorted(counted.items()):
+            declared = self.RANK_INDEPENDENT_RAISES.get(qualname)
+            with self.subTest(path=name, function=qualname):
+                self.assertIsNotNone(
+                    declared,
+                    msg=f"{qualname}, reached from {name} outside any "
+                        f"agreement, raises. If what it raises on is a file, "
+                        f"a model, or anything else only this rank can see, "
+                        f"the rank it fires on leaves the others waiting in "
+                        f"the next collective -- put it inside run_agreed. "
+                        f"If every rank really does raise together, name it "
+                        f"in RANK_INDEPENDENT_RAISES with what makes that "
+                        f"true.")
+                self.assertEqual(
+                    count, declared[0],
+                    msg=f"{qualname} now raises {count} times where "
+                        f"RANK_INDEPENDENT_RAISES accounts for "
+                        f"{declared[0]}, said to be rank-independent because "
+                        f"{declared[1]} A new raise here needs the same "
+                        f"argument made for it.")
+
+        self.assertEqual(
+            sorted(self.RANK_INDEPENDENT_RAISES), sorted(counted),
+            msg="RANK_INDEPENDENT_RAISES names a function these paths no "
+                "longer reach, or does not name one they do")
+
+    def test_every_agreement_is_exercised_by_the_driver(self):
+        """Each ``run_agreed`` on these paths has a step that breaks it.
+
+        Per agreement, not per path: a path with two agreements and one step
+        used to pass, and three of the eight steps could be dropped from the
+        driver with nothing going red.
+        """
+        for name, entry in self.PATHS:
+            for qualname, func, tree, _agreed, ns in self._closure(entry):
+                agreements = [node for node in ast.walk(tree)
+                              if isinstance(node, ast.Call)
+                              and isinstance(node.func, ast.Attribute)
+                              and node.func.attr == "run_agreed"]
+                # In source order, which is the order they are declared in.
+                agreements.sort(key=lambda node: (node.lineno, node.col_offset))
+                declared = self.AGREEMENTS.get(qualname, ())
+                with self.subTest(path=name, function=qualname):
+                    self.assertEqual(
+                        len(agreements), len(declared),
+                        msg=f"{qualname} has {len(agreements)} agreement(s) "
+                            f"and AGREEMENTS names {len(declared)} step(s) "
+                            f"for it. An agreement the driver cannot break "
+                            f"is one whose first failure is a hung job.")
+                for node, step in zip(agreements, declared):
+                    with self.subTest(path=name, function=qualname,
+                                      step=step):
+                        self.assertIn(
+                            step, agreement_driver.STEPS,
+                            msg=f"{qualname} says its agreement is exercised "
+                                f"by the step '{step}', which the driver "
+                                f"does not have")
+                        self.assertTrue(
+                            self._agreement_runs(node, func, ns, step),
+                            msg=f"the step '{step}' breaks "
+                                f"{agreement_driver.STEPS[step][1]}, which "
+                                f"this agreement in {qualname} does not run, "
+                                f"so breaking it exercises something else")
+
+    def test_every_step_the_driver_breaks_belongs_to_one_agreement(self):
+        """And the other direction: a step named twice, or named for an
+        agreement that is gone, is a step exercising something other than
+        what it is written down as exercising."""
+        claimed = [step for steps in self.AGREEMENTS.values()
+                   for step in steps]
+        self.assertEqual(sorted(claimed), sorted(set(claimed)),
+                         msg=f"a step is claimed by two agreements: {claimed}")
+        self.assertEqual(
+            sorted(claimed), sorted(agreement_driver.STEPS),
+            msg="the driver's steps and the agreements they are written down "
+                "against have parted company")
+
+    @classmethod
+    def _agreement_runs(cls, node, func, namespace, step):
+        """Whether the work this agreement hands over runs the driver's step.
+
+        The step is broken by replacing a checkpointing attribute, so the
+        question is whether that attribute is called inside the agreement --
+        directly, or in the method the agreement hands over by name.
+        """
+        attribute = agreement_driver.STEPS[step][1]
+        owner = func.__globals__.get(
+            getattr(func, "__qualname__", "").split(".")[0])
+        for inner in ast.walk(node):
+            if isinstance(inner, ast.Call):
+                target = cls._resolve(inner.func, namespace, owner)
+                if getattr(target, "__name__", None) == attribute:
+                    return True
+            elif isinstance(inner, ast.Attribute):
+                handed = cls._resolve(inner, namespace, owner)
+                module = getattr(handed, "__module__", None) or ""
+                if (handed is None or not module.startswith("mpisppy")
+                        or inspect.isclass(handed)):
+                    continue
+                for qualname, _, tree, _agreed, inner_ns in cls._closure(handed):
+                    inner_owner = inner_ns.get(qualname.split(".")[0])
+                    for call in ast.walk(tree):
+                        if not isinstance(call, ast.Call):
+                            continue
+                        target = cls._resolve(call.func, inner_ns, inner_owner)
+                        if getattr(target, "__name__", None) == attribute:
+                            return True
+        return False
+
 
 if __name__ == "__main__":
     unittest.main()
