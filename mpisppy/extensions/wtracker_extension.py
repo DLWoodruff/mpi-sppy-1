@@ -34,6 +34,9 @@ class Wtracker_extension(mpisppy.extensions.extension.Extension):
         self.options = opt.options["wtracker_options"]
         # TBD: more graceful death if options are bad
         self.wlen = self.options["wlen"]
+        #: The wlen the checkpoint this run resumed from was written with,
+        #: or None on a run that did not resume.
+        self._carried_wlen = None
 
     def pre_iter0(self):
         pass
@@ -94,9 +97,19 @@ class Wtracker_extension(mpisppy.extensions.extension.Extension):
         if getattr(self, "_size_tocced", False):
             return
         self._size_tocced = True
-        values = sum(len(w) for sets in carried.values() for w in sets.values())
+        # This runs at the *first* write, where the window holds one set and
+        # every write after it carries wlen+1. A set is the same size every
+        # iteration -- this rank's scenarios by their nonants -- so the
+        # window's cost is that one set multiplied out, which is arithmetic
+        # rather than an estimate. Counting what happened to be carried at
+        # this one write reported 1/(wlen+1) of what the option costs, which
+        # is the opposite of the point: at the wlen of 1000 above it turned
+        # gigabytes into megabytes.
+        sets = max(len(carried), self.wlen + 1)
+        per_set = sum(len(w) for w in next(iter(carried.values())).values())
+        values = sets * per_set
         global_toc(
-            f"Wtracker carries {len(carried)} W set(s) (wlen {self.wlen}) "
+            f"Wtracker carries the last {sets} W set(s) (wlen {self.wlen}) "
             f"into every checkpoint: {values} values, about "
             f"{values * 8 / 1024:.1f} KiB per rank per write.",
             self.opt.cylinder_rank == 0)
@@ -105,19 +118,11 @@ class Wtracker_extension(mpisppy.extensions.extension.Extension):
         carried = state["local_Ws"]
         self.wtracker.local_Ws.update(carried)
         self.wtracker.ph_iter = state["ph_iter"]
-        written = state.get("wlen")
-        if written is not None and written < self.wlen:
-            # The window carried was sized by the run that wrote it, so a
-            # longer one asked for here cannot be filled from the earlier
-            # leg. Left unsaid, the report reads as the study having gone
-            # quiet rather than as the two legs having been asked different
-            # questions. A checkpoint taken before the window had filled is
-            # a different matter and stays silent: the report says "not
-            # enough iterations tracked" for itself.
-            return (f"the checkpoint was written with wlen {written} and "
-                    f"this run asks for {self.wlen}, so its report covers "
-                    f"the shorter window the earlier leg recorded rather "
-                    f"than the one an uninterrupted run would have")
+        # Kept rather than judged here: whether a window wider than the
+        # checkpoint's can be filled depends on how far this leg runs, and
+        # this hook runs at the end of Iter0. See
+        # _say_why_the_window_is_short.
+        self._carried_wlen = state.get("wlen")
         return None
 
     def post_everything(self):
@@ -127,9 +132,40 @@ class Wtracker_extension(mpisppy.extensions.extension.Extension):
         # report_by_moving_stats's own default: unset, the three reports were
         # named after a stringified None ("None_summary_iter5_rank0.txt").
         file_prefix = self.options.get("file_prefix") or ""
-        self.wtracker.report_by_moving_stats(self.wlen,
-                                             reportlen=reportlen,
-                                             stdevthresh=stdevthresh,
-                                             file_prefix=file_prefix)
+        shortfall = self.wtracker.report_by_moving_stats(
+            self.wlen,
+            reportlen=reportlen,
+            stdevthresh=stdevthresh,
+            file_prefix=file_prefix)
+        self._say_why_the_window_is_short(shortfall)
+
+    def _say_why_the_window_is_short(self, shortfall):
+        """Name the earlier leg's narrower window when that is what cost the
+        report.
+
+        Only the report knows whether the window was filled. A resumed leg
+        that runs long enough fills a wider window on its own, whatever the
+        leg before it was asked for, and its report is then exactly the one
+        an uninterrupted run of the same length would have written. Asked at
+        the restore instead -- which happens at the end of Iter0, before this
+        leg has run an iteration -- this warned every such run that its
+        report was short while the report it went on to write was complete.
+
+        A window the *same* wlen could not fill stays silent: the report says
+        "not enough iterations tracked" for itself, and that case is the
+        study not having run long enough rather than the two legs having been
+        asked different questions.
+        """
+        if shortfall is None or self._carried_wlen is None:
+            return
+        if self._carried_wlen >= self.wlen:
+            return
+        global_toc(
+            f"WARNING: Wtracker_extension: no report for window len "
+            f"{self.wlen}. The checkpoint was written with wlen "
+            f"{self._carried_wlen}, so it carried that window rather than "
+            f"this one, and this leg did not run long enough to fill the "
+            f"wider one on its own.",
+            self.opt.cylinder_rank == 0)
 
         
