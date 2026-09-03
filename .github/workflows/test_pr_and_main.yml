@@ -196,6 +196,10 @@ jobs:
         run: |
           coverage run $COV_ARGS -m pytest mpisppy/tests/test_checkpoint_extensions.py -v
 
+      - name: Test checkpoint/resume of the xhat spoke cursor
+        run: |
+          coverage run $COV_ARGS -m pytest mpisppy/tests/test_checkpoint_spoke_cursor.py -v
+
       # These two spawn their own mpiexec jobs -- one per A/B leg, in a fresh
       # process, which is what the design's acceptance gate asks for and what
       # a stopped study really does -- so they run under plain pytest.
@@ -206,6 +210,14 @@ jobs:
       - name: Test checkpoint/resume on multi-rank cylinders
         run: |
           coverage run $COV_ARGS -m pytest mpisppy/tests/test_checkpoint_multirank.py -v
+
+      # Same shape, on a user's whole option profile rather than one
+      # mechanism. The uc case takes about a minute per leg; it is skipped
+      # where egret is missing, and here, because the solvers pip installs
+      # are community editions that refuse a model that size.
+      - name: Test checkpoint/resume on a production option profile
+        run: |
+          coverage run $COV_ARGS -m pytest mpisppy/tests/test_checkpoint_profile.py -v
 
       - name: Test prox_approx end-to-end
         run: |

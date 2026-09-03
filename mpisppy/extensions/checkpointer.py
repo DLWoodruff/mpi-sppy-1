@@ -68,6 +68,12 @@ untouched. The last iteration of an exhausted iteration limit is always
 written, because raising ``--max-iterations`` and resuming is a supported
 workflow and that iterate is known-good and already in memory.
 
+``--checkpoint-before-seconds S`` covers the stop K does not: a run that ends
+against a wall clock rather than at an iteration limit, at an iteration that
+is not a multiple of K. It adds one extra checkpoint point, at the end of the
+last iteration that is expected to finish before S seconds have elapsed. See
+``_deadline_is_near``.
+
 A checkpoint therefore describes a *completed PH iteration*. A run that ends
 before finishing iteration 1 publishes nothing: no iteration completed, so
 there is no iterate to resume from. Iteration 0 is deliberately not a
@@ -95,23 +101,31 @@ and the spokes.
 **Multi-rank cylinders.** A hub spread over several ranks holds its scenarios
 in slices, so one checkpoint generation spans all of them and is published only
 once every rank's files are on disk. The write is therefore collective (see
-``mpisppy/utils/checkpointing.py``), and what makes that safe is that the
-trigger below is a pure function of the absolute iteration number and the
-iteration limit -- identical on every rank of a synchronous PH cylinder, so the
-ranks reach the write together without being asked. A trigger that depended on
-anything rank-local (elapsed wall-clock, say) would have to be put through
-``allreduce_or`` first or it would deadlock the write.
+``mpisppy/utils/checkpointing.py``), and the iteration-count triggers below are
+safe in it because they are pure functions of the absolute iteration number and
+the iteration limit -- identical on every rank of a synchronous PH cylinder, so
+the ranks reach the write together without being asked.
+
+The deadline trigger is not: elapsed wall clock is rank-local, and a rank that
+decided to write alone would hang the cylinder at the write barrier for the
+rest of the job. So it is put through ``allreduce_or`` before it is believed,
+and the cheap iteration-count tests are evaluated *first* so that the ranks
+either all skip that collective or all reach it. Any trigger added later has
+to do the same.
 
 The *spoke* incumbent write needs none of that. Each rank writes only its own
 file, and the incumbent objective that gates the write comes from an
 all-reduced objective evaluation, so the ranks are already in step; the design
 deliberately keeps spokes uncoordinated with the hub and with each other
-(section 9, item 6).
+(section 9, item 6). A spoke has no use for the cadence or deadline triggers
+either -- it already writes whenever it has something new to write -- so both
+are hub-only and a spoke simply ignores them.
 
 See ``doc/designs/checkpointing_design.md``.
 """
 
 import os
+import time
 
 from mpisppy import global_toc
 from mpisppy.extensions.extension import Extension
@@ -141,6 +155,18 @@ class Checkpointer(Extension):
                 f"{self.every}. It counts completed iterations between "
                 f"writes; 1 writes at every iteration."
             )
+
+        #: --checkpoint-before-seconds S, or None. See _deadline_is_near.
+        before = options.get("checkpoint_before_seconds", None)
+        self.before_seconds = None if before is None else float(before)
+        if self.before_seconds is not None and self.before_seconds <= 0:
+            raise RuntimeError(
+                f"--checkpoint-before-seconds must be positive, got "
+                f"{self.before_seconds}. It is a wall-clock deadline measured "
+                f"from the start of this run."
+            )
+        #: Set once the deadline trigger has fired, so it fires at most once.
+        self._before_seconds_fired = False
 
         # Restore-only: --resume-from without --checkpoint-dir. The hub does
         # not need the extension for that (its resume branch is in Iter0), but
@@ -180,7 +206,15 @@ class Checkpointer(Extension):
         # checkpoint it resumed from.
         from mpisppy.opt.ph import PH
         from mpisppy.utils.xhat_eval import Xhat_Eval
-        self.spoke_mode = not isinstance(opt, PH)
+        # A third kind of cylinder: one that runs PH itself without being the
+        # hub -- relaxed_ph and ph_dual. Its opt is a PHBase, which is neither
+        # the hub's PH nor an xhat spoke's Xhat_Eval, so the cylinder builder
+        # says which it is rather than leaving it to be inferred. It writes W
+        # rather than models (see checkpointing.dual_spoke_state) and restores
+        # it in post_iter0.
+        self.dual_spoke_mode = \
+            options.get("checkpoint_role", "hub") == "dual_spoke"
+        self.spoke_mode = not self.dual_spoke_mode and not isinstance(opt, PH)
         if self.spoke_mode and not isinstance(opt, Xhat_Eval):
             raise RuntimeError(
                 f"Checkpointing supports the synchronous PH hub and the xhat "
@@ -190,13 +224,27 @@ class Checkpointer(Extension):
 
         #: Set once a restored incumbent still needs publishing to the hub.
         self._publish_restored_bound = None
+        #: The iteration a dual cylinder's restored W was written at, or None
+        #: if it started from W=0. Read by tests, which otherwise cannot tell
+        #: a restored W from one the cylinder converged to on its own.
+        self.restored_dual_generation = None
         #: The incumbent objective this spoke restored from disk, or None if
         #: it started without one. Read by tests, which otherwise cannot tell
         #: a restored incumbent from one the spoke happened to re-find.
         self.restored_incumbent_obj = None
+        #: The loop cursor this spoke restored, held until the loop exists to
+        #: receive it (the restore runs in pre_iter0, the loop is built after).
+        #: Collected by XhatInnerBoundBase._checkpointed_loop_state.
+        self.restored_loop_state = None
+        #: Likewise this spoke's extension state, handed over at the end of
+        #: xhat_prep so post_iter0 cannot overwrite it.
+        self.restored_extension_state = None
         #: The incumbent objective the last write recorded, so an unchanged
         #: incumbent is not rewritten on every pass of a loop that spins.
         self._last_written_obj = None
+        #: Likewise for the loop cursor, which moves independently of the
+        #: incumbent -- most cursor moves do not improve on the best xhat.
+        self._last_written_loop_progress = None
 
         if not self.write_enabled:
             # Nothing below is about reading, and a restore-only run must not
@@ -220,7 +268,7 @@ class Checkpointer(Extension):
         ``checkpointing.run_agreed``.
         """
         opt = self.opt
-        if not self.spoke_mode:
+        if not self.spoke_mode and not self.dual_spoke_mode:
             ckpt.require_dill(self.backend)
 
         # Two scenario names that sanitize to the same file name would
@@ -232,6 +280,11 @@ class Checkpointer(Extension):
         ckpt.probe_directory_is_writable(opt, self.ckpt_dir)
 
     def pre_iter0(self):
+        if self.dual_spoke_mode:
+            # Nothing to prove: this cylinder writes no models, so there is
+            # no dill to probe. Its own restore waits for post_iter0, by
+            # which time PH_Prep has attached the W it writes into.
+            return
         if self.spoke_mode:
             # xhat_prep calls this once, before the spoke's loop starts, which
             # is the spoke's equivalent of the hub's resume branch in Iter0.
@@ -243,6 +296,89 @@ class Checkpointer(Extension):
         # that only found out at its first write would lose exactly the state
         # checkpointing exists to preserve.
         ckpt.probe_model_is_dillable(self.opt)
+
+    def post_iter0(self):
+        """Put a dual cylinder's W back, once there is a W to put it in.
+
+        Iter0 has just solved this cylinder's subproblems from W = 0 and is
+        about to hand the loop an iterate that owes nothing to the study.
+        Overwriting it here rather than skipping the solve keeps the cylinder
+        ordinary -- solvers created, bound reported, prox terms spliced -- at
+        the cost of one solve round that a resumed run throws away.
+        """
+        if not self.dual_spoke_mode:
+            return
+        resume_from = self.opt.options.get("resume_from", None)
+        if not resume_from:
+            return
+        cylinder, ordinal = self._spoke_identity()
+        rank0 = self.opt.cylinder_rank == 0
+        # Collective, for the reason given at the xhat spoke's load.
+        state = ckpt.run_agreed(
+            self.opt,
+            lambda: ckpt.load_dual_spoke_state(self.opt, resume_from,
+                                               cylinder, ordinal),
+            "read their checkpointed dual weights, so none of them restores "
+            "any")
+        # Collective, and reached whether or not this rank found a file: W is
+        # per rank, but the iteration it belongs to is the cylinder's, and
+        # ranks restoring different iterations blend them in Compute_Xbar.
+        # See agree_dual_spoke_restore.
+        state, disagreement = ckpt.agree_dual_spoke_restore(self.opt, state)
+        if disagreement is not None:
+            global_toc(f"WARNING: {disagreement}; {cylinder} starts from "
+                       f"W=0", rank0)
+            return
+        if state is None:
+            global_toc(f"No checkpointed dual weights for {cylinder} in "
+                       f"{resume_from}; this cylinder starts from W=0", rank0)
+            return
+        was = state.get("class_count")
+        now = self._class_ordinal_and_count()[1]
+        if was is not None and was != now:
+            global_toc(
+                f"WARNING: the checkpoint was written by a wheel carrying "
+                f"{was} {cylinder} cylinder(s) and this run has {now}, so "
+                f"this cylinder may be restoring dual weights that belonged "
+                f"to a different one.", rank0)
+        # Agreed like the load: putting W back resolves the file's entries
+        # against the nonants of this rank's own models, so it is a refusal
+        # one rank can make while the others walk into Compute_Xbar's
+        # allreduce. The agreement above has already settled that every rank
+        # has a state, so all of them reach this.
+        ckpt.run_agreed(
+            self.opt,
+            lambda: ckpt.restore_dual_spoke_state(self.opt, state),
+            "put their checkpointed dual weights back on their models, so "
+            "none of them restores any")
+        self.restored_dual_generation = state["generation"]
+        global_toc(f"Restored the checkpointed dual weights for {cylinder} "
+                   f"(written at its iteration {state['generation']})", rank0)
+
+    def _dual_spoke_checkpoint(self):
+        """Write W at the end of a completed iteration of this cylinder.
+
+        Every iteration, with no cadence to divide it: the file is a couple
+        of floats per nonanticipative variable, and the iteration that
+        produced it was a round of subproblem solves. Failures warn for the
+        same reason the other cylinders' do -- losing this file costs a
+        resumed run a dual restart, which is not worth killing a running
+        cylinder over.
+        """
+        if not self.write_enabled:
+            return
+        try:
+            cylinder, ordinal = self._spoke_identity()
+            ckpt.write_dual_spoke_state(
+                self.opt, self.ckpt_dir, cylinder, ordinal,
+                generation=int(getattr(self.opt, "_PHIter", 0)),
+                class_count=self._class_ordinal_and_count()[1])
+        except Exception as exc:
+            global_toc(
+                f"WARNING: this cylinder could not write its dual weights "
+                f"({type(exc).__name__}); the run continues and the next "
+                f"iteration will try again.\n{exc}",
+                self.opt.cylinder_rank == 0)
 
     def _spoke_identity(self):
         """(cylinder name, ordinal among cylinders of that class).
@@ -295,13 +431,21 @@ class Checkpointer(Extension):
         rank0 = self.opt.cylinder_rank == 0
         # Collective: the load refuses per rank -- it reads the file named
         # after this rank and checks it against the scenarios this rank owns
-        # -- and the spoke's loop is collective, so a rank-local refusal
-        # would strand the others in it. Every rank refuses or none does.
+        # -- and everything after it is collective, so a rank-local refusal
+        # would strand the others there. Every rank refuses or none does.
         state = ckpt.run_agreed(
             self.opt,
             lambda: ckpt.load_spoke_incumbent(self.opt, resume_from,
                                               cylinder, ordinal),
             "read their checkpointed incumbent, so none of them restores one")
+        # Collective, and reached whether or not this rank found a file: the
+        # cursor and the bound in there belong to the cylinder, not to a
+        # rank, and ranks that resume from different cursors go on to
+        # broadcast from different roots. See agree_spoke_restore.
+        state, disagreement = ckpt.agree_spoke_restore(self.opt, state)
+        if disagreement is not None:
+            global_toc(f"WARNING: {disagreement}", rank0)
+            return
         if state is not None:
             # The ordinal is stable when an unrelated cylinder comes or goes,
             # but not when one of two same-class spokes does: the survivor's
@@ -317,11 +461,12 @@ class Checkpointer(Extension):
                     f"this spoke may be restoring an incumbent that belonged "
                     f"to a different one. It is a feasible solution for the "
                     f"same model either way.", rank0)
-        # Collective too, and reached whether or not this rank found a file:
-        # putting the values back is per rank -- it resolves the file's
-        # variable names against this rank's own models -- so it is a refusal
-        # one rank can make alone, and the ranks that did restore would carry
-        # on into the loop without it.
+        # Agreed too: putting the values back is per rank -- it resolves the
+        # file's variable names against this rank's own models -- so it is a
+        # refusal one rank can make alone, and the ranks that did restore
+        # would carry on into the loop without it. The agreement above has
+        # already settled whether there is a state to restore, so every rank
+        # reaches this with the same answer.
         obj = ckpt.run_agreed(
             self.opt,
             lambda: None if state is None
@@ -334,17 +479,27 @@ class Checkpointer(Extension):
             return
         self.restored_incumbent_obj = obj
         self.opt.spcomm.best_inner_bound = state["best_inner_bound"]
-        # _last_written_obj means "what the file in self.ckpt_dir already
-        # holds", so it may only be seeded when that is the file we just read.
-        # Resuming into a *different* directory is the documented
+        # Held rather than applied: the spoke's loop -- and the cursor this
+        # describes -- is built after pre_iter0, so it collects this itself
+        # once it exists. Older files have no such key.
+        self.restored_loop_state = state.get("loop_state")
+        # Held for the same reason, and handed over at the end of xhat_prep:
+        # post_iter0 has not run yet, and it is where an extension rebuilds
+        # its bookkeeping from the models.
+        self.restored_extension_state = state.get("extension_state")
+        # These two mean "what the file in self.ckpt_dir already holds", so
+        # they may only be seeded when that is the file we just read. Resuming
+        # into a *different* directory is the documented
         # stop-today-resume-tomorrow flow, and there this spoke has written
-        # nothing yet: seeding it there makes the skip test below decline to
+        # nothing yet: seeding them there makes the skip test below decline to
         # write until the spoke strictly improves on what it restored, so a
         # study whose xhat has stopped improving -- a converged one, the case
         # where the answer is worth the most -- publishes no incumbent at all
         # and the next resume starts without one, with exit code 0 throughout.
         if self.write_enabled and self._same_directory(resume_from):
             self._last_written_obj = obj
+            self._last_written_loop_progress = \
+                self.opt.spcomm.loop_state_progress(self.restored_loop_state)
         # The hub learns bounds only from what a spoke sends, so a restored
         # incumbent that is never published leaves the hub reporting an
         # infinite inner bound -- and its gap and convergence tests reading
@@ -407,9 +562,65 @@ class Checkpointer(Extension):
         workflow, and dropping the last K-1 iterations of a run that ended by
         finishing its budget would lose work that is known to be coherent and
         is sitting in memory.
+
+        Failing all that, the deadline trigger gets a look. The order matters
+        for more than speed: everything above is a pure function of the
+        iteration number, so every rank of a multi-rank cylinder answers it
+        the same way, and the ranks either all skip the collective below or
+        all reach it.
         """
         iteration = int(getattr(self.opt, "_PHIter", 0))
-        return iteration % self.every == 0 or self._is_final_iteration()
+        if iteration % self.every == 0 or self._is_final_iteration():
+            return True
+        return self._deadline_is_near()
+
+    def _deadline_is_near(self):
+        """``--checkpoint-before-seconds S``: is there time for another one?
+
+        The gap this closes is the one ``--checkpoint-every-iterations K``
+        opens. At K > 1 a run against a hard wall clock -- a scheduler slot, a
+        ``--time-limit`` -- can stop at an iteration that is not a multiple of
+        K, and then the newest checkpoint is up to K-1 iterations old. If K is
+        larger than the number of iterations the run ever completes, there is
+        no checkpoint at all. So at the end of each completed iteration this
+        asks whether *another* iteration would carry the run past S seconds of
+        elapsed wall clock, and writes now if it would.
+
+        The estimate of "another iteration" is the last one measured
+        (``PHBase._last_iteration_seconds``), seeded by iteration 0. That is
+        the whole model: mpi-sppy does not pad it, and S is not adjusted for
+        the write it triggers. The write's own cost is bracketed by ``toc`` in
+        ``_write`` so it can be read off a log rather than guessed at, and
+        leaving room for it is the user's to do when choosing S.
+
+        **The test goes through allreduce_or**, because elapsed wall clock is
+        rank-local and the hub write is a collective bracketed by barriers: a
+        rank that decided to write while another decided not to would hang the
+        cylinder for the rest of the job. Everything that could return early
+        here is identical on every rank -- the option itself, and a latch set
+        only from the all-reduced answer -- so the ranks arrive at the
+        collective together.
+
+        Latched afterwards because the deadline passes only once. Without it
+        every subsequent iteration would also be past S and would write, which
+        is the per-iteration cost K was set to avoid, at the point in the run
+        where the user has said time is short.
+        """
+        if self.before_seconds is None or self._before_seconds_fired:
+            return False
+        last = getattr(self.opt, "_last_iteration_seconds", None)
+        elapsed = time.perf_counter() - self.opt.start_time
+        near = self.opt.allreduce_or(
+            elapsed + (0.0 if last is None else last) >= self.before_seconds)
+        if near:
+            self._before_seconds_fired = True
+            global_toc(
+                f"Within one iteration of --checkpoint-before-seconds "
+                f"{self.before_seconds} ({elapsed:.1f} seconds elapsed, last "
+                f"iteration {0.0 if last is None else last:.1f}); "
+                f"checkpointing now",
+                self.opt.cylinder_rank == 0)
+        return near
 
     def maybe_checkpoint(self):
         """Write the checkpoint if this iteration is a checkpoint point.
@@ -443,6 +654,9 @@ class Checkpointer(Extension):
         """
         if self.spoke_mode:
             self._spoke_checkpoint()
+            return
+        if self.dual_spoke_mode:
+            self._dual_spoke_checkpoint()
             return
         if not self.write_enabled:
             return
@@ -481,12 +695,18 @@ class Checkpointer(Extension):
         global_toc(f"Checkpoint written at iteration {generation}", rank0)
 
     def _spoke_checkpoint(self):
-        """Publish a restored bound, then write the incumbent if it improved.
+        """Publish a restored bound, then write if anything worth keeping moved.
 
         Called once per pass of a loop that spins while it waits on the hub,
-        so the common case has to be cheap: comparing two floats and
-        returning. A write happens only when the incumbent objective differs
-        from the one already on disk.
+        so the common case has to be cheap: comparing a float and a small dict
+        and returning.
+
+        Two things can move. The incumbent improves rarely. The **loop cursor**
+        moves whenever the spoke tries another scenario, which is more often --
+        but every cursor move is the result of a subproblem solve, so a small
+        pickle and a rename per move is negligible against what caused it. A
+        pass that solves nothing writes nothing, which is the case that has to
+        stay cheap and does.
 
         Failures warn rather than raise, for the hub's reason and one more:
         this file is an optimization. Losing it costs a resumed run the
@@ -510,13 +730,29 @@ class Checkpointer(Extension):
             return
 
         obj = getattr(self.opt, "best_solution_obj_val", None)
-        if obj is None or obj == self._last_written_obj:
+        if obj is None:
+            # Nothing to write yet: the file carries a solution, and the
+            # cursor rides along with it rather than on its own.
+            return
+        loop_state = spoke.checkpoint_loop_state()
+        # Compared on the progress projection rather than the whole state.
+        # xhatshuffle's loop state carries xh_iter, which counts passes of a
+        # loop that spins while it waits on the hub, so it differs on every
+        # pass whether or not anything was solved -- and comparing it made a
+        # pass that solves nothing write the incumbent, pickle and rename the
+        # file and fsync the directory. Measured at 0.115 ms a pass on farmer
+        # over tmpfs: about 8,700 writes a second, per spoke rank, silently,
+        # since the toc below only speaks when the objective improved.
+        progress = spoke.loop_state_progress(loop_state)
+        if (obj == self._last_written_obj
+                and progress == self._last_written_loop_progress):
             return
         try:
             cylinder, ordinal = self._spoke_identity()
             path = ckpt.write_spoke_incumbent(
                 self.opt, self.ckpt_dir, cylinder, ordinal,
                 best_inner_bound=getattr(spoke, "best_inner_bound", None),
+                loop_state=loop_state,
                 class_count=self._class_ordinal_and_count()[1])
         except Exception as exc:
             global_toc(
@@ -527,7 +763,13 @@ class Checkpointer(Extension):
             return
         if path is None:
             return
+        improved = obj != self._last_written_obj
         self._last_written_obj = obj
+        self._last_written_loop_progress = progress
+        if not improved:
+            # The cursor moved but the answer did not. Worth writing, not
+            # worth a line in the log every time the spoke tries a scenario.
+            return
         # One line, not the pair the hub prints. The pair exists to measure a
         # write whose cost a user has to trade off against checkpoint
         # frequency; this write has no frequency knob and costs a rename.

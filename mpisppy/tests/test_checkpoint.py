@@ -31,6 +31,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import types
 import unittest
 from unittest import mock
@@ -80,6 +81,20 @@ def _options(max_iters, ckpt_dir=None, resume_from=None, **overrides):
 
 #: The iteration at which ClockRewinder trips the --time-limit break.
 _LATE_STOP_ITERATION = 3
+
+
+def _strip_leaf_key(ckpt_dir, key):
+    """Delete a key from the published leaf file, standing in for a checkpoint
+    written before that key existed."""
+    generation = _published_generation(ckpt_dir)
+    gen_dir = os.path.join(ckpt_dir, checkpointing.HUB_SUBDIR,
+                           checkpointing._generation_dirname(generation))
+    path = os.path.join(gen_dir, checkpointing._leaf_filename(0))
+    with open(path, "rb") as f:
+        leaf = pickle.load(f)
+    del leaf[key]
+    with open(path, "wb") as f:
+        pickle.dump(leaf, f)
 
 
 def _published_generation(ckpt_dir):
@@ -172,6 +187,56 @@ class ClockRewinder(Extension):
             self.opt.start_time -= (self.opt.options["time_limit"] + 1.0)
 
 
+class DeadlineApproacher(Extension):
+    """Put the run one iteration away from a deadline, deterministically.
+
+    `--checkpoint-before-seconds` reads two things: how much wall clock has
+    gone, and what the last iteration cost. A test cannot wait out a real
+    deadline, and racing one on farmer would make the trigger fire whenever
+    the host happened to be slow. So this states both, in `enditer` -- which
+    runs immediately before the checkpoint hook -- and the deadline arrives at
+    a named iteration instead.
+
+    It keeps stating them on every iteration from `ITERATION` on, so the
+    condition stays true afterwards. That is what makes the latch visible: the
+    trigger is entitled to fire again on every one of those iterations and
+    must not.
+    """
+
+    #: The iteration at whose end the deadline comes into view.
+    ITERATION = 2
+    #: Declared elapsed time and iteration cost. Their sum clears
+    #: BEFORE_SECONDS; neither does alone, so the test cannot pass on a
+    #: trigger that ignored the iteration duration and just watched the clock.
+    ELAPSED_SECONDS = 60.0
+    ITERATION_SECONDS = 50.0
+
+    def enditer(self):
+        if self.opt._PHIter >= self.ITERATION:
+            self.opt.start_time = time.perf_counter() - self.ELAPSED_SECONDS
+            self.opt._last_iteration_seconds = self.ITERATION_SECONDS
+
+
+#: --checkpoint-before-seconds for the runs driven by DeadlineApproacher.
+_BEFORE_SECONDS = 100.0
+
+
+class IterationCostStamper(Extension):
+    """Stamp an unmistakable iteration duration into the checkpoint.
+
+    `enditer` runs after the solve and before the checkpoint hook, so what it
+    stamps is what gets written; the loop overwrites it with the real
+    measurement straight afterwards. That is what makes it a usable probe --
+    a duration that could not possibly have been measured, sitting in the file
+    and nowhere else.
+    """
+
+    STAMP = 12345.0
+
+    def enditer(self):
+        self.opt._last_iteration_seconds = self.STAMP
+
+
 class PreIter0Tagger(Extension):
     """Tag the models pre_iter0 sees, so a test can tell whether the hook ran
     on the models the run actually iterates or on fresh ones a resume splice
@@ -201,6 +266,10 @@ def _extension_class(name):
         return PreIter0Tagger
     if name == "clock_rewinder":
         return ClockRewinder
+    if name == "deadline_approacher":
+        return DeadlineApproacher
+    if name == "cost_stamper":
+        return IterationCostStamper
     if name == "sep_rho":
         from mpisppy.extensions.sep_rho import SepRho
         return SepRho
@@ -1145,7 +1214,8 @@ class TestConfigRegistration(unittest.TestCase):
 
     def test_flags_are_registered(self):
         for name in ("checkpoint_dir", "checkpoint_backend",
-                     "checkpoint_every_iterations", "resume_from",
+                     "checkpoint_every_iterations",
+                     "checkpoint_before_seconds", "resume_from",
                      "stop_at_iteration_number"):
             self.assertIn(name, self.cfg)
 
@@ -1155,6 +1225,10 @@ class TestConfigRegistration(unittest.TestCase):
     def test_checkpointing_is_off_by_default(self):
         self.assertIsNone(self.cfg.checkpoint_dir)
         self.assertIsNone(self.cfg.resume_from)
+        self.assertIsNone(self.cfg.checkpoint_before_seconds)
+
+        # The refusal of --checkpoint-before-seconds without a directory to
+        # write to lives with the other Config.checker tests, in test_config.py.
 
     def test_obsolete_termination_flag_is_gone(self):
         """It described a trigger that no longer exists.
@@ -1496,6 +1570,285 @@ class TestCheckpointEveryIterationsValidation(unittest.TestCase):
             checkpointing._is_non_structural("checkpoint_every_iterations"))
 
 
+class TestCheckpointBeforeSecondsDecision(unittest.TestCase):
+    """`--checkpoint-before-seconds S` in isolation.
+
+    The trigger asks whether *another* iteration would carry the run past S
+    seconds of elapsed wall clock, so both of its inputs are set here directly:
+    a real elapsed time cannot be waited for, and a real farmer iteration is
+    too fast to be worth predicting.
+    """
+
+    def _checkpointer(self, before_seconds, every=100, phiter=3, limit=100):
+        opt = _make_ph(_options(limit))
+        opt.options["checkpoint_dir"] = tempfile.mkdtemp()
+        opt.options["checkpoint_backend"] = checkpointing.DILL_RELOAD_BACKEND
+        opt.options["checkpoint_every_iterations"] = every
+        opt.options["checkpoint_before_seconds"] = before_seconds
+        ext = Checkpointer(opt)
+        opt._PHIter = phiter
+        return ext
+
+    def _clock(self, ext, elapsed, last_iteration=10.0):
+        ext.opt.start_time = time.perf_counter() - elapsed
+        ext.opt._last_iteration_seconds = last_iteration
+
+    def test_fires_before_the_deadline_not_at_it(self):
+        """80 seconds gone of 100 is not a stop -- but the next iteration
+        costs 30, so this is the last boundary before the deadline."""
+        ext = self._checkpointer(100.0)
+        self._clock(ext, elapsed=80.0, last_iteration=30.0)
+        self.assertTrue(ext._should_write())
+
+    def test_silent_while_another_iteration_still_fits(self):
+        ext = self._checkpointer(100.0)
+        self._clock(ext, elapsed=80.0, last_iteration=10.0)
+        self.assertFalse(ext._should_write())
+
+    def test_fires_at_most_once(self):
+        """Past the deadline every later iteration also qualifies. Writing at
+        each of them is the per-iteration cost K was set to avoid, at the
+        point in the run where the user has said time is short."""
+        ext = self._checkpointer(100.0)
+        self._clock(ext, elapsed=200.0, last_iteration=30.0)
+        self.assertTrue(ext._should_write())
+        ext.opt._PHIter += 1
+        self.assertFalse(ext._should_write())
+        ext.opt._PHIter += 1
+        self.assertFalse(ext._should_write())
+
+    def test_off_when_no_deadline_was_given(self):
+        ext = self._checkpointer(None)
+        self._clock(ext, elapsed=1e6, last_iteration=1e6)
+        self.assertFalse(ext._should_write())
+
+    def test_an_unmeasured_iteration_counts_as_zero(self):
+        """Nothing has been timed yet, so there is nothing to predict with and
+        the test degenerates to the elapsed clock -- it must not raise."""
+        ext = self._checkpointer(100.0)
+        ext.opt.start_time = time.perf_counter() - 80.0
+        ext.opt._last_iteration_seconds = None
+        self.assertFalse(ext._should_write())
+        ext.opt.start_time = time.perf_counter() - 120.0
+        self.assertTrue(ext._should_write())
+
+    def test_the_cadence_still_writes_after_the_deadline_fired(self):
+        """The latch is on the deadline trigger alone; K keeps its cadence."""
+        ext = self._checkpointer(100.0, every=2, phiter=3)
+        self._clock(ext, elapsed=200.0)
+        self.assertTrue(ext._should_write())
+        ext.opt._PHIter = 4
+        self.assertTrue(ext._should_write())
+
+    def test_a_cadence_iteration_does_not_consult_the_clock(self):
+        """Rank safety, not speed: the collective below must be reached by
+        every rank or by none, so everything decided before it has to be a
+        pure function of the iteration number."""
+        ext = self._checkpointer(100.0, every=2, phiter=4)
+        self._clock(ext, elapsed=1.0, last_iteration=1.0)
+        with mock.patch.object(ext.opt, "allreduce_or") as never:
+            self.assertTrue(ext._should_write())
+        never.assert_not_called()
+
+    def test_the_ranks_decide_together(self):
+        """A rank that wrote on its own local clock would hang the cylinder at
+        the write barrier, so the all-reduced answer is the only one that
+        counts -- including when it overrules this rank."""
+        ext = self._checkpointer(100.0)
+        self._clock(ext, elapsed=200.0, last_iteration=30.0)
+        with mock.patch.object(ext.opt, "allreduce_or", return_value=False):
+            self.assertFalse(ext._should_write())
+        # ... and having not fired, it is not latched either.
+        self.assertTrue(ext._should_write())
+
+    def test_a_nonpositive_deadline_is_refused_at_setup(self):
+        for bad in (0.0, -5.0):
+            with self.subTest(bad=bad):
+                with self.assertRaises(RuntimeError) as ctx:
+                    self._checkpointer(bad)
+                self.assertIn("must be positive", str(ctx.exception))
+
+    def test_the_deadline_is_not_structural(self):
+        """A resume may set a different deadline -- the second leg of a study
+        usually gets a different slot -- and must not be refused for it."""
+        base = {"defaultPHrho": 1.0}
+        self.assertEqual(
+            checkpointing.structural_fingerprint(
+                {**base, "checkpoint_before_seconds": None}),
+            checkpointing.structural_fingerprint(
+                {**base, "checkpoint_before_seconds": 3500.0}))
+        self.assertTrue(
+            checkpointing._is_non_structural("checkpoint_before_seconds"))
+
+
+@unittest.skipIf(not solver_available,
+                 "no solver is available to run PH to a deadline")
+class TestCheckpointBeforeSeconds(unittest.TestCase):
+    """The deadline trigger in a run: it exists to close the gap K opens.
+
+    At K > 1 a run that stops against a wall clock rather than at its
+    iteration limit stops at an iteration that is not a multiple of K, and the
+    newest checkpoint is up to K-1 iterations old. If K is larger than the
+    number of iterations the run completes, there is no checkpoint at all --
+    which is the case these tests are built around, because it is the one that
+    loses everything rather than a little.
+    """
+
+    N = 4
+    #: Larger than any iteration these runs reach, so nothing is a checkpoint
+    #: point on cadence and every write seen is the deadline's or the final
+    #: iteration's.
+    K = 100
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.ckpt_dir = os.path.join(self._tmp.name, "ckpt")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _run(self, max_iters, before_seconds=_BEFORE_SECONDS,
+             extra_names=("deadline_approacher",), **overrides):
+        opts = _options(max_iters, ckpt_dir=self.ckpt_dir, **overrides)
+        opts["checkpoint_every_iterations"] = self.K
+        if before_seconds is not None:
+            opts["checkpoint_before_seconds"] = before_seconds
+        ph = _make_ph(opts, extra_names=extra_names)
+        writes = []
+        real = checkpointing.write_checkpoint
+
+        def counting(opt, ckpt_dir, generation, backend):
+            writes.append(generation)
+            return real(opt, ckpt_dir, generation, backend=backend)
+
+        with mock.patch.object(checkpointing, "write_checkpoint",
+                               side_effect=counting):
+            ph.ph_main()
+        return ph, writes
+
+    def test_writes_at_the_last_boundary_before_the_deadline(self):
+        """Iteration 2 is not a multiple of K and is not the last, so the
+        deadline is the only reason it is written -- and iterations 3 and 4
+        are equally close to it, so only the latch keeps 3 out."""
+        _, writes = self._run(self.N)
+        self.assertEqual(writes, [DeadlineApproacher.ITERATION, self.N])
+
+    def test_without_the_deadline_only_the_final_iteration_is_written(self):
+        """The same run, minus the option: what the deadline write adds."""
+        _, writes = self._run(self.N, before_seconds=None)
+        self.assertEqual(writes, [self.N])
+
+    def test_a_run_stopped_by_the_time_limit_has_a_checkpoint(self):
+        """The whole point, end to end. --time-limit stops the run at an
+        iteration that is not a multiple of K and is not the limit, so nothing
+        else in the design writes anything at all."""
+        _, writes = self._run(
+            self.N, extra_names=("deadline_approacher", "clock_rewinder"),
+            time_limit=3600)
+        self.assertEqual(writes, [DeadlineApproacher.ITERATION])
+        self.assertEqual(_published_generation(self.ckpt_dir),
+                         DeadlineApproacher.ITERATION)
+
+    def test_without_the_deadline_that_run_checkpoints_nothing(self):
+        """The gap, stated: the run stops cleanly, the directory exists, and
+        there is no checkpoint in it."""
+        _, writes = self._run(
+            self.N, before_seconds=None,
+            extra_names=("deadline_approacher", "clock_rewinder"),
+            time_limit=3600)
+        self.assertEqual(writes, [])
+        self.assertIsNone(_published_generation(self.ckpt_dir))
+
+    def test_the_deadline_checkpoint_resumes(self):
+        """A write earned by a deadline is a write like any other: it lands on
+        an iteration boundary, so it must resume into a continuation that is
+        indistinguishable from the uninterrupted run."""
+        total = 6
+        self._run(self.N, extra_names=("deadline_approacher",
+                                       "clock_rewinder"),
+                  time_limit=3600)
+        self.assertEqual(_published_generation(self.ckpt_dir),
+                         DeadlineApproacher.ITERATION)
+
+        resumed = _make_ph(_options(total - DeadlineApproacher.ITERATION,
+                                    resume_from=self.ckpt_dir))
+        resumed.ph_main()
+        self.assertEqual(resumed._resume_iteration,
+                         DeadlineApproacher.ITERATION)
+        self.assertEqual(resumed._PHIter, total)
+
+        reference = _make_ph(_options(total))
+        reference.ph_main()
+        want = _primal_snapshot(reference)
+        got = _primal_snapshot(resumed)
+        worst = max((abs(want[k] - got[k]) for k in want), default=0.0)
+        self.assertLessEqual(worst, 1e-9)
+
+
+@unittest.skipIf(not solver_available,
+                 "no solver is available to time a PH iteration")
+class TestIterationDurationIsRecorded(unittest.TestCase):
+    """`PHBase._last_iteration_seconds`: the deadline trigger's estimate.
+
+    It is the plain measured duration of the most recent completed iteration.
+    mpi-sppy does not pad it and does not add anything for the write it may
+    trigger; the write's own cost is bracketed by `toc` in the log, and
+    leaving room for it is the user's to do when choosing S.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.ckpt_dir = os.path.join(self._tmp.name, "ckpt")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_iteration_zero_seeds_it(self):
+        """The first time the trigger is tested, no iteration of the loop has
+        finished yet, so iteration 0 is what there is to go on."""
+        ph = _make_ph(_options(0, PHIterLimit=0))
+        ph.ph_main()
+        self.assertIsNotNone(ph._last_iteration_seconds)
+        self.assertGreater(ph._last_iteration_seconds, 0.0)
+
+    def test_it_tracks_the_iterations(self):
+        ph = _make_ph(_options(3))
+        ph.ph_main()
+        self.assertIsNotNone(ph._last_iteration_seconds)
+        self.assertGreater(ph._last_iteration_seconds, 0.0)
+
+    def test_it_is_carried_across_a_resume(self):
+        """A resumed run's own iteration 0 reloads models instead of solving
+        them, so timing it describes a reload and not a PH iteration. The
+        checkpoint carries a real measurement, and that is the seed."""
+        ph = _make_ph(_options(2, ckpt_dir=self.ckpt_dir),
+                      extra_names=("cost_stamper",))
+        ph.ph_main()
+        self.assertEqual(_published_generation(self.ckpt_dir), 2)
+
+        # Resuming with a per-run budget of zero runs no iterations at all,
+        # so what is read here is the seed and nothing else.
+        resumed = _make_ph(_options(0, resume_from=self.ckpt_dir))
+        resumed.ph_main()
+        self.assertEqual(resumed._PHIter, 2)
+        self.assertEqual(resumed._last_iteration_seconds,
+                         IterationCostStamper.STAMP)
+
+    def test_a_checkpoint_without_one_falls_back_to_iteration_zero(self):
+        """Checkpoints written before the duration was carried have no such
+        key; a resume from one seeds itself and does not fail."""
+        ph = _make_ph(_options(2, ckpt_dir=self.ckpt_dir))
+        ph.ph_main()
+        _strip_leaf_key(self.ckpt_dir, "last_iteration_seconds")
+
+        # Again with nothing to do, so what is checked is the seed itself and
+        # not a duration a resumed iteration happened to measure.
+        resumed = _make_ph(_options(0, resume_from=self.ckpt_dir))
+        resumed.ph_main()
+        self.assertIsNotNone(resumed._last_iteration_seconds)
+        self.assertGreater(resumed._last_iteration_seconds, 0.0)
+
+
 class TestConfigureExtensionsComposes(unittest.TestCase):
     """configure_extensions must compose with what is already attached.
 
@@ -1811,7 +2164,7 @@ class TestCheckpointHookPlacement(unittest.TestCase):
 class _SpokeStub:
     """Stands in for the spoke communicator the Checkpointer reads."""
 
-    def __init__(self, strata_rank=2, best_inner_bound=None,
+    def __init__(self, strata_rank=2, best_inner_bound=None, loop_state=None,
                  communicators=None):
         self.strata_rank = strata_rank
         #: The cylinder list WheelSpinner hands every SPCommunicator, or None
@@ -1822,12 +2175,25 @@ class _SpokeStub:
         self.best_inner_bound = best_inner_bound
         self.sent_bounds = []
         self.sent_xhats = 0
+        #: What checkpoint_loop_state() reports. None is what every xhatter
+        #: but xhatshuffle says: they re-evaluate from scratch when new
+        #: nonants arrive, so there is no cursor to carry.
+        self.loop_state = loop_state
 
     def send_bound(self, value):
         self.sent_bounds.append(value)
 
     def send_best_xhat(self):
         self.sent_xhats += 1
+
+    def checkpoint_loop_state(self):
+        return self.loop_state
+
+    def loop_state_progress(self, state):
+        # XhatBase's default. A stub that stands in for a spoke has to carry
+        # the whole contract, not just the part that was in use when it was
+        # written -- the Checkpointer calls this unguarded.
+        return state
 
 
 def _xhat_eval(ckpt_dir=None, resume_from=None, **overrides):
