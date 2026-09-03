@@ -364,42 +364,37 @@ class TestWtrackerResume(_ABMixin, unittest.TestCase):
                              msg=f"the resumed run's {kind} report differs "
                                  f"from the uninterrupted run's")
 
-    def test_a_wider_window_on_the_resumed_leg_says_so(self):
-        """The window carried was sized by the run that wrote it.
-
-        Ask for a longer one on the resumed leg and the report covers less
-        than an uninterrupted run of the same length would -- which reads as
-        the study having gone quiet rather than as the two legs having been
-        asked different questions.
-        """
+    def test_the_carried_wlen_is_kept_for_the_report_to_judge(self):
+        """The restore records what the checkpoint was written with and says
+        nothing about it. Whether a wider window can be filled depends on how
+        far this leg runs, which this hook -- at the end of Iter0 -- cannot
+        know; the two classes below run that out."""
         from mpisppy.extensions.wtracker_extension import Wtracker_extension
         _, stopped, _ = self.run_ab()
         ext = _extension(stopped, Wtracker_extension)
         state = ext.checkpoint_state()
-
-        self.assertIsNone(ext.restore_state(state),
-                          msg="the same wlen has nothing to report")
-
         ext.wlen = self.WLEN + 5        # what a wider --wlen would ask for
-        message = ext.restore_state(state)
-        self.assertIsNotNone(
-            message, msg="the resumed leg asked for a window the checkpoint "
-                         "cannot fill, and said nothing")
-        self.assertIn("shorter window", message)
+        self.assertIsNone(
+            ext.restore_state(state),
+            msg="the restore judged a window it cannot yet see the end of")
+        self.assertEqual(ext._carried_wlen, self.WLEN)
 
-    def test_the_resume_prints_what_the_extension_reports(self):
-        """The plumbing: a sentence returned by restore_state comes out with
-        the resume's other warnings, rather than being dropped."""
+    def test_what_it_costs_is_the_windows_worth_not_the_first_write(self):
+        """This is said at the first write, where the window holds one set of
+        the wlen+1 that every write after it carries. Reporting what happened
+        to be in hand there reported a fraction of what the option costs."""
         from mpisppy.extensions.wtracker_extension import Wtracker_extension
-        _, stopped, _ = self.run_ab()
-        ext = _extension(stopped, Wtracker_extension)
-        state = ext.checkpoint_state()
-        ext.wlen = self.WLEN + 5
-        warnings = checkpointing.restore_extension_state(
-            stopped, {"extensions": {"Wtracker_extension": state}})
-        self.assertTrue(
-            any("shorter window" in w for w in warnings),
-            msg=f"the extension's message never reached the user: {warnings}")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            _, stopped, _ = self.run_ab()
+        said = [line for line in out.getvalue().splitlines()
+                if "Wtracker carries" in line]
+        self.assertEqual(len(said), 1, msg=out.getvalue())
+        one_set = next(iter(
+            _extension(stopped, Wtracker_extension).wtracker.local_Ws.values()))
+        per_set = sum(len(w) for w in one_set.values())
+        self.assertIn(f"{self.WLEN + 1} W set(s)", said[0])
+        self.assertIn(f"{(self.WLEN + 1) * per_set} values", said[0])
 
     def test_what_it_costs_is_said_once(self):
         """The window is the user's option, so its cost is theirs to see --
@@ -425,6 +420,153 @@ class TestWtrackerResume(_ABMixin, unittest.TestCase):
                          list(range(1, self.STOP + 1))[-(self.WLEN + 1):])
         carried = _extension(resumed, Wtracker_extension).wtracker.local_Ws
         self.assertEqual(sorted(carried), list(range(1, self.N + 1)))
+
+
+class _WiderWindowMixin(_ABMixin):
+    """The two legs are asked for different windows.
+
+    The leg that stops tracks a narrow one; the leg that resumes asks for a
+    wider one. That is the case that used to be judged in restore_state, at
+    the end of Iter0 -- before the resumed leg had run an iteration, and so
+    before anything could know whether it would fill the wider window itself.
+    """
+
+    #: What the checkpoint is written with, and what it therefore carries.
+    STOPPED_WLEN = 1
+    #: What the resumed leg -- and the uninterrupted reference -- ask for.
+    RESUMED_WLEN = 5
+
+    def ext_classes(self):
+        from mpisppy.extensions.wtracker_extension import Wtracker_extension
+        return [Wtracker_extension]
+
+    def setUp(self):
+        super().setUp()
+        self._legs = 0
+
+    def _ph(self, max_iters, **ckpt_kwargs):
+        self._legs += 1
+        # The leg that writes the checkpoint is the one asked for the narrow
+        # window; the reference leg asks for the wide one, so its report is
+        # the one the resumed leg's is compared against.
+        wlen = (self.STOPPED_WLEN if "ckpt_dir" in ckpt_kwargs
+                else self.RESUMED_WLEN)
+        prefix = os.path.join(self._tmp.name, f"leg{self._legs}")
+        options = _options(max_iters, **ckpt_kwargs)
+        options["wtracker_options"] = {"wlen": wlen, "file_prefix": prefix}
+        return _make_ph(options, self.ext_classes())
+
+    def _leg_file(self, leg, kind, ph, ext="csv"):
+        return os.path.join(
+            self._tmp.name,
+            f"leg{leg}_{kind}_iter{self.N}_rank{ph.global_rank}.{ext}")
+
+    def run_ab_and_capture(self):
+        """run_ab, plus everything the three legs said."""
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            reference, stopped, resumed = self.run_ab()
+        return reference, stopped, resumed, out.getvalue()
+
+
+@unittest.skipIf(not solver_available, "no solver is available")
+class TestALegThatFillsTheWiderWindowIsNotWarnedAbout(_WiderWindowMixin,
+                                                      unittest.TestCase):
+    """A resumed leg long enough to fill the wider window on its own writes
+    the report an uninterrupted run writes, and there is nothing to say about
+    it. Judged at the restore, every such run was told its report covered
+    less than an uninterrupted one -- while the report it went on to write
+    was identical to the uninterrupted one's.
+    """
+
+    N = 8
+    STOP = 3
+
+    def test_the_wider_window_is_filled_and_nothing_is_said(self):
+        reference, _, resumed, said = self.run_ab_and_capture()
+        for kind in ("stdev", "cv"):
+            with open(self._leg_file(3, kind, resumed)) as f:
+                got = f.read()
+            with open(self._leg_file(1, kind, reference)) as f:
+                want = f.read()
+            self.assertEqual(
+                got, want,
+                msg=f"the resumed run's {kind} report differs from the "
+                    f"uninterrupted run's, so this leg did not fill the "
+                    f"wider window and the case under test is not running")
+        self.assertNotIn(
+            "Wtracker_extension", said,
+            msg="the resumed leg wrote the report an uninterrupted run "
+                "writes, and was warned that its report was short anyway")
+
+
+@unittest.skipIf(not solver_available, "no solver is available")
+class TestALegThatCannotFillTheWiderWindowIsToldWhy(_WiderWindowMixin,
+                                                    unittest.TestCase):
+    """The other side of it: a resumed leg too short to fill the wider window
+    gets no report, and the reason is the earlier leg's narrower one rather
+    than the study having gone quiet."""
+
+    N = 5
+    STOP = 3
+
+    def test_the_missing_report_names_the_window_the_checkpoint_carried(self):
+        _, _, resumed, said = self.run_ab_and_capture()
+        with open(self._leg_file(3, "summary", resumed, ext="txt")) as f:
+            self.assertIn("Not enough iterations tracked", f.read(),
+                          msg="this leg did fill the window, so there is "
+                              "nothing for the warning to explain")
+        self.assertIn(f"no report for window len {self.RESUMED_WLEN}", said)
+        self.assertIn(f"written with wlen {self.STOPPED_WLEN}", said)
+
+
+@unittest.skipIf(not solver_available, "no solver is available")
+class TestTheSameWindowOnBothLegsStaysSilent(_WiderWindowMixin,
+                                             unittest.TestCase):
+    """A window the study has simply not run long enough for is the report's
+    own business -- it says "not enough iterations tracked" for itself, and
+    the two legs were asked the same question."""
+
+    N = 5
+    STOP = 3
+    STOPPED_WLEN = 5
+    RESUMED_WLEN = 5
+
+    def test_a_short_window_both_legs_asked_for_is_not_explained_away(self):
+        _, _, resumed, said = self.run_ab_and_capture()
+        with open(self._leg_file(3, "summary", resumed, ext="txt")) as f:
+            self.assertIn("Not enough iterations tracked", f.read())
+        self.assertNotIn("Wtracker_extension", said)
+
+
+class TestARestoreStateSentenceReachesTheUser(unittest.TestCase):
+    """The plumbing: a sentence an extension returns from restore_state comes
+    out with the resume's other warnings rather than being dropped.
+
+    Wtracker_extension returned the only shipped one until its message moved
+    to the end of the run, where what it reports is knowable, so this drives
+    the mechanism with a stand-in.
+    """
+
+    class _HasSomethingToSay(Extension):
+        def checkpoint_state(self):
+            return {"n": 1}
+
+        def restore_state(self, state):
+            return "the counter it kept could not be put back exactly"
+
+    def test_the_sentence_comes_out_with_the_resumes_warnings(self):
+        ext = self._HasSomethingToSay.__new__(self._HasSomethingToSay)
+        opt = types.SimpleNamespace(
+            extobject=types.SimpleNamespace(
+                extdict={"_HasSomethingToSay": ext}))
+        warnings = checkpointing.restore_extension_state(
+            opt, {"extensions": {"_HasSomethingToSay": {"n": 1}}})
+        self.assertTrue(
+            any("could not be put back exactly" in w for w in warnings),
+            msg=f"the extension's message never reached the user: {warnings}")
+        self.assertTrue(any("_HasSomethingToSay" in w for w in warnings),
+                        msg=f"and nothing said which extension: {warnings}")
 
 
 @unittest.skipIf(not solver_available, "no solver is available")
