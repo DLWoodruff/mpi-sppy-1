@@ -466,6 +466,19 @@ Checkable at setup, hard error (following the repo's fail-loudly convention):
   one — supplying dual warm starts is a common reason — and silently reusing an
   `EXPORT` or `LOCAL` suffix would import nothing, leaving the certificate with no
   multipliers. Existence is therefore not enough; `import_enabled()` is what is checked.
+- **An expression Pyomo's `differentiate` has no rule for**, in the objective or in any
+  constraint body. §3.3 needs `∇φ(v̂)`, so such a scenario can never yield a bound — not
+  on this iteration, on any of them — and since `Ebound` is all-or-nothing one of them
+  silences the whole cylinder for the whole run while it goes on solving every
+  subproblem and discarding the result. Convex and supported are different properties:
+  `cosh(x) ≤ y` is convex and unsupported alike, so this cannot be worked around by
+  asserting convexity, which is why it belongs here rather than with the warnings. The
+  supported set is read from `differentiate`'s own dispatch tables rather than restated,
+  so a Pyomo release that adds a rule is picked up instead of being refused by a stale
+  list; today the gap is `cosh`, `sinh`, `tanh`, `ceil`, `floor` and `Expr_if`.
+  `abs` is deliberately *not* rejected — `differentiate` handles it everywhere except
+  exactly at the kink, which is a property of the iterate and not of the model, so it
+  stays with the runtime stand-down below.
 
 Checked every iteration rather than at setup, and **not** a hard error — warn once on
 rank 0 and report no bound, for the reason in §6.1:

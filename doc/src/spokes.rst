@@ -82,12 +82,24 @@ Cost is one solve per scenario per iteration, the same as the Lagrangian spoke.
 
    What *is* checked, as a hard error at setup: discrete variables, nonlinear
    equality constraints, nonlinear two-sided (ranged) constraints, a
-   maximization objective, a solver that is not Ipopt, and a ``dual`` Suffix
+   maximization objective, a solver that is not Ipopt, a ``dual`` Suffix
    the scenario creator already attached in a direction that does not import
    (the certificate needs the solver's duals back, so ``Suffix.IMPORT`` or
-   ``Suffix.IMPORT_EXPORT`` is required). The affine cases are decidable, so
+   ``Suffix.IMPORT_EXPORT`` is required), and an expression Pyomo's
+   ``differentiate`` has no rule for. The affine cases are decidable, so
    they are enforced; convexity of a one-sided nonlinear body is not, so
    convexity remains a user assertion.
+
+   That last one is worth expanding, because it refuses models that are
+   perfectly convex. The certificate differentiates the objective and the
+   constraint bodies, so an expression ``differentiate`` cannot handle means
+   no bound is available for that scenario on any iteration -- and because
+   ``Ebound`` is all-or-nothing, one such scenario leaves the whole ``N``
+   column empty for the run. Today the gap is ``cosh``, ``sinh``, ``tanh``,
+   ``ceil``, ``floor`` and ``Expr_if``; the error names the one it found.
+   Convexity is not the issue and asserting it does not help -- ``cosh`` is
+   convex and unsupported alike -- so the expression has to be rewritten in
+   terms ``differentiate`` knows, or this spoke left off the run.
 
 Two things determine whether the bound is any good:
 
