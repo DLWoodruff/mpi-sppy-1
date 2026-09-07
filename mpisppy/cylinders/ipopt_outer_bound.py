@@ -534,8 +534,12 @@ class IpoptOuterBound(LagrangianOuterBound):
                     # was reported as unbounded -- with the advice for the
                     # wrong cause, and the right cause's key left unburnt but
                     # unreachable, since the condition recurs every iteration.
+                    # "unclassified", not a guess at one of the known tags:
+                    # a return-None site added to certified_lower_bound
+                    # without a tag would otherwise print a specific cause,
+                    # and advice for it, for something nobody classified.
                     tag, detail = (scenario_reason[0] if scenario_reason
-                                   else ("non_finite", "no reason recorded"))
+                                   else ("unclassified", "no reason recorded"))
                     no_bound_by_cause.setdefault(tag, []).append(
                         f"{sname} ({detail})")
 
@@ -582,10 +586,16 @@ class IpoptOuterBound(LagrangianOuterBound):
                 "example above names it and the side it is missing.",
             ),
             "non_finite": (
-                "the arithmetic produced a non-finite value",
+                "the arithmetic produced a non-finite value",  # detail says which
                 "NaN or an infinity in the point or the duals, which usually "
                 "means the solve diverged rather than that anything is "
                 "unbounded -- bounds will not help.",
+            ),
+            "unclassified": (
+                "the certificate returned no bound and recorded no reason",
+                "That is a gap in certified_lower_bound rather than in the "
+                "model -- a return-None path that records no tag. Please "
+                "report it.",
             ),
             "no_solution": (
                 "the solve produced no loadable solution",

@@ -346,6 +346,21 @@ def certified_lower_bound(model, sign_convention="ipopt", eps_rel=1e-9,
             g = float(g)
             if g == 0.0:
                 continue
+            # BEFORE the bound selection, because NaN answers False to every
+            # comparison: `g == 0.0` and `g > 0.0` are both False for it, so a
+            # NaN gradient silently took the `v.ub` branch and, on the very
+            # common `NonNegativeReals` shape, found ub is None and reported an
+            # unbounded box. That is a diverged solve mislabelled as a missing
+            # bound -- the misclassification this out-parameter exists to end,
+            # and returning here rather than falling through to the qhat screen
+            # keeps `bound - vhat` from being evaluated against a None bound.
+            if not math.isfinite(g):
+                if no_bound_reason is not None:
+                    no_bound_reason.append((
+                        "non_finite",
+                        f"the gradient component for {v.name} is {g}",
+                    ))
+                return None
             vhat = pyo.value(v)
             # min over [lo, hi] of a linear term goes to whichever end the
             # gradient points away from.
@@ -380,7 +395,7 @@ def certified_lower_bound(model, sign_convention="ipopt", eps_rel=1e-9,
         if no_bound_reason is not None:
             no_bound_reason.append((
                 "non_finite",
-                "the arithmetic produced a non-finite value",
+                f"the certified quantity evaluated to {qhat}",
             ))
         return None
 

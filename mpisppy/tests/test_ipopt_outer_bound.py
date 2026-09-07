@@ -1229,6 +1229,61 @@ class TestCertificateFailureStandsDown(unittest.TestCase):
                          f"blamed z, which is not why there is no bound: "
                          f"{messages}")
 
+    def test_a_nan_gradient_on_a_one_sided_variable_is_not_called_unbounded(self):
+        """NaN answers False to every comparison, which is how it got mislabelled.
+
+        `g == 0.0` and `g > 0.0` are both False for NaN, so a NaN gradient took
+        the `v.ub` branch, and on NonNegativeReals -- ub is None -- reported an
+        unbounded box: a diverged solve dressed as a missing bound, with the
+        advice for the wrong one, burning the wrong key. The two existing
+        non-finite fixtures both bound x on BOTH sides, which routes the NaN to
+        a finite ub and is exactly why neither caught this.
+        """
+        m = pyo.ConcreteModel()
+        m.x = pyo.Var(within=pyo.NonNegativeReals, initialize=1.0)
+        m.dual = pyo.Suffix(direction=pyo.Suffix.IMPORT)
+        m.c = pyo.Constraint(expr=m.x >= 1)
+        m.dual[m.c] = float("nan")
+        m.obj = pyo.Objective(expr=m.x)
+        m._mpisppy_data = type(
+            "_D", (), {"solution_available": True, "outer_bound": "UNSET"})()
+
+        spoke = self._spoke_over(m)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            spoke.lagrangian()
+        messages = [str(w.message) for w in caught]
+        self.assertIsNone(m._mpisppy_data.outer_bound, messages)
+        self.assertTrue(any("non-finite value" in m for m in messages),
+                        messages)
+        self.assertFalse(
+            any("unbounded below" in m for m in messages),
+            f"a diverged solve reported as a missing bound: {messages}")
+
+    def test_an_unlabelled_no_bound_is_not_attributed_to_a_known_cause(self):
+        """Unreachable today, which is the reason to pin it.
+
+        Both return-None sites record a tag, so nothing exercises the
+        fallback. If a third is ever added without one, the fallback decides
+        what the user is told -- and guessing "non_finite" would print a
+        specific cause, and advice for it, for something nobody classified.
+        """
+        from unittest import mock
+        scenario = self._scenario_with_a_bound_and_a_missing_dual()
+        spoke = self._spoke_over(scenario)
+        with mock.patch(
+            "mpisppy.cylinders.ipopt_outer_bound.certified_lower_bound",
+            return_value=None,          # returns None, records no reason
+        ):
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                spoke.lagrangian()
+        messages = [str(w.message) for w in caught]
+        self.assertTrue(any("recorded no reason" in m for m in messages),
+                        messages)
+        self.assertFalse(any("bounds will not help" in m for m in messages),
+                         f"asserted a cause nobody classified: {messages}")
+
     def test_value_error_becomes_no_bound(self):
         scenario = self._scenario_with_uninitialized_var()
         spoke = self._spoke_over(scenario)
