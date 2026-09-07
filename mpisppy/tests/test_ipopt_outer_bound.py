@@ -997,11 +997,16 @@ class TestCertificateFailureStandsDown(unittest.TestCase):
                 spoke.lagrangian()
             return [str(w.message) for w in caught]
 
-        # iteration 1: a routine CertificateError (no dual suffix at all)
+        # Iteration 1: a routine ValueError. _scenario_with_uninitialized_var
+        # DOES attach a dual suffix; what it leaves out is the Var's value, so
+        # evaluating phi raises. The class matters and only the class matters
+        # -- it has to differ from the one below for the premise to hold.
         routine = self._scenario_with_uninitialized_var()
         spoke = self._spoke_over(routine)
         first = warnings_from(spoke)
         self.assertTrue(any("no certificate" in m for m in first))
+        # the premise, asserted rather than described: two DIFFERENT classes
+        self.assertTrue(any("ValueError" in m for m in first), first)
 
         # iteration 2, same spoke so _warned persists: a different class
         structural = self._scenario_differentiate_cannot_handle()
@@ -1017,6 +1022,46 @@ class TestCertificateFailureStandsDown(unittest.TestCase):
         third = warnings_from(spoke)
         self.assertFalse(any("no certificate" in m for m in third),
                          "once per class, not once per iteration")
+
+    def _scenario_with_no_bound_and_a_missing_dual(self):
+        """certified_lower_bound RETURNS None here, without raising.
+
+        An unbounded variable whose gradient component in phi is nonzero is an
+        ordinary outcome for this spoke -- the unbounded_variables warning at
+        setup exists for exactly it -- and the constraint has no imported dual,
+        so missing_duals is populated on the way to returning None.
+        """
+        m = pyo.ConcreteModel()
+        m.x = pyo.Var(bounds=(None, None), initialize=1.0)
+        m.y = pyo.Var(bounds=(0, 10), initialize=1.0)
+        m.dual = pyo.Suffix(direction=pyo.Suffix.IMPORT)
+        m.c = pyo.Constraint(expr=m.x + m.y >= 1)     # no dual imported
+        m.obj = pyo.Objective(expr=m.x + m.y)
+        m._mpisppy_data = type(
+            "_D", (), {"solution_available": True, "outer_bound": "UNSET"})()
+        return m
+
+    def test_a_scenario_with_no_bound_does_not_claim_a_looser_one(self):
+        from mpisppy.utils.dual_certificate import certified_lower_bound
+        # the premise: returns None WITHOUT raising, having populated the list
+        probe, missing = self._scenario_with_no_bound_and_a_missing_dual(), []
+        self.assertIsNone(certified_lower_bound(
+            probe, sign_convention="ipopt", eps_rel=1e-9,
+            missing_duals=missing))
+        self.assertEqual(missing, ["c"])
+
+        scenario = self._scenario_with_no_bound_and_a_missing_dual()
+        spoke = self._spoke_over(scenario)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            spoke.lagrangian()
+        self.assertIsNone(scenario._mpisppy_data.outer_bound)
+        # "looser than it could be but still valid" is false of a scenario
+        # that produced no bound at all, and saying it burns the warn-once
+        # key so a real tightness loss later is never reported.
+        self.assertFalse(
+            any("still valid" in str(w.message) for w in caught),
+            [str(w.message) for w in caught])
 
     def test_value_error_becomes_no_bound(self):
         scenario = self._scenario_with_uninitialized_var()

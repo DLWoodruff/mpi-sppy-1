@@ -433,8 +433,8 @@ class IpoptOuterBound(LagrangianOuterBound):
         # per run, so a single "certificate_failed" key meant the first failure
         # -- typically a routine CertificateError -- consumed the warning and a
         # genuine bug arriving on a later iteration was silent for the rest of
-        # the run. That silence is what the wide catch above would otherwise
-        # buy, and it is not a trade worth making.
+        # the run. That silence is what the `except Exception` below would
+        # otherwise buy, and it is not a trade worth making.
         failures_by_class = {}
         no_dual = []
         # .items() for the same reason as _attach_dual_suffixes: the failure
@@ -489,7 +489,17 @@ class IpoptOuterBound(LagrangianOuterBound):
                     type(e).__name__, []).append(f"{sname} ({e})")
                 s._mpisppy_data.outer_bound = None
             else:
-                no_dual.extend(scenario_no_dual)
+                # `is not None`, not merely "did not raise". Populating
+                # missing_duals happens before the work that decides whether
+                # there is a bound at all, and certified_lower_bound RETURNS
+                # None on two ordinary outcomes for this spoke -- an unbounded
+                # variable with a nonzero gradient component in phi, and a
+                # non-finite qhat. Merging on the raise path alone left the
+                # same falsehood in place for those: "the bound is looser than
+                # it could be but still valid" said of a scenario that has no
+                # bound, and the missing_duals key burnt for the run.
+                if s._mpisppy_data.outer_bound is not None:
+                    no_dual.extend(scenario_no_dual)
 
         # The set of classes to warn about must be GLOBAL. The key drives
         # _warn_once_collectively, and ranks entering it with different keys,
@@ -503,7 +513,11 @@ class IpoptOuterBound(LagrangianOuterBound):
             self._warn_once_collectively(
                 f"certificate_failed:{cls}",
                 bool(here),
-                # cls and here bound now: the lambda outlives this iteration.
+                # Bound as defaults rather than captured: the loop rebinds
+                # both names, and a closure over them would report the last
+                # class for every key. (_warn_once_collectively calls this
+                # synchronously and does not store it, so this is about the
+                # loop, not about lifetime.)
                 lambda cls=cls, here=here: (
                     f"ipopt_outer_bound: no certificate ({cls}) for "
                     f"{len(here)} scenario(s) on rank {self.cylinder_rank}, "
