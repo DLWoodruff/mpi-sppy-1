@@ -123,9 +123,9 @@ The trap: `q_s` is defined by an *infimum*. Handing `φ_s` to Ipopt and solving 
 returns a point, and the value at that point is ≥ the infimum — an upper bound on
 `q_s`, which is the wrong direction again. **A second NLP solve does not by itself
 produce a certificate.** This is the one place where the original sketch for this
-cylinder (solve, take λ, solve the dual, report) does not close.
+cylinder (solve, take λ, solve the dual, report) does not give a valid bound.
 
-### 3.3 What does close it: a linear underestimator over the box
+### 3.3 What does give one: a linear underestimator over the box
 
 `φ_s` is convex on `B`, so for any point `v̂ ∈ B` the tangent at `v̂` lies below it:
 
