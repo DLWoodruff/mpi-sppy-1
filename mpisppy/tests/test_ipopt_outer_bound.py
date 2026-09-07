@@ -440,10 +440,20 @@ class TestDualSuffixGuard(unittest.TestCase):
         # A scenario_creator supplying dual warm starts attaches EXPORT;
         # reusing it would import nothing and the certificate would see no
         # multipliers at all.
-        m = _certifiable_scenario()
+        # Unnamed, keyed "Scen0", for the same reason as the test below:
+        # _certifiable_scenario() names the model "Scen0" too, so this passed
+        # whether the message used the key or the model name.
+        m = pyo.ConcreteModel()
+        m.x = pyo.Var(bounds=(0, 10), initialize=1.0)
+        m.c = pyo.Constraint(expr=m.x >= 1)
+        m.obj = pyo.Objective(expr=m.x, sense=pyo.minimize)
         m.dual = pyo.Suffix(direction=pyo.Suffix.EXPORT)
-        with self.assertRaisesRegex(CertificateError, "does not import"):
+        with self.assertRaises(CertificateError) as ctx:
             self._spoke_over(m)._attach_dual_suffixes()
+        message = str(ctx.exception)
+        self.assertIn("does not import", message)
+        self.assertIn("Scen0", message)
+        self.assertNotIn("unknown", message)
 
     def test_a_dual_that_is_not_a_suffix_is_rejected_by_name(self):
         # getattr returns whatever the scenario_creator declared, and `dual` is
@@ -612,29 +622,47 @@ class TestFbbtExceptionsStandDown(unittest.TestCase):
         return m
 
     def _unanalyzable_scenarios(self):
+        """label -> (builder, the class fbbt raises on it).
+
+        The class is carried, not just asserted to be "some exception": two
+        rows that collapsed onto the same class would silently stop covering
+        the other one, which is the failure this table exists to prevent.
+        """
+        from pyomo.common.errors import IntervalException
         return {
-            "negative base to a variable power": self._negative_base_scenario,
-            "overflow in interval.power": self._overflowing_power_scenario,
+            "negative base to a variable power":
+                (self._negative_base_scenario, IntervalException),
+            "overflow in interval.power":
+                (self._overflowing_power_scenario, OverflowError),
         }
 
     def test_the_scenarios_are_admitted_by_the_certifiability_check(self):
         # If this ever stops holding, the fbbt call is unreachable for that
         # model and its case below stops testing anything.
         from mpisppy.utils.dual_certificate import check_model_is_certifiable
-        for label, build in self._unanalyzable_scenarios().items():
+        for label, (build, _) in self._unanalyzable_scenarios().items():
             with self.subTest(label):
                 check_model_is_certifiable(build())
 
-    def test_fbbt_really_raises_on_each_of_them(self):
-        # The premise of the test below: no exception, nothing being caught.
+    def test_fbbt_raises_the_expected_class_on_each_of_them(self):
+        # The premise of the tests below, twice over: that fbbt raises at all
+        # (no exception, nothing being caught) and that the two rows still
+        # cover two DIFFERENT classes. Note the build is outside assertRaises:
+        # a model that started raising at CONSTRUCTION would otherwise satisfy
+        # the assertion while testing nothing.
         from mpisppy.utils.dual_certificate import unbounded_variables
-        for label, build in self._unanalyzable_scenarios().items():
+        seen = {}
+        for label, (build, expected) in self._unanalyzable_scenarios().items():
             with self.subTest(label):
-                with self.assertRaises(Exception):
-                    unbounded_variables(build(), do_fbbt=True)
+                scenario = build()
+                with self.assertRaises(expected):
+                    unbounded_variables(scenario, do_fbbt=True)
+                seen[label] = expected
+        self.assertEqual(len(set(seen.values())), len(seen),
+                         "two rows collapsed onto one exception class")
 
     def test_fbbt_raising_does_not_escape_the_guard(self):
-        for label, build in self._unanalyzable_scenarios().items():
+        for label, (build, _) in self._unanalyzable_scenarios().items():
             with self.subTest(label):
                 spoke = self._spoke_over(build())
                 with warnings.catch_warnings(record=True) as caught:
@@ -658,7 +686,7 @@ class TestFbbtExceptionsStandDown(unittest.TestCase):
         # Losing the tightening costs looseness. Losing the diagnostic would
         # cost the user the one message that explains an empty 'N' column, so
         # the scan is redone without fbbt.
-        for label, build in self._unanalyzable_scenarios().items():
+        for label, (build, _) in self._unanalyzable_scenarios().items():
             with self.subTest(label):
                 spoke = self._spoke_over(build())
                 with warnings.catch_warnings(record=True) as caught:
@@ -884,6 +912,58 @@ class TestCertificateFailureStandsDown(unittest.TestCase):
         m._mpisppy_data = type(
             "_D", (), {"solution_available": True, "outer_bound": "UNSET"})()
         return m
+
+    def _scenario_differentiate_cannot_handle(self):
+        """A model certified_lower_bound cannot differentiate.
+
+        cosh IS convex, so check_model_is_certifiable admits it and this is a
+        model the spoke targets, not an abuse. Pyomo's differentiate has no
+        rule for it and raises DifferentiationException, which derives
+        straight from Exception -- not ValueError, not ArithmeticError, not
+        even PyomoException -- so the enumerated catch this replaces let it
+        out of the iteration loop, every iteration, aborting the wheel.
+        sinh, tanh, ceil, floor, Expr_if and abs(x) at x=0 are the same story.
+        """
+        m = pyo.ConcreteModel()                   # unnamed on purpose
+        m.x = pyo.Var(bounds=(-2, 2), initialize=0.5)
+        m.y = pyo.Var(bounds=(0, 100), initialize=5.0)
+        m.dual = pyo.Suffix(direction=pyo.Suffix.IMPORT)
+        m.c = pyo.Constraint(expr=pyo.cosh(m.x) <= m.y)
+        m.dual[m.c] = -1.0
+        m.obj = pyo.Objective(expr=m.y)
+        m._mpisppy_data = type(
+            "_D", (), {"solution_available": True, "outer_bound": "UNSET"})()
+        return m
+
+    def test_the_model_is_one_the_spoke_targets(self):
+        # Otherwise the test below is about an abuse rather than about a
+        # convex model the certificate is supposed to handle.
+        from mpisppy.utils.dual_certificate import check_model_is_certifiable
+        check_model_is_certifiable(self._scenario_differentiate_cannot_handle())
+
+    def test_a_differentiation_failure_becomes_no_bound(self):
+        from mpisppy.utils.dual_certificate import certified_lower_bound
+        scenario = self._scenario_differentiate_cannot_handle()
+        # the premise: it really does raise, and really is outside the list
+        with self.assertRaises(Exception) as ctx:
+            certified_lower_bound(scenario, sign_convention="ipopt",
+                                  eps_rel=1e-9)
+        self.assertNotIsInstance(
+            ctx.exception, (CertificateError, ValueError, ArithmeticError),
+            "no longer outside the old enumerated catch; pick another model")
+
+        spoke = self._spoke_over(self._scenario_differentiate_cannot_handle())
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            result = spoke.lagrangian()           # must not raise
+        self.assertEqual(result, "EBOUND")
+        message = next(str(w.message) for w in caught
+                       if "no certificate" in str(w.message))
+        # the class is reported, so a genuine bug stays legible
+        self.assertIn("DifferentiationException", message)
+        # and the scenario is named by its local_scenarios KEY, not s.name
+        self.assertIn("Scen0", message)
+        self.assertNotIn("unknown", message)
 
     def test_value_error_becomes_no_bound(self):
         scenario = self._scenario_with_uninitialized_var()

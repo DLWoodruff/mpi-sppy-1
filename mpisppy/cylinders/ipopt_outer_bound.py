@@ -446,18 +446,33 @@ class IpoptOuterBound(LagrangianOuterBound):
                 s._mpisppy_data.outer_bound = certified_lower_bound(
                     s, sign_convention="ipopt", eps_rel=self._cushion,
                     missing_duals=no_dual)
-            except (CertificateError, ValueError, ArithmeticError) as e:
-                # CertificateError is the module's own signal (e.g. a routine
-                # solver outcome leaving a constraint without a dual). The
-                # other two are what evaluating phi and its gradient at the
-                # returned point can raise on the very class of model this
-                # spoke targets: ValueError from an uninitialized Var or from
+            except Exception as e:
+                # `except Exception` for the same reason as the fbbt call in
+                # _check_setup_guards, and the enumerated list this replaces
+                # was wrong for the same reason. It read:
+                #
+                #   (CertificateError, ValueError, ArithmeticError)
+                #
+                # CertificateError being the module's own signal, ValueError
+                # what evaluating phi raises on an uninitialized Var or on
                 # `math domain error` when bound_relax_factor puts the iterate
-                # a hair outside a bound under a log or a sqrt, ArithmeticError
-                # from an overflow. All three mean the same thing here -- no
-                # certificate this iteration -- and none is worth taking down
-                # the hub and every other spoke from inside the iteration loop.
-                failures.append(f"{sname} ({e})")
+                # a hair outside a log or a sqrt, ArithmeticError an overflow.
+                # The list looked defensible because dual_certificate is
+                # disciplined about its error type -- it converts even the
+                # objective finder's RuntimeError into CertificateError. But
+                # certified_lower_bound calls Pyomo's differentiate(), which
+                # carries no such promise: it raises DifferentiationException,
+                # derived straight from Exception, on models this spoke
+                # TARGETS. `cosh(x) <= y` is convex and admitted by
+                # check_model_is_certifiable, and differentiate has no rule for
+                # it; so are sinh, tanh, ceil, floor and Expr_if, and abs(x) at
+                # x=0 raises it too. Each one aborted the hub and every other
+                # cylinder from inside the iteration loop, every iteration.
+                #
+                # The property is the one already stated below: no certificate
+                # this iteration is not worth the wheel. The exception class is
+                # reported so a genuine bug in our own code is still legible.
+                failures.append(f"{sname} ({type(e).__name__}: {e})")
                 s._mpisppy_data.outer_bound = None
 
         self._warn_once_collectively(
