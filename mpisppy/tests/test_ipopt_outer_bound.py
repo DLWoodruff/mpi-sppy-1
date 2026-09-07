@@ -1104,8 +1104,96 @@ class TestCertificateFailureStandsDown(unittest.TestCase):
             warnings.simplefilter("always")
             spoke.lagrangian()
         messages = [str(w.message) for w in caught]
-        self.assertTrue(any("produced no bound" in m for m in messages),
+        self.assertTrue(any("no bound" in m for m in messages),
                         f"silent: an empty 'N' column with no reason. {messages}")
+        # and it names WHICH cause, with advice that fits it
+        self.assertTrue(
+            any("a variable with no finite bound" in m for m in messages),
+            messages)
+        self.assertTrue(any("finite bounds is the fix" in m for m in messages),
+                        messages)
+
+    def test_a_non_finite_value_is_not_blamed_on_unbounded_variables(self):
+        """One flat key, or one message naming two causes, sends the user
+        hunting for an unbounded variable that does not exist."""
+        m = pyo.ConcreteModel()
+        m.x = pyo.Var(bounds=(0, 10), initialize=1.0)
+        m.dual = pyo.Suffix(direction=pyo.Suffix.IMPORT)
+        m.c = pyo.Constraint(expr=m.x >= 1)
+        m.dual[m.c] = float("nan")                # a diverged solve's duals
+        m.obj = pyo.Objective(expr=m.x)
+        m._mpisppy_data = type(
+            "_D", (), {"solution_available": True, "outer_bound": "UNSET"})()
+
+        spoke = self._spoke_over(m)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            spoke.lagrangian()
+        messages = [str(w.message) for w in caught]
+        self.assertIsNone(m._mpisppy_data.outer_bound, messages)
+        self.assertTrue(any("a non-finite value" in m for m in messages),
+                        messages)
+        # every variable here IS bounded; saying otherwise is a wild goose chase
+        self.assertFalse(any("finite bounds is the fix" in m for m in messages),
+                         messages)
+
+    def test_a_scenario_with_no_solution_is_not_silent(self):
+        """solve_loop reports the failed solve; only this cylinder can report
+        that Ebound is all-or-nothing so the whole spoke stood down."""
+        m = self._scenario_with_a_bound_and_a_missing_dual()
+        m._mpisppy_data.solution_available = False
+
+        spoke = self._spoke_over(m)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            spoke.lagrangian()
+        messages = [str(w.message) for w in caught]
+        self.assertIsNone(m._mpisppy_data.outer_bound)
+        self.assertTrue(any("no solution was loaded" in m for m in messages),
+                        f"the last silent path. {messages}")
+
+    def test_a_second_no_bound_cause_still_warns_on_the_same_spoke(self):
+        """The reason the key carries the cause.
+
+        _warn_once_collectively consumes a key for the life of the run, so one
+        flat "no_bound_returned" key is spent by whichever cause arrives first
+        and every other cause is silent from then on -- the burnt-key problem
+        that keying failures_by_class per class was meant to end. A fresh
+        spoke per test cannot see this: it takes two iterations on ONE spoke.
+        """
+        def warnings_from(spoke):
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                spoke.lagrangian()
+            return [str(w.message) for w in caught]
+
+        # iteration 1: an unbounded variable
+        spoke = self._spoke_over(self._scenario_with_no_bound_and_a_missing_dual())
+        first = warnings_from(spoke)
+        self.assertTrue(any("a variable with no finite bound" in m
+                            for m in first), first)
+
+        # iteration 2, same spoke so _warned persists: a different cause
+        nan_scenario = pyo.ConcreteModel()
+        nan_scenario.x = pyo.Var(bounds=(0, 10), initialize=1.0)
+        nan_scenario.dual = pyo.Suffix(direction=pyo.Suffix.IMPORT)
+        nan_scenario.c = pyo.Constraint(expr=nan_scenario.x >= 1)
+        nan_scenario.dual[nan_scenario.c] = float("nan")
+        nan_scenario.obj = pyo.Objective(expr=nan_scenario.x)
+        nan_scenario._mpisppy_data = type(
+            "_D", (), {"solution_available": True, "outer_bound": "UNSET"})()
+        spoke.opt.local_scenarios = {"Scen0": nan_scenario}
+        second = warnings_from(spoke)
+        self.assertTrue(
+            any("a non-finite value" in m for m in second),
+            f"a second cause was swallowed by the first one's key: {second}")
+
+        # and the first cause does not warn twice
+        spoke.opt.local_scenarios = {
+            "Scen0": self._scenario_with_no_bound_and_a_missing_dual()}
+        third = warnings_from(spoke)
+        self.assertFalse(any("no finite bound" in m for m in third),
+                         f"once per cause, not once per iteration: {third}")
 
     def test_value_error_becomes_no_bound(self):
         scenario = self._scenario_with_uninitialized_var()

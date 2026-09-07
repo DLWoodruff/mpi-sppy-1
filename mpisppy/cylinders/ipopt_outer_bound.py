@@ -437,7 +437,12 @@ class IpoptOuterBound(LagrangianOuterBound):
         # otherwise buy, and it is not a trade worth making.
         failures_by_class = {}
         no_dual = []
-        no_bound = []
+        # Keyed by CAUSE, for the reason failures_by_class is keyed by class:
+        # one flat key is consumed by whichever cause happens to arrive first
+        # and silences every other one for the rest of the run. The three are
+        # distinguishable here and want different advice -- bounding variables
+        # fixes one of them and is a wild goose chase for the other two.
+        no_bound_by_cause = {}
         # .items() for the same reason as _attach_dual_suffixes: the failure
         # message has to name the scenario by its local_scenarios key. s.name
         # is the Pyomo model name, which SPBase never sets.
@@ -447,7 +452,14 @@ class IpoptOuterBound(LagrangianOuterBound):
             # with None when there is no certificate to be had -- Ebound then
             # declines collectively rather than folding a -inf into the sum.
             if not s._mpisppy_data.solution_available:
+                # Counted, not just skipped. solve_loop(gripe=True) reports the
+                # failed solve, but not the consequence this cylinder is the
+                # only one that can state: Ebound is all-or-nothing, so the
+                # whole spoke stood down for the iteration, not just this
+                # scenario. Leaving it uncounted was the last silent path.
                 s._mpisppy_data.outer_bound = None
+                no_bound_by_cause.setdefault(
+                    "no solution was loaded", []).append(sname)
                 continue
             # Into a per-scenario list, merged into no_dual only if the call
             # produces A BOUND -- not merely if it returns; see the `else`
@@ -510,7 +522,15 @@ class IpoptOuterBound(LagrangianOuterBound):
                     # nothing said anywhere. Dropping the false "looser but
                     # still valid" message is an improvement only if something
                     # true takes its place.
-                    no_bound.append(sname)
+                    #
+                    # Which of the two return-None cases it was is worth
+                    # separating, because the advice differs. do_fbbt=False:
+                    # a pure scan, and the box was already tightened at setup.
+                    if unbounded_variables(s, do_fbbt=False):
+                        cause = "a variable with no finite bound"
+                    else:
+                        cause = "a non-finite value"
+                    no_bound_by_cause.setdefault(cause, []).append(sname)
 
         # The set of classes to warn about must be GLOBAL. The key drives
         # _warn_once_collectively, and ranks entering it with different keys,
@@ -541,20 +561,36 @@ class IpoptOuterBound(LagrangianOuterBound):
                     "once per exception class."
                 ),
             )
-        self._warn_once_collectively(
-            "no_bound_returned",
-            bool(no_bound),
-            lambda: (
-                f"ipopt_outer_bound: the certificate produced no bound for "
-                f"{len(no_bound)} scenario(s) on rank {self.cylinder_rank}, "
-                f"for example {no_bound[0]}, without failing -- a variable "
-                "with no finite bound whose gradient component in phi is "
-                "nonzero, or a non-finite value. Ebound is all-or-nothing, so "
-                "this cylinder reports NO bound on such an iteration, not "
-                "merely for the scenarios named. Bounding those variables is "
-                "the fix. Printed once."
-            ),
-        )
+        # The cause set must be global, for the same reason the class set is:
+        # the key drives _warn_once_collectively, and ranks entering it with
+        # different keys, or in a different order, is a hang.
+        _ADVICE = {
+            "a variable with no finite bound":
+                "Giving those variables finite bounds is the fix; the "
+                "unbounded-variable warning at setup names them.",
+            "a non-finite value":
+                "NaN or an infinity in the point or the duals, which usually "
+                "means the solve diverged rather than that anything is "
+                "unbounded -- bounds will not help.",
+            "no solution was loaded":
+                "The solve itself failed; solve_loop reports it separately.",
+        }
+        all_causes = sorted(set().union(
+            *self.cylinder_comm.allgather(set(no_bound_by_cause))))
+        for cause in all_causes:
+            here = no_bound_by_cause.get(cause, [])
+            self._warn_once_collectively(
+                f"no_bound_returned:{cause}",
+                bool(here),
+                lambda cause=cause, here=here: (
+                    f"ipopt_outer_bound: no bound for {len(here)} scenario(s) "
+                    f"on rank {self.cylinder_rank}, for example {here[0]} -- "
+                    f"{cause}. Ebound is all-or-nothing, so this cylinder "
+                    "reports NO bound on such an iteration, not merely for "
+                    f"the scenarios named. {_ADVICE[cause]} Printed once per "
+                    "cause."
+                ),
+            )
         self._warn_once_collectively(
             "missing_duals",
             bool(no_dual),
