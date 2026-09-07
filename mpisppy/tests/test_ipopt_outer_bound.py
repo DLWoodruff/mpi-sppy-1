@@ -1284,6 +1284,62 @@ class TestCertificateFailureStandsDown(unittest.TestCase):
         self.assertFalse(any("bounds will not help" in m for m in messages),
                          f"asserted a cause nobody classified: {messages}")
 
+    def test_a_nan_beats_an_unbounded_variable_regardless_of_order(self):
+        """Screening per component only moved the misclassification.
+
+        The bound-selection loop returns on the first UNBOUNDED component too,
+        so whichever came first in vlist won. Here `x` is unbounded above and
+        appears ONLY in the objective, so its gradient stays finite while the
+        NaN dual on a constraint over `y` poisons a different component -- and
+        `x` is visited first. The user was told to bound `x`, which does not
+        help, and the unbounded_box key was burnt so the NaN could never be
+        reported for the rest of the run.
+        """
+        m = pyo.ConcreteModel()
+        m.x = pyo.Var(within=pyo.NonNegativeReals, initialize=1.0)
+        m.y = pyo.Var(bounds=(0, 10), initialize=1.0)
+        m.dual = pyo.Suffix(direction=pyo.Suffix.IMPORT)
+        m.c = pyo.Constraint(expr=m.y >= 1)       # x is NOT in it
+        m.dual[m.c] = float("nan")
+        m.obj = pyo.Objective(expr=-m.x + m.y)    # x needs an ub it lacks
+        m._mpisppy_data = type(
+            "_D", (), {"solution_available": True, "outer_bound": "UNSET"})()
+
+        spoke = self._spoke_over(m)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            spoke.lagrangian()
+        messages = [str(w.message) for w in caught]
+        self.assertIsNone(m._mpisppy_data.outer_bound, messages)
+        self.assertTrue(any("non-finite value" in m for m in messages),
+                        messages)
+        self.assertFalse(
+            any("unbounded below" in m for m in messages),
+            f"the earlier unbounded component won the race: {messages}")
+
+    def test_an_unknown_tag_does_not_abort_the_wheel(self):
+        """A new return-None site recording a NEW tag used to KeyError inside
+        lagrangian(), aborting the wheel every iteration."""
+        from unittest import mock
+        scenario = self._scenario_with_a_bound_and_a_missing_dual()
+        spoke = self._spoke_over(scenario)
+
+        def _records_an_unknown_tag(*args, **kwargs):
+            kwargs["no_bound_reason"].append(("a_tag_from_the_future", "hi"))
+            return None
+
+        with mock.patch(
+            "mpisppy.cylinders.ipopt_outer_bound.certified_lower_bound",
+            side_effect=_records_an_unknown_tag,
+        ):
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                result = spoke.lagrangian()       # must not raise
+        self.assertEqual(result, "EBOUND")
+        self.assertTrue(
+            any("recorded no reason" in str(w.message) for w in caught),
+            [str(w.message) for w in caught])
+
     def test_value_error_becomes_no_bound(self):
         scenario = self._scenario_with_uninitialized_var()
         spoke = self._spoke_over(scenario)

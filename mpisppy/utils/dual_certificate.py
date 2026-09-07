@@ -341,19 +341,30 @@ def certified_lower_bound(model, sign_convention="ipopt", eps_rel=1e-9,
 
     correction = 0.0
     if vlist:
-        grad = differentiate(phi, wrt_list=vlist, mode=Modes.reverse_numeric)
+        grad = [float(g) for g in
+                differentiate(phi, wrt_list=vlist, mode=Modes.reverse_numeric)]
+
+        # The WHOLE gradient is screened before any bound is selected, and
+        # non_finite therefore wins over unbounded_box unconditionally. Both
+        # of those matter:
+        #
+        # - Before, because NaN answers False to every comparison. `g == 0.0`
+        #   and `g > 0.0` are both False for it, so a NaN component silently
+        #   took the `v.ub` branch and, on the very common NonNegativeReals
+        #   shape, found ub is None and reported an unbounded box -- a
+        #   diverged solve dressed as a missing bound.
+        # - Unconditionally, because screening per component only moved that:
+        #   the loop returns on the first UNBOUNDED component too, so
+        #   whichever came first in vlist won. A variable that is unbounded and
+        #   appears only in the objective keeps a finite gradient while a NaN
+        #   dual poisons another component, and the user was told to bound a
+        #   variable when the actual trouble was the NaN. With a NaN anywhere
+        #   in phi, the component that looks unbounded is itself untrustworthy,
+        #   so it is not a competing explanation.
+        #
+        # Returning here rather than falling through to the qhat screen also
+        # keeps `bound - vhat` from being evaluated against a None bound.
         for v, g in zip(vlist, grad):
-            g = float(g)
-            if g == 0.0:
-                continue
-            # BEFORE the bound selection, because NaN answers False to every
-            # comparison: `g == 0.0` and `g > 0.0` are both False for it, so a
-            # NaN gradient silently took the `v.ub` branch and, on the very
-            # common `NonNegativeReals` shape, found ub is None and reported an
-            # unbounded box. That is a diverged solve mislabelled as a missing
-            # bound -- the misclassification this out-parameter exists to end,
-            # and returning here rather than falling through to the qhat screen
-            # keeps `bound - vhat` from being evaluated against a None bound.
             if not math.isfinite(g):
                 if no_bound_reason is not None:
                     no_bound_reason.append((
@@ -361,6 +372,10 @@ def certified_lower_bound(model, sign_convention="ipopt", eps_rel=1e-9,
                         f"the gradient component for {v.name} is {g}",
                     ))
                 return None
+
+        for v, g in zip(vlist, grad):
+            if g == 0.0:
+                continue
             vhat = pyo.value(v)
             # min over [lo, hi] of a linear term goes to whichever end the
             # gradient points away from.

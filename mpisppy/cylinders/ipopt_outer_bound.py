@@ -608,7 +608,12 @@ class IpoptOuterBound(LagrangianOuterBound):
             *self.cylinder_comm.allgather(set(no_bound_by_cause))))
         for tag in all_tags:
             here = no_bound_by_cause.get(tag, [])
-            what, advice = _CAUSES[tag]
+            # .get, not [tag]: a return-None site recording a NEW tag would
+            # otherwise KeyError inside lagrangian() and abort the wheel every
+            # iteration -- worse than the wrong-advice symptom the
+            # "unclassified" entry was added to prevent, and the harder half of
+            # the same gap. That entry reads correctly for any unknown tag.
+            what, advice = _CAUSES.get(tag, _CAUSES["unclassified"])
             self._warn_once_collectively(
                 f"no_bound_returned:{tag}",
                 bool(here),
