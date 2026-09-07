@@ -458,8 +458,7 @@ class IpoptOuterBound(LagrangianOuterBound):
                 # whole spoke stood down for the iteration, not just this
                 # scenario. Leaving it uncounted was the last silent path.
                 s._mpisppy_data.outer_bound = None
-                no_bound_by_cause.setdefault(
-                    "no solution was loaded", []).append(sname)
+                no_bound_by_cause.setdefault("no_solution", []).append(sname)
                 continue
             # Into a per-scenario list, merged into no_dual only if the call
             # produces A BOUND -- not merely if it returns; see the `else`
@@ -469,10 +468,12 @@ class IpoptOuterBound(LagrangianOuterBound):
             # bound is looser but still valid" -- false -- and burn the
             # missing_duals warn-once key, hiding a real tightness loss later.
             scenario_no_dual = []
+            scenario_reason = []
             try:
                 s._mpisppy_data.outer_bound = certified_lower_bound(
                     s, sign_convention="ipopt", eps_rel=self._cushion,
-                    missing_duals=scenario_no_dual)
+                    missing_duals=scenario_no_dual,
+                    no_bound_reason=scenario_reason)
             except Exception as e:
                 # `except Exception` for the same reason as the fbbt call in
                 # _check_setup_guards, and the enumerated list this replaces
@@ -523,14 +524,20 @@ class IpoptOuterBound(LagrangianOuterBound):
                     # still valid" message is an improvement only if something
                     # true takes its place.
                     #
-                    # Which of the two return-None cases it was is worth
-                    # separating, because the advice differs. do_fbbt=False:
-                    # a pure scan, and the box was already tightened at setup.
-                    if unbounded_variables(s, do_fbbt=False):
-                        cause = "a variable with no finite bound"
-                    else:
-                        cause = "a non-finite value"
-                    no_bound_by_cause.setdefault(cause, []).append(sname)
+                    # Which of the two return-None cases it was comes from
+                    # the engine, which knows. Re-deriving it by scanning the
+                    # model for an unbounded variable was wrong in one
+                    # direction: that scan also finds variables absent from
+                    # phi, variables whose gradient component is zero, and
+                    # variables unbounded on the side never consulted, so a
+                    # non-finite result on a model that merely contains one
+                    # was reported as unbounded -- with the advice for the
+                    # wrong cause, and the right cause's key left unburnt but
+                    # unreachable, since the condition recurs every iteration.
+                    tag, detail = (scenario_reason[0] if scenario_reason
+                                   else ("non_finite", "no reason recorded"))
+                    no_bound_by_cause.setdefault(tag, []).append(
+                        f"{sname} ({detail})")
 
         # The set of classes to warn about must be GLOBAL. The key drives
         # _warn_once_collectively, and ranks entering it with different keys,
@@ -564,31 +571,43 @@ class IpoptOuterBound(LagrangianOuterBound):
         # The cause set must be global, for the same reason the class set is:
         # the key drives _warn_once_collectively, and ranks entering it with
         # different keys, or in a different order, is a hang.
-        _ADVICE = {
-            "a variable with no finite bound":
-                "Giving those variables finite bounds is the fix; the "
-                "unbounded-variable warning at setup names them.",
-            "a non-finite value":
+        # tag -> (what happened, what to do about it). The tags come from
+        # certified_lower_bound, except "no_solution", which is this loop's.
+        # The advice is per cause because it differs: bounding a variable fixes
+        # one of these and is a wild goose chase for the other two.
+        _CAUSES = {
+            "unbounded_box": (
+                "the box minimization was unbounded below",
+                "Giving that variable a finite bound is the fix -- the "
+                "example above names it and the side it is missing.",
+            ),
+            "non_finite": (
+                "the arithmetic produced a non-finite value",
                 "NaN or an infinity in the point or the duals, which usually "
                 "means the solve diverged rather than that anything is "
                 "unbounded -- bounds will not help.",
-            "no solution was loaded":
-                "The solve itself failed; solve_loop reports it separately.",
+            ),
+            "no_solution": (
+                "the solve produced no loadable solution",
+                "solve_loop reports the solve itself; what only this cylinder "
+                "can say is that the whole spoke stood down, not just that "
+                "scenario.",
+            ),
         }
-        all_causes = sorted(set().union(
+        all_tags = sorted(set().union(
             *self.cylinder_comm.allgather(set(no_bound_by_cause))))
-        for cause in all_causes:
-            here = no_bound_by_cause.get(cause, [])
+        for tag in all_tags:
+            here = no_bound_by_cause.get(tag, [])
+            what, advice = _CAUSES[tag]
             self._warn_once_collectively(
-                f"no_bound_returned:{cause}",
+                f"no_bound_returned:{tag}",
                 bool(here),
-                lambda cause=cause, here=here: (
+                lambda tag=tag, here=here, what=what, advice=advice: (
                     f"ipopt_outer_bound: no bound for {len(here)} scenario(s) "
-                    f"on rank {self.cylinder_rank}, for example {here[0]} -- "
-                    f"{cause}. Ebound is all-or-nothing, so this cylinder "
+                    f"on rank {self.cylinder_rank} -- {what}. For example "
+                    f"{here[0]}. Ebound is all-or-nothing, so this cylinder "
                     "reports NO bound on such an iteration, not merely for "
-                    f"the scenarios named. {_ADVICE[cause]} Printed once per "
-                    "cause."
+                    f"the scenarios named. {advice} Printed once per cause."
                 ),
             )
         self._warn_once_collectively(

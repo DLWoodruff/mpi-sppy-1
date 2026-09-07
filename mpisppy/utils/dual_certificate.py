@@ -282,7 +282,7 @@ def _lagrangian_expression(model, conv):
 
 
 def certified_lower_bound(model, sign_convention="ipopt", eps_rel=1e-9,
-                          missing_duals=None):
+                          missing_duals=None, no_bound_reason=None):
     """A number guaranteed <= the model's optimal value, or None.
 
     `model` must already be solved, with its `dual` Suffix populated and its
@@ -294,6 +294,15 @@ def certified_lower_bound(model, sign_convention="ipopt", eps_rel=1e-9,
     phi, and also when the arithmetic produces a non-finite result -- a NaN or
     an infinity arriving from a diverged solve.  None means "no bound this
     time", never "-inf".
+
+    `no_bound_reason`, if given a list, receives one `(tag, detail)` pair
+    saying WHICH of those two it was: `("unbounded_box", <the variable and the
+    side>)` or `("non_finite", ...)`.  The caller cannot reliably re-derive
+    this -- scanning the model for a variable with an infinite bound also finds
+    variables absent from phi, variables whose gradient component is zero, and
+    variables unbounded only on the side never consulted, so a non-finite
+    result on a model that happens to contain one is misreported as unbounded.
+    The tag is stable; the detail is for humans.
 
     `eps_rel` shaves a relative cushion off the result.  At the default 1e-9
     this is last-bit hygiene, not a proof-carrying margin; pass 0.0 to get the
@@ -342,6 +351,13 @@ def certified_lower_bound(model, sign_convention="ipopt", eps_rel=1e-9,
             # gradient points away from.
             bound = v.lb if g > 0.0 else v.ub
             if bound is None:
+                if no_bound_reason is not None:
+                    side = "lower" if g > 0.0 else "upper"
+                    no_bound_reason.append((
+                        "unbounded_box",
+                        f"{v.name} has no finite {side} bound and a nonzero "
+                        "gradient component in phi",
+                    ))
                 return None
             correction += g * (bound - vhat)
 
@@ -361,6 +377,11 @@ def certified_lower_bound(model, sign_convention="ipopt", eps_rel=1e-9,
     # -inf and publish it: -inf is a number, so unlike NaN it survives every
     # downstream test and is folded into Ebound's sum as though it were a bound.
     if not math.isfinite(qhat):
+        if no_bound_reason is not None:
+            no_bound_reason.append((
+                "non_finite",
+                "the arithmetic produced a non-finite value",
+            ))
         return None
 
     return qhat

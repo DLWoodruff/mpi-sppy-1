@@ -1108,9 +1108,11 @@ class TestCertificateFailureStandsDown(unittest.TestCase):
                         f"silent: an empty 'N' column with no reason. {messages}")
         # and it names WHICH cause, with advice that fits it
         self.assertTrue(
-            any("a variable with no finite bound" in m for m in messages),
-            messages)
-        self.assertTrue(any("finite bounds is the fix" in m for m in messages),
+            any("unbounded below" in m for m in messages), messages)
+        self.assertTrue(any("finite bound is the fix" in m for m in messages),
+                        messages)
+        # and it names the variable and the side, from the engine
+        self.assertTrue(any("no finite lower bound" in m for m in messages),
                         messages)
 
     def test_a_non_finite_value_is_not_blamed_on_unbounded_variables(self):
@@ -1131,10 +1133,10 @@ class TestCertificateFailureStandsDown(unittest.TestCase):
             spoke.lagrangian()
         messages = [str(w.message) for w in caught]
         self.assertIsNone(m._mpisppy_data.outer_bound, messages)
-        self.assertTrue(any("a non-finite value" in m for m in messages),
+        self.assertTrue(any("non-finite value" in m for m in messages),
                         messages)
         # every variable here IS bounded; saying otherwise is a wild goose chase
-        self.assertFalse(any("finite bounds is the fix" in m for m in messages),
+        self.assertFalse(any("finite bound is the fix" in m for m in messages),
                          messages)
 
     def test_a_scenario_with_no_solution_is_not_silent(self):
@@ -1149,7 +1151,7 @@ class TestCertificateFailureStandsDown(unittest.TestCase):
             spoke.lagrangian()
         messages = [str(w.message) for w in caught]
         self.assertIsNone(m._mpisppy_data.outer_bound)
-        self.assertTrue(any("no solution was loaded" in m for m in messages),
+        self.assertTrue(any("no loadable solution" in m for m in messages),
                         f"the last silent path. {messages}")
 
     def test_a_second_no_bound_cause_still_warns_on_the_same_spoke(self):
@@ -1170,8 +1172,7 @@ class TestCertificateFailureStandsDown(unittest.TestCase):
         # iteration 1: an unbounded variable
         spoke = self._spoke_over(self._scenario_with_no_bound_and_a_missing_dual())
         first = warnings_from(spoke)
-        self.assertTrue(any("a variable with no finite bound" in m
-                            for m in first), first)
+        self.assertTrue(any("unbounded below" in m for m in first), first)
 
         # iteration 2, same spoke so _warned persists: a different cause
         nan_scenario = pyo.ConcreteModel()
@@ -1185,15 +1186,48 @@ class TestCertificateFailureStandsDown(unittest.TestCase):
         spoke.opt.local_scenarios = {"Scen0": nan_scenario}
         second = warnings_from(spoke)
         self.assertTrue(
-            any("a non-finite value" in m for m in second),
+            any("non-finite value" in m for m in second),
             f"a second cause was swallowed by the first one's key: {second}")
 
         # and the first cause does not warn twice
         spoke.opt.local_scenarios = {
             "Scen0": self._scenario_with_no_bound_and_a_missing_dual()}
         third = warnings_from(spoke)
-        self.assertFalse(any("no finite bound" in m for m in third),
+        self.assertFalse(any("unbounded below" in m for m in third),
                          f"once per cause, not once per iteration: {third}")
+
+    def test_a_non_finite_value_alongside_an_irrelevant_unbounded_var(self):
+        """The configuration the old scan-based classifier misread.
+
+        `z` has no upper bound but is absent from phi's gradient, so it is NOT
+        why there is no bound -- the NaN dual is. Scanning the model for any
+        variable with an infinite bound found `z` and reported the unbounded
+        cause, with the advice for it, and burnt that key; the real cause then
+        had no way to be reported for the rest of the run even though it
+        recurs every iteration. The engine reports which site fired, so this
+        cannot be got wrong by re-derivation.
+        """
+        m = pyo.ConcreteModel()
+        m.x = pyo.Var(bounds=(0, 10), initialize=1.0)
+        m.z = pyo.Var(bounds=(0, None), initialize=0.0)   # unbounded, unused
+        m.dual = pyo.Suffix(direction=pyo.Suffix.IMPORT)
+        m.c = pyo.Constraint(expr=m.x >= 1)
+        m.dual[m.c] = float("nan")
+        m.obj = pyo.Objective(expr=m.x)                   # z not in the objective
+        m._mpisppy_data = type(
+            "_D", (), {"solution_available": True, "outer_bound": "UNSET"})()
+
+        spoke = self._spoke_over(m)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            spoke.lagrangian()
+        messages = [str(w.message) for w in caught]
+        self.assertIsNone(m._mpisppy_data.outer_bound, messages)
+        self.assertTrue(any("non-finite value" in m for m in messages),
+                        messages)
+        self.assertFalse(any("unbounded below" in m for m in messages),
+                         f"blamed z, which is not why there is no bound: "
+                         f"{messages}")
 
     def test_value_error_becomes_no_bound(self):
         scenario = self._scenario_with_uninitialized_var()
