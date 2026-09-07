@@ -390,7 +390,6 @@ class TestGuards(unittest.TestCase):
             certified_lower_bound(m, sign_convention="no-such-solver")
 
 
-@unittest.skipUnless(ipopt_available, "ipopt is not available")
 class TestUndifferentiableExpressions(unittest.TestCase):
     """Expressions Pyomo's differentiate has no rule for are a setup error.
 
@@ -503,6 +502,8 @@ class TestUndifferentiableExpressions(unittest.TestCase):
         check_model_is_certifiable(m)           # still a setup-legal model
 
 
+
+@unittest.skipUnless(ipopt_available, "ipopt is not available")
 class TestWithIpopt(unittest.TestCase):
     """The parts that can only be checked against the real solver: that ipopt's
     reported dual signs are what the table in dual_certificate.py assumes."""
