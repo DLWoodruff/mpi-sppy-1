@@ -129,8 +129,12 @@ integer variables this spoke is inapplicable no matter what anything else runs.
 **An inexact or ill-conditioned solve is safe.** The certificate assumes nothing
 about the accuracy of the solve. The model is convex by assumption, so it has no
 non-global local minima, and Ipopt returning a sub-optimal answer can only mean
-it stopped short of converging -- an inexact point with inexact multipliers, both
-of which the underlying theorem admits. Ill-conditioning does not enter either:
+it stopped short of converging -- an inexact point with inexact multipliers, and
+the bound holds for any point and any ``lam >= 0``. The point need not even lie
+in the box: the minimization runs over the box while the point only has to be
+somewhere the objective is convex and differentiable, which is what makes the
+certificate cover the slightly-out-of-bounds iterate ``bound_relax_factor``
+can produce. Ill-conditioning does not enter either:
 the certificate evaluates the objective and one gradient, and inverts nothing, so
 there is no linear solve for a condition number to amplify. What both cost is
 tightness. The looseness term grows as the point moves away from optimal, so a

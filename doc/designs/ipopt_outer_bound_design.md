@@ -493,8 +493,8 @@ Checkable at setup, hard error (following the repo's fail-loudly convention):
   exactly at the kink, which is a property of the iterate and not of the model, so it
   stays with the runtime stand-down below.
 
-Checked every iteration rather than at setup, and **not** a hard error — warn once on
-rank 0 and report no bound, for the reason in §6.1:
+Checked every iteration rather than at setup, and **not** a hard error — warn once
+and report no bound, for the reason in §6.1:
 
 - **Nonanticipative variables fixed after setup.** Same failure as the prox term and
   less obvious: PH's variable-fixing extensions (`fixer.py`, the reduced-cost fixers)
@@ -537,8 +537,54 @@ guards above, where the model genuinely violates an assumption and any number th
 cylinder produced would be wrong. The warning is what keeps the quiet case from being
 silent.
 
-Per repo convention the warning is emitted on one rank only (`cylinder_rank == 0`),
-once at setup rather than once per iteration.
+The warning is emitted once, from the **lowest rank that actually saw the
+condition** — not from rank 0. Every condition in this section is rank-local (a
+scenario with an unbounded variable lives on one rank) while `Ebound` is
+collective, so a `cylinder_rank == 0` gate would silence the one rank that saw
+the problem and leave the user an empty `N` column with no explanation. The
+cylinder therefore reduces over the cylinder communicator to pick the speaker;
+see `_warn_once_collectively`. Every rank must enter it, including the ranks with
+nothing to report — the reduction is what makes it work, and a caller that skips
+it behind a rank-local `if` hangs the run instead of warning.
+
+### 6.2 What else warns rather than fails
+
+The fixed-nonant check above is the one that needed arguing. The rest of the
+warn-and-stand-down surface, each keyed separately so one cause cannot consume
+another's message for the run:
+
+- **`fbbt` proved a scenario infeasible**, or **could not analyze it**. The call
+  is made to tighten the box and build a diagnostic, so nothing it raises is
+  worth the wheel; the box is then used as the model states it.
+- **A variable with no finite bound after `fbbt`** (§6.1).
+- **The certificate raised**, keyed by exception class. A model this cylinder
+  targets can still defeat Pyomo's `differentiate` at a particular point —
+  `abs` exactly at its kink — and the class is reported so a genuine bug in our
+  own code stays legible rather than being swallowed by a broad catch.
+- **The certificate returned no bound without raising**, keyed by cause: an
+  unbounded box direction with a nonzero gradient component, a non-finite value
+  (usually a diverged solve), or no loadable solution. The causes want different
+  advice, which is why they are not one message: bounding a variable fixes the
+  first and is a wild goose chase for the other two. A fourth key,
+  `unclassified`, exists for a return-`None` path the engine might grow without
+  recording a cause; it is unreachable today and says so rather than guessing at
+  one of the three.
+- **A constraint whose dual was not imported.** Taken with multiplier zero,
+  which weak duality admits, so the bound is looser but still valid. Reported
+  only for scenarios that actually produced a bound.
+
+Hard errors at setup are, by contrast, raised **collectively**: those conditions
+are rank-local too, so a bare `raise` on the offending rank leaves its peers in
+the next reduction with no partner — a hang rather than an error. See
+`_raise_collectively`, which broadcasts the offending rank's message so every
+traceback names the scenario that caused it.
+
+A solve whose *solution fails to load* is also not fatal: `solve_loop` is called
+with `need_solution=False`, so spopt hands that case back as
+`solution_available=False` and it becomes the "no loadable solution" cause above
+rather than an exception out of the iteration loop. The flag reaches only the
+load step; a solve that fails outright still re-raises its `solver_exception`
+from spopt's `not_good_enough_results` branch.
 
 Not checkable, documented as the user's assertion: convexity of `f_s` and `g_s`.
 
