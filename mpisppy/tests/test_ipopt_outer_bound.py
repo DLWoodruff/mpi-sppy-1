@@ -284,6 +284,9 @@ class _SerialComm:
     def allreduce(self, value, op=None):
         return value
 
+    def bcast(self, value, root=0):
+        return value
+
 
 class TestSetupGuards(unittest.TestCase):
     """The guards that belong to the spoke rather than the certificate engine.
@@ -415,6 +418,10 @@ class TestDualSuffixGuard(unittest.TestCase):
         from mpisppy.cylinders.ipopt_outer_bound import IpoptOuterBound
         spoke = IpoptOuterBound.__new__(IpoptOuterBound)
         spoke.opt = type("_O", (), {"local_scenarios": {"Scen0": scenario}})()
+        # The reject path is collective -- see _raise_collectively -- so even a
+        # one-rank stub needs a comm.
+        spoke.cylinder_rank = 0
+        spoke.cylinder_comm = _SerialComm()
         return spoke
 
     def test_a_suffix_is_attached_when_there_is_none(self):
@@ -437,6 +444,21 @@ class TestDualSuffixGuard(unittest.TestCase):
         m.dual = pyo.Suffix(direction=pyo.Suffix.EXPORT)
         with self.assertRaisesRegex(CertificateError, "does not import"):
             self._spoke_over(m)._attach_dual_suffixes()
+
+    def test_a_dual_that_is_not_a_suffix_is_rejected_by_name(self):
+        # getattr returns whatever the scenario_creator declared, and `dual` is
+        # an ordinary enough name for a Var. Calling import_enabled() on it
+        # raised AttributeError out of lagrangian_prep, naming neither this
+        # spoke nor the component; every other setup problem here is a
+        # CertificateError naming the scenario.
+        m = _certifiable_scenario()
+        m.dual = pyo.Var(initialize=0.0)
+        with self.assertRaises(CertificateError) as ctx:
+            self._spoke_over(m)._attach_dual_suffixes()
+        message = str(ctx.exception)
+        self.assertIn("Scen0", message)
+        self.assertIn("not a Suffix", message)
+        self.assertIn("ScalarVar", message)
 
 
 class TestNewlyFixedNonants(unittest.TestCase):
@@ -524,6 +546,134 @@ class TestProxGuard(unittest.TestCase):
 
     def test_prox_off_passes(self):
         self._spoke(False)._check_setup_guards()
+
+
+class TestFbbtExceptionsStandDown(unittest.TestCase):
+    """fbbt raises more than the infeasibility the guard asks it about.
+
+    unbounded_variables(do_fbbt=True) is called to TIGHTEN the box and to build
+    a diagnostic. Nothing it raises is worth aborting the wheel, and an
+    exception escaping lagrangian_prep does exactly that.
+    """
+
+    def _spoke_over(self, scenario):
+        from mpisppy.cylinders.ipopt_outer_bound import IpoptOuterBound
+
+        class _Stub:
+            options = {"solver_name": "ipopt"}
+            local_scenarios = {"Scen0": scenario}
+
+        spoke = IpoptOuterBound.__new__(IpoptOuterBound)
+        spoke.opt = _Stub()
+        spoke.opt._attach_prox = False
+        spoke.cylinder_rank = 0
+        spoke.cylinder_comm = _SerialComm()
+        spoke._warned = set()
+        return spoke
+
+    def _interval_exception_scenario(self):
+        """A model whose fbbt raises IntervalException, not infeasibility.
+
+        pyomo.contrib.fbbt.interval refuses to bound a negative base raised to
+        a variable power. check_model_is_certifiable admits the row -- a
+        one-sided nonlinear body is the caller's convexity assertion -- so it
+        reaches the fbbt call.
+        """
+        m = pyo.ConcreteModel(name="Scen0")
+        m.x = pyo.Var(bounds=(-5, -1), initialize=-2.0)
+        m.y = pyo.Var(bounds=(0.5, 2), initialize=1.0)
+        m.z = pyo.Var(initialize=0.0)             # deliberately unbounded
+        m.c = pyo.Constraint(expr=m.x ** m.y <= 10)
+        m.obj = pyo.Objective(expr=m.x + m.y + m.z, sense=pyo.minimize)
+        return m
+
+    def test_the_scenario_is_admitted_by_the_certifiability_check(self):
+        # If this ever stops holding, the fbbt call is unreachable for this
+        # model and the test below stops testing anything.
+        from mpisppy.utils.dual_certificate import check_model_is_certifiable
+        check_model_is_certifiable(self._interval_exception_scenario())
+
+    def test_fbbt_raising_does_not_escape_the_guard(self):
+        from pyomo.common.errors import IntervalException
+        from mpisppy.utils.dual_certificate import unbounded_variables
+
+        scenario = self._interval_exception_scenario()
+        # the call really does raise, so the guard really is catching it
+        with self.assertRaises(IntervalException):
+            unbounded_variables(scenario, do_fbbt=True)
+
+        spoke = self._spoke_over(self._interval_exception_scenario())
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            spoke._check_setup_guards()           # must not raise
+        self.assertTrue(
+            any("could not analyze" in str(w.message) for w in caught),
+            "the run stood down silently; it should say the box is untightened")
+
+    def test_the_unbounded_diagnostic_survives_fbbt_bailing(self):
+        # Losing the tightening costs looseness. Losing the diagnostic would
+        # cost the user the one message that explains an empty 'N' column, so
+        # the scan is redone without fbbt.
+        spoke = self._spoke_over(self._interval_exception_scenario())
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            spoke._check_setup_guards()
+        self.assertTrue(
+            any("no finite bound" in str(w.message) for w in caught))
+
+
+class TestCollectiveRaise(unittest.TestCase):
+    """A hard error at setup must reach every rank, or none.
+
+    The conditions are rank-local -- a discrete variable, a `dual` of the wrong
+    type, sit in one scenario on one rank -- while everything after them is
+    collective. A bare raise on the one offending rank leaves its peers in the
+    next allreduce with no partner: a hang, not an error. Today it dies rather
+    than hangs only because WheelSpinner.run wraps the wheel in MPI_Abort
+    (#852), which is not a property of this spoke.
+    """
+
+    def _spoke(self, rank, peer_saw_it):
+        from mpisppy import MPI
+        from mpisppy.cylinders.ipopt_outer_bound import IpoptOuterBound
+
+        class _TwoRanks:
+            size = 2
+
+            def Get_rank(self):
+                return rank
+
+            def allreduce(self, value, op=None):
+                assert op is MPI.MIN
+                return min(value, 1) if peer_saw_it else value
+
+            def bcast(self, value, root=0):
+                # rank 1 is the one with the bad scenario in these tests
+                return value if root == rank else "scenario Scen1: a discrete variable"
+
+        spoke = IpoptOuterBound.__new__(IpoptOuterBound)
+        spoke.cylinder_rank = rank
+        spoke.cylinder_comm = _TwoRanks()
+        return spoke
+
+    def test_a_clean_rank_still_raises_when_its_peer_did_not(self):
+        # rank 0 saw nothing and neither did rank 1
+        self._spoke(rank=0, peer_saw_it=False)._raise_collectively(None)
+
+    def test_a_clean_rank_raises_when_its_peer_saw_the_problem(self):
+        """This is the fix. Before it, rank 0 returned and blocked."""
+        spoke = self._spoke(rank=0, peer_saw_it=True)
+        with self.assertRaises(CertificateError) as ctx:
+            spoke._raise_collectively(None)       # nothing wrong HERE
+        # and it names the rank and the real cause, not "some other rank"
+        message = str(ctx.exception)
+        self.assertIn("rank 1", message)
+        self.assertIn("Scen1", message)
+
+    def test_the_offending_rank_raises_its_own_message(self):
+        spoke = self._spoke(rank=0, peer_saw_it=False)
+        with self.assertRaisesRegex(CertificateError, "rank 0: my own problem"):
+            spoke._raise_collectively("my own problem")
 
 
 class TestCollectiveWarning(unittest.TestCase):

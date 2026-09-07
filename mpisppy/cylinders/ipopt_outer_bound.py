@@ -25,6 +25,7 @@ import warnings
 
 import pyomo.environ as pyo
 
+from pyomo.common.errors import PyomoException
 from pyomo.contrib.fbbt.fbbt import InfeasibleConstraintException
 
 from mpisppy import MPI
@@ -97,6 +98,7 @@ class IpoptOuterBound(LagrangianOuterBound):
         Its own method so it can be tested without standing up a wheel; the
         guard below it is the kind that only fails on someone else's model.
         """
+        problem = None
         for s in self.opt.local_scenarios.values():
             # Existence is not enough: a scenario_creator may already attach an
             # EXPORT or LOCAL `dual` suffix (a common way to supply dual warm
@@ -104,12 +106,24 @@ class IpoptOuterBound(LagrangianOuterBound):
             existing = getattr(s, "dual", None)
             if existing is None:
                 s.dual = pyo.Suffix(direction=pyo.Suffix.IMPORT)
+            elif not isinstance(existing, pyo.Suffix):
+                # getattr returns whatever the scenario_creator declared, and
+                # `dual` is an ordinary enough name for a Var or Param. Without
+                # this the next line raises AttributeError from inside
+                # lagrangian_prep, naming neither this spoke nor the component.
+                problem = problem or (
+                    f"scenario {s.name} already has a component named `dual` "
+                    f"that is not a Suffix (it is a "
+                    f"{type(existing).__name__}); the certificate needs a "
+                    "Suffix.IMPORT named `dual` to receive the solver's duals."
+                )
             elif not existing.import_enabled():
-                raise CertificateError(
+                problem = problem or (
                     f"scenario {s.name} already has a `dual` Suffix that does "
                     "not import; the certificate needs the solver's duals. Use "
                     "Suffix.IMPORT or Suffix.IMPORT_EXPORT."
                 )
+        self._raise_collectively(problem)
 
     def _check_setup_guards(self):
         """Hard errors for the parts of the theorem that are checkable, and a
@@ -128,27 +142,38 @@ class IpoptOuterBound(LagrangianOuterBound):
         # could never fire either, AND _reenable_prox sets it to 1 whether or
         # not the objective contains a prox term, so it would also have fired
         # on models that have none.
-        if getattr(self.opt, "_attach_prox", False):
-            raise CertificateError(
-                "ipopt_outer_bound requires the proximal term to be off; "
-                "the bound it computes is a Lagrangian bound and a proximal "
-                "subproblem is not the Lagrangian relaxation"
-            )
+        # Every hard error below goes through _raise_collectively, including
+        # the two whose conditions are the same on every rank -- self.opt.options
+        # comes from the spoke dict and _attach_prox is set identically by
+        # PH_Prep. Routing them the same way costs two allreduces once, at
+        # setup, and leaves the class one rule instead of a per-guard judgement
+        # about whether this particular condition happens to be rank-uniform.
+        self._raise_collectively(
+            "ipopt_outer_bound requires the proximal term to be off; "
+            "the bound it computes is a Lagrangian bound and a proximal "
+            "subproblem is not the Lagrangian relaxation"
+            if getattr(self.opt, "_attach_prox", False) else None
+        )
 
         solver_name = (self.opt.options.get("solver_name") or "").strip().lower()
-        if solver_name not in _MEASURED_IPOPT_SOLVERS:
-            raise CertificateError(
-                f"ipopt_outer_bound is scoped to Ipopt, but its solver is "
-                f"{solver_name!r}. The dual sign conventions it relies on have "
-                f"been measured only for {sorted(_MEASURED_IPOPT_SOLVERS)}. "
-                "Set --ipopt-outer-bound-solver-name."
-            )
+        self._raise_collectively(
+            f"ipopt_outer_bound is scoped to Ipopt, but its solver is "
+            f"{solver_name!r}. The dual sign conventions it relies on have "
+            f"been measured only for {sorted(_MEASURED_IPOPT_SOLVERS)}. "
+            "Set --ipopt-outer-bound-solver-name."
+            if solver_name not in _MEASURED_IPOPT_SOLVERS else None
+        )
 
+        # Certifiability is genuinely rank-local -- a discrete variable or a
+        # nonlinear equality sits in one scenario on one rank -- so raising
+        # here is exactly the case _raise_collectively exists for.
+        problem = None
         for sname, s in self.opt.local_scenarios.items():
             try:
                 check_model_is_certifiable(s)
             except CertificateError as e:
-                raise CertificateError(f"scenario {sname}: {e}") from None
+                problem = problem or f"scenario {sname}: {e}"
+        self._raise_collectively(problem)
 
         # fbbt first (it can only shrink the box, which makes the bound
         # tighter without dropping a feasible point), then say something if a
@@ -157,6 +182,7 @@ class IpoptOuterBound(LagrangianOuterBound):
         # is not a broken model. It may simply report nothing.
         still_unbounded = {}
         infeasible = []
+        fbbt_failed = []
         for sname, s in self.opt.local_scenarios.items():
             try:
                 names = unbounded_variables(s, do_fbbt=True)
@@ -165,10 +191,25 @@ class IpoptOuterBound(LagrangianOuterBound):
                 # problem and the subsequent solve will report it; it is not
                 # this spoke's to escalate. Letting it out would MPI_Abort the
                 # hub and every other cylinder from a call made to tighten the
-                # box and build a diagnostic, which is exactly the stand-down
-                # stand-down policy this spoke states for itself, inverted.
+                # box and build a diagnostic, which inverts the stand-down
+                # policy this spoke states for itself.
                 infeasible.append(f"{sname} ({e})")
                 continue
+            except PyomoException as e:
+                # fbbt raises more than the infeasibility it is asked about:
+                # pyomo.contrib.fbbt.interval raises IntervalException on rows
+                # it cannot bound, e.g. `x**y <= 10` with x allowed negative
+                # ("Cannot raise a negative variable to a fractional power").
+                # check_model_is_certifiable admits that row -- a one-sided
+                # nonlinear body is the caller's convexity assertion -- so it
+                # reaches here, and the narrow catch above used to let it out
+                # of lagrangian_prep and abort the whole wheel.
+                #
+                # Tightening is only ever an improvement, so losing it costs
+                # looseness and nothing else. Redo the scan without fbbt to
+                # keep the unbounded-variable diagnostic.
+                fbbt_failed.append(f"{sname} ({type(e).__name__}: {e})")
+                names = unbounded_variables(s, do_fbbt=False)
             if names:
                 still_unbounded[sname] = names
         self._warn_once_collectively(
@@ -184,6 +225,20 @@ class IpoptOuterBound(LagrangianOuterBound):
                 "this message is printed once."
             ),
         )
+        self._warn_once_collectively(
+            "fbbt_failed",
+            bool(fbbt_failed),
+            lambda: (
+                f"ipopt_outer_bound: bounds tightening could not analyze "
+                f"{len(fbbt_failed)} scenario(s) on rank "
+                f"{self.cylinder_rank}, for example {fbbt_failed[0]}. Their "
+                "variable boxes are used as the model states them, untightened, "
+                "so the bound from those scenarios is looser than it could be. "
+                "The certificate is unaffected otherwise; this message is "
+                "printed once."
+            ),
+        )
+
         def _unbounded_message():
             sname, names = next(iter(still_unbounded.items()))
             return (
@@ -246,6 +301,37 @@ class IpoptOuterBound(LagrangianOuterBound):
             if self.cylinder_rank == speaking_rank:
                 warnings.warn(message_from_rank())
         return anyone
+
+    def _raise_collectively(self, local_problem):
+        """Raise on every rank, or on none.
+
+        The counterpart to _warn_once_collectively, for the conditions that
+        are hard errors rather than warnings. Same reason for existing: the
+        conditions this spoke checks at setup are rank-local -- a discrete
+        variable, a `dual` component of the wrong type -- while everything
+        after them is collective. A bare `raise` on the one rank that saw the
+        problem leaves the others in the next allreduce with no partner, and
+        the run hangs rather than reporting the model error that caused it.
+        Today it dies instead of hanging, but only because WheelSpinner.run
+        wraps the wheel in MPI_Abort (#852); driven any other way, or with that
+        wrapper bypassed, it is a hang with no traceback.
+
+        `local_problem` is the message for THIS rank's problem, or None. The
+        message from the lowest offending rank is broadcast, so every rank's
+        traceback names the scenario that actually caused it rather than
+        reporting a bare "some other rank failed".
+
+        EVERY rank must call this, including the ranks with nothing to report.
+        """
+        speaking_rank = self.cylinder_comm.allreduce(
+            self.cylinder_rank if local_problem is not None
+            else self.cylinder_comm.size,
+            op=MPI.MIN,
+        )
+        if speaking_rank == self.cylinder_comm.size:
+            return
+        problem = self.cylinder_comm.bcast(local_problem, root=speaking_rank)
+        raise CertificateError(f"rank {speaking_rank}: {problem}")
 
     def _nonants_newly_fixed(self):
         """True if ANY rank fixed a nonant since setup, in which case no bound

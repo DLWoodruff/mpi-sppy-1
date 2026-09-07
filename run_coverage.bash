@@ -234,9 +234,17 @@ run_phase "test_ipopt_outer_bound (mpiexec -np 2)" \
 # without the same run here local and CI coverage disagree on that path.
 # Not in a subshell: run_phase increments a global counter, which a subshell
 # would discard and the phase numbering would repeat.
+# --data-file is not optional here: .coveragerc sets parallel=true but no
+# data_file, so coverage writes .coverage.<host>.<pid>.<rnd> into the CURRENT
+# directory. Without it this phase's data lands in examples/farmer, the
+# `coverage combine` back in $PROJ_DIR never sees it, and the files pile up
+# across runs where the script's `rm -f .coverage.*` does not reach. CI is
+# unaffected because COV_ARGS carries --data-file, so the mismatch is silent.
+# The example-based phases below pass it for the same reason; see EX_COV.
 cd examples/farmer
 run_phase "generic_cylinders --ipopt-outer-bound (mpiexec -np 2)" \
-    mpiexec -np 2 coverage run --rcfile="$PROJ_DIR/.coveragerc" -m mpi4py \
+    mpiexec -np 2 coverage run --data-file="$PROJ_DIR/.coverage" \
+        --rcfile="$PROJ_DIR/.coveragerc" -m mpi4py \
         "$PROJ_DIR/mpisppy/generic_cylinders.py" \
         --module-name farmer --num-scens 3 --solver-name ipopt \
         --max-iterations 5 --default-rho 1.0 --ipopt-outer-bound
