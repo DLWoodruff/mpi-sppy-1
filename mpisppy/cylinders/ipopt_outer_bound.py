@@ -437,6 +437,7 @@ class IpoptOuterBound(LagrangianOuterBound):
         # otherwise buy, and it is not a trade worth making.
         failures_by_class = {}
         no_dual = []
+        no_bound = []
         # .items() for the same reason as _attach_dual_suffixes: the failure
         # message has to name the scenario by its local_scenarios key. s.name
         # is the Pyomo model name, which SPBase never sets.
@@ -449,11 +450,12 @@ class IpoptOuterBound(LagrangianOuterBound):
                 s._mpisppy_data.outer_bound = None
                 continue
             # Into a per-scenario list, merged into no_dual only if the call
-            # returns. certified_lower_bound extends missing_duals BEFORE it
-            # differentiates, so passing no_dual directly let a scenario that
-            # went on to fail report "the bound is looser but still valid" --
-            # false, there is no bound for it -- and burn the missing_duals
-            # warn-once key, hiding a real tightness loss later.
+            # produces A BOUND -- not merely if it returns; see the `else`
+            # below. certified_lower_bound extends missing_duals BEFORE the
+            # work that decides whether there is a bound at all, so passing
+            # no_dual directly let a scenario that produced none report "the
+            # bound is looser but still valid" -- false -- and burn the
+            # missing_duals warn-once key, hiding a real tightness loss later.
             scenario_no_dual = []
             try:
                 s._mpisppy_data.outer_bound = certified_lower_bound(
@@ -500,6 +502,15 @@ class IpoptOuterBound(LagrangianOuterBound):
                 # bound, and the missing_duals key burnt for the run.
                 if s._mpisppy_data.outer_bound is not None:
                     no_dual.extend(scenario_no_dual)
+                else:
+                    # Returning None raises nothing, so without this the
+                    # scenario reaches neither failures_by_class nor no_dual
+                    # and the run goes completely silent: Ebound declines
+                    # collectively and the user reads an empty 'N' column with
+                    # nothing said anywhere. Dropping the false "looser but
+                    # still valid" message is an improvement only if something
+                    # true takes its place.
+                    no_bound.append(sname)
 
         # The set of classes to warn about must be GLOBAL. The key drives
         # _warn_once_collectively, and ranks entering it with different keys,
@@ -513,11 +524,11 @@ class IpoptOuterBound(LagrangianOuterBound):
             self._warn_once_collectively(
                 f"certificate_failed:{cls}",
                 bool(here),
-                # Bound as defaults rather than captured: the loop rebinds
-                # both names, and a closure over them would report the last
-                # class for every key. (_warn_once_collectively calls this
-                # synchronously and does not store it, so this is about the
-                # loop, not about lifetime.)
+                # Bound as defaults rather than captured. As it stands
+                # _warn_once_collectively calls this synchronously, inside
+                # this iteration, so a closure would report the right class
+                # too; the defaults are what keep that from depending on when
+                # the callback runs.
                 lambda cls=cls, here=here: (
                     f"ipopt_outer_bound: no certificate ({cls}) for "
                     f"{len(here)} scenario(s) on rank {self.cylinder_rank}, "
@@ -530,6 +541,20 @@ class IpoptOuterBound(LagrangianOuterBound):
                     "once per exception class."
                 ),
             )
+        self._warn_once_collectively(
+            "no_bound_returned",
+            bool(no_bound),
+            lambda: (
+                f"ipopt_outer_bound: the certificate produced no bound for "
+                f"{len(no_bound)} scenario(s) on rank {self.cylinder_rank}, "
+                f"for example {no_bound[0]}, without failing -- a variable "
+                "with no finite bound whose gradient component in phi is "
+                "nonzero, or a non-finite value. Ebound is all-or-nothing, so "
+                "this cylinder reports NO bound on such an iteration, not "
+                "merely for the scenarios named. Bounding those variables is "
+                "the fix. Printed once."
+            ),
+        )
         self._warn_once_collectively(
             "missing_duals",
             bool(no_dual),

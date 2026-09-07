@@ -1063,6 +1063,50 @@ class TestCertificateFailureStandsDown(unittest.TestCase):
             any("still valid" in str(w.message) for w in caught),
             [str(w.message) for w in caught])
 
+    def _scenario_with_a_bound_and_a_missing_dual(self):
+        """Produces a bound, and one constraint has no imported dual.
+
+        The positive half of the gate. Everything bounded, so the correction
+        is finite; the dual-less row is taken with multiplier zero, which is
+        what "looser than it could be but still valid" describes.
+        """
+        m = pyo.ConcreteModel()
+        m.x = pyo.Var(bounds=(0, 10), initialize=1.0)
+        m.y = pyo.Var(bounds=(0, 10), initialize=1.0)
+        m.dual = pyo.Suffix(direction=pyo.Suffix.IMPORT)
+        m.c = pyo.Constraint(expr=m.x + m.y >= 1)     # no dual imported
+        m.obj = pyo.Objective(expr=m.x + m.y)
+        m._mpisppy_data = type(
+            "_D", (), {"solution_available": True, "outer_bound": "UNSET"})()
+        return m
+
+    def test_a_scenario_that_does_produce_a_bound_reports_the_missing_dual(self):
+        """Without this the gate is unguarded in the direction that matters.
+
+        Deleting the merge outright, or inverting the condition to `is None`,
+        left the whole suite green: only the negative half was asserted.
+        """
+        scenario = self._scenario_with_a_bound_and_a_missing_dual()
+        spoke = self._spoke_over(scenario)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            spoke.lagrangian()
+        messages = [str(w.message) for w in caught]
+        self.assertIsNotNone(scenario._mpisppy_data.outer_bound, messages)
+        self.assertTrue(any("still valid" in m for m in messages), messages)
+
+    def test_a_scenario_with_no_bound_is_not_silent(self):
+        """Dropping the false message is only an improvement if something
+        true replaces it. It reached neither failure list, so nothing did."""
+        scenario = self._scenario_with_no_bound_and_a_missing_dual()
+        spoke = self._spoke_over(scenario)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            spoke.lagrangian()
+        messages = [str(w.message) for w in caught]
+        self.assertTrue(any("produced no bound" in m for m in messages),
+                        f"silent: an empty 'N' column with no reason. {messages}")
+
     def test_value_error_becomes_no_bound(self):
         scenario = self._scenario_with_uninitialized_var()
         spoke = self._spoke_over(scenario)
