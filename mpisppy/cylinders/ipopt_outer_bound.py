@@ -429,7 +429,13 @@ class IpoptOuterBound(LagrangianOuterBound):
                 s._mpisppy_data.outer_bound = None
             return self.opt.Ebound(verbose)
 
-        failures = []
+        # Keyed by exception CLASS: _warn_once_collectively fires a key once
+        # per run, so a single "certificate_failed" key meant the first failure
+        # -- typically a routine CertificateError -- consumed the warning and a
+        # genuine bug arriving on a later iteration was silent for the rest of
+        # the run. That silence is what the wide catch above would otherwise
+        # buy, and it is not a trade worth making.
+        failures_by_class = {}
         no_dual = []
         # .items() for the same reason as _attach_dual_suffixes: the failure
         # message has to name the scenario by its local_scenarios key. s.name
@@ -442,10 +448,17 @@ class IpoptOuterBound(LagrangianOuterBound):
             if not s._mpisppy_data.solution_available:
                 s._mpisppy_data.outer_bound = None
                 continue
+            # Into a per-scenario list, merged into no_dual only if the call
+            # returns. certified_lower_bound extends missing_duals BEFORE it
+            # differentiates, so passing no_dual directly let a scenario that
+            # went on to fail report "the bound is looser but still valid" --
+            # false, there is no bound for it -- and burn the missing_duals
+            # warn-once key, hiding a real tightness loss later.
+            scenario_no_dual = []
             try:
                 s._mpisppy_data.outer_bound = certified_lower_bound(
                     s, sign_convention="ipopt", eps_rel=self._cushion,
-                    missing_duals=no_dual)
+                    missing_duals=scenario_no_dual)
             except Exception as e:
                 # `except Exception` for the same reason as the fbbt call in
                 # _check_setup_guards, and the enumerated list this replaces
@@ -472,20 +485,37 @@ class IpoptOuterBound(LagrangianOuterBound):
                 # The property is the one already stated below: no certificate
                 # this iteration is not worth the wheel. The exception class is
                 # reported so a genuine bug in our own code is still legible.
-                failures.append(f"{sname} ({type(e).__name__}: {e})")
+                failures_by_class.setdefault(
+                    type(e).__name__, []).append(f"{sname} ({e})")
                 s._mpisppy_data.outer_bound = None
+            else:
+                no_dual.extend(scenario_no_dual)
 
-        self._warn_once_collectively(
-            "certificate_failed",
-            bool(failures),
-            lambda: (
-                f"ipopt_outer_bound: no certificate for {len(failures)} "
-                f"scenario(s) on rank {self.cylinder_rank}, for example "
-                f"{failures[0]}. Ebound is all-or-nothing, so this cylinder "
-                "reports no bound at all this iteration -- not merely for the "
-                "scenarios named."
-            ),
-        )
+        # The set of classes to warn about must be GLOBAL. The key drives
+        # _warn_once_collectively, and ranks entering it with different keys,
+        # or in a different order, is a hang rather than a missed warning --
+        # so take the union and walk it sorted.
+        seen_here = set(failures_by_class)
+        all_classes = sorted(
+            set().union(*self.cylinder_comm.allgather(seen_here)))
+        for cls in all_classes:
+            here = failures_by_class.get(cls, [])
+            self._warn_once_collectively(
+                f"certificate_failed:{cls}",
+                bool(here),
+                # cls and here bound now: the lambda outlives this iteration.
+                lambda cls=cls, here=here: (
+                    f"ipopt_outer_bound: no certificate ({cls}) for "
+                    f"{len(here)} scenario(s) on rank {self.cylinder_rank}, "
+                    f"for example {here[0]}. Ebound is all-or-nothing, so this "
+                    "cylinder reports NO bound at all on such an iteration, "
+                    "not merely for the scenarios named. Some causes are "
+                    "structural rather than transient -- an expression "
+                    "differentiate has no rule for recurs every iteration -- "
+                    "so if the 'N' column stays empty, this is why. Printed "
+                    "once per exception class."
+                ),
+            )
         self._warn_once_collectively(
             "missing_duals",
             bool(no_dual),

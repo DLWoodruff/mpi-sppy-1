@@ -287,6 +287,9 @@ class _SerialComm:
     def bcast(self, value, root=0):
         return value
 
+    def allgather(self, value):
+        return [value]
+
 
 class TestSetupGuards(unittest.TestCase):
     """The guards that belong to the spoke rather than the certificate engine.
@@ -651,15 +654,21 @@ class TestFbbtExceptionsStandDown(unittest.TestCase):
         # a model that started raising at CONSTRUCTION would otherwise satisfy
         # the assertion while testing nothing.
         from mpisppy.utils.dual_certificate import unbounded_variables
+        table = self._unanalyzable_scenarios()
         seen = {}
-        for label, (build, expected) in self._unanalyzable_scenarios().items():
+        for label, (build, expected) in table.items():
             with self.subTest(label):
                 scenario = build()
-                with self.assertRaises(expected):
+                with self.assertRaises(expected) as ctx:
                     unbounded_variables(scenario, do_fbbt=True)
-                seen[label] = expected
+                # the class RAISED, not the class declared in the table --
+                # recording the latter makes the distinctness check below
+                # test the dict literal rather than Pyomo's behavior
+                seen[label] = type(ctx.exception)
+        self.assertEqual(len(seen), len(table),
+                         "a row did not raise, so it never reached the check")
         self.assertEqual(len(set(seen.values())), len(seen),
-                         "two rows collapsed onto one exception class")
+                         f"two rows collapsed onto one exception class: {seen}")
 
     def test_fbbt_raising_does_not_escape_the_guard(self):
         for label, (build, _) in self._unanalyzable_scenarios().items():
@@ -943,27 +952,71 @@ class TestCertificateFailureStandsDown(unittest.TestCase):
 
     def test_a_differentiation_failure_becomes_no_bound(self):
         from mpisppy.utils.dual_certificate import certified_lower_bound
-        scenario = self._scenario_differentiate_cannot_handle()
-        # the premise: it really does raise, and really is outside the list
+        # The premise, on its OWN model: that the call really does raise, and
+        # really is outside the classes the old enumerated catch listed.
         with self.assertRaises(Exception) as ctx:
-            certified_lower_bound(scenario, sign_convention="ipopt",
-                                  eps_rel=1e-9)
+            certified_lower_bound(self._scenario_differentiate_cannot_handle(),
+                                  sign_convention="ipopt", eps_rel=1e-9)
         self.assertNotIsInstance(
             ctx.exception, (CertificateError, ValueError, ArithmeticError),
             "no longer outside the old enumerated catch; pick another model")
 
-        spoke = self._spoke_over(self._scenario_differentiate_cannot_handle())
+        # and now the model the spoke actually runs, so the assertions below
+        # are about the object it touched
+        scenario = self._scenario_differentiate_cannot_handle()
+        spoke = self._spoke_over(scenario)
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
             result = spoke.lagrangian()           # must not raise
         self.assertEqual(result, "EBOUND")
-        message = next(str(w.message) for w in caught
-                       if "no certificate" in str(w.message))
+        self.assertIsNone(scenario._mpisppy_data.outer_bound)
+        matching = [str(w.message) for w in caught
+                    if "no certificate" in str(w.message)]
+        # assertion, not StopIteration: a missing warning should say so
+        self.assertEqual(len(matching), 1, f"warnings were: {matching}")
+        message = matching[0]
         # the class is reported, so a genuine bug stays legible
         self.assertIn("DifferentiationException", message)
         # and the scenario is named by its local_scenarios KEY, not s.name
         self.assertIn("Scen0", message)
         self.assertNotIn("unknown", message)
+
+    def test_a_later_failure_of_a_different_class_still_warns(self):
+        """The wide catch is only acceptable if a genuine bug stays audible.
+
+        The warning used to be keyed "certificate_failed", which
+        _warn_once_collectively consumes on the FIRST failure of the run --
+        typically a routine CertificateError. A DifferentiationException
+        arriving on a later iteration was then silent for the rest of the run,
+        and the spoke reported no bound with no explanation. Before the catch
+        was widened it at least aborted loudly.
+        """
+        def warnings_from(spoke):
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                spoke.lagrangian()
+            return [str(w.message) for w in caught]
+
+        # iteration 1: a routine CertificateError (no dual suffix at all)
+        routine = self._scenario_with_uninitialized_var()
+        spoke = self._spoke_over(routine)
+        first = warnings_from(spoke)
+        self.assertTrue(any("no certificate" in m for m in first))
+
+        # iteration 2, same spoke so _warned persists: a different class
+        structural = self._scenario_differentiate_cannot_handle()
+        spoke.opt.local_scenarios = {"Scen0": structural}
+        second = warnings_from(spoke)
+        self.assertTrue(
+            any("DifferentiationException" in m for m in second),
+            "a new failure class was swallowed silently; before the catch was "
+            f"widened this aborted loudly. warnings were: {second}")
+
+        # and the routine class does NOT warn twice
+        spoke.opt.local_scenarios = {"Scen0": self._scenario_with_uninitialized_var()}
+        third = warnings_from(spoke)
+        self.assertFalse(any("no certificate" in m for m in third),
+                         "once per class, not once per iteration")
 
     def test_value_error_becomes_no_bound(self):
         scenario = self._scenario_with_uninitialized_var()
