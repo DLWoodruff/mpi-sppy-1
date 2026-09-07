@@ -420,7 +420,19 @@ class IpoptOuterBound(LagrangianOuterBound):
             gripe=True,
             tee=teeme,
             verbose=verbose,
-            need_solution=True,
+            # False so a solution that fails to LOAD is reported rather than
+            # raised. spopt hands that case back as solution_available=False,
+            # which the loop below already treats as "no bound for this
+            # scenario" and now names as a cause -- an optional source of a
+            # bound should not take the hub and every other cylinder with it.
+            #
+            # Worth being exact about the reach of this, because the name
+            # oversells it: it governs ONLY the load step. A solve that fails
+            # outright still re-raises its solver_exception from the
+            # not_good_enough_results branch, which need_solution does not
+            # gate. Narrowing that too would take a catch around solve_loop
+            # here, which is a bigger change than this flag.
+            need_solution=False,
             warmstart=warmstart,
         )
 
