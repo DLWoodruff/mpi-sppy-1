@@ -676,6 +676,41 @@ class TestCollectiveRaise(unittest.TestCase):
             spoke._raise_collectively("my own problem")
 
 
+@unittest.skipUnless(comm.size == 2, "needs exactly two ranks")
+class TestCollectiveRaiseOnRealRanks(unittest.TestCase):
+    """The stubbed version above pins the logic; this pins the MPI calls.
+
+    A stub cannot catch a wrong `op`, a bcast whose root disagrees between
+    ranks, or an allreduce that the ranks enter with different types -- and
+    those are exactly the mistakes that turn a guard meant to prevent a hang
+    into one.
+    """
+
+    def _spoke(self):
+        from mpisppy.cylinders.ipopt_outer_bound import IpoptOuterBound
+        spoke = IpoptOuterBound.__new__(IpoptOuterBound)
+        spoke.cylinder_comm = comm
+        spoke.cylinder_rank = comm.Get_rank()
+        return spoke
+
+    def test_one_rank_with_a_problem_raises_on_both(self):
+        # Only rank 1 has the bad scenario. Both ranks must raise; before the
+        # fix rank 0 returned and blocked in the next collective.
+        rank = comm.Get_rank()
+        problem = "scenario Scen1: has a discrete variable" if rank == 1 else None
+        with self.assertRaises(CertificateError) as ctx:
+            self._spoke()._raise_collectively(problem)
+        # and BOTH tracebacks name the scenario that actually caused it
+        self.assertIn("rank 1", str(ctx.exception))
+        self.assertIn("Scen1", str(ctx.exception))
+
+    def test_no_rank_with_a_problem_raises_on_neither(self):
+        self._spoke()._raise_collectively(None)
+        # If either rank had raised, the other would hang here rather than
+        # reach the barrier.
+        comm.Barrier()
+
+
 class TestCollectiveWarning(unittest.TestCase):
     """The conditions this spoke warns about are rank-local; Ebound is not.
 
