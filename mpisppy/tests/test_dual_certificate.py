@@ -391,6 +391,118 @@ class TestGuards(unittest.TestCase):
 
 
 @unittest.skipUnless(ipopt_available, "ipopt is not available")
+class TestUndifferentiableExpressions(unittest.TestCase):
+    """Expressions Pyomo's differentiate has no rule for are a setup error.
+
+    They are not a convexity problem and cannot be asserted away: cosh is
+    convex AND unsupported. Without the guard the scenario is admitted, and
+    since Ebound is all-or-nothing one such scenario silences the whole
+    cylinder for the whole run while it goes on solving every subproblem and
+    throwing the result away.
+    """
+
+    def _model(self, body_fn):
+        m = pyo.ConcreteModel()
+        m.x = pyo.Var(bounds=(0.5, 4), initialize=1.0)
+        m.y = pyo.Var(bounds=(0, 100), initialize=5.0)
+        m.c = pyo.Constraint(expr=body_fn(m.x) <= m.y)
+        m.obj = pyo.Objective(expr=m.y)
+        return m
+
+    def test_the_unsupported_unary_functions_are_rejected(self):
+        for name in ("cosh", "sinh", "tanh", "ceil", "floor"):
+            with self.subTest(name):
+                with self.assertRaises(CertificateError) as ctx:
+                    check_model_is_certifiable(self._model(getattr(pyo, name)))
+                # naming the function is the point: it is what the user has to
+                # rewrite, and nothing else in the run will say which it was
+                self.assertIn(f"{name}()", str(ctx.exception))
+
+    def test_expr_if_is_rejected(self):
+        m = pyo.ConcreteModel()
+        m.x = pyo.Var(bounds=(0, 10), initialize=1.0)
+        m.c = pyo.Constraint(
+            expr=pyo.Expr_if(IF=m.x >= 1, THEN=m.x, ELSE=2 * m.x) <= 5)
+        m.obj = pyo.Objective(expr=m.x)
+        with self.assertRaisesRegex(CertificateError, "Expr_if"):
+            check_model_is_certifiable(m)
+
+    def test_an_unsupported_function_in_the_objective_is_rejected(self):
+        # phi is built from the objective too, not only the constraint bodies.
+        m = pyo.ConcreteModel()
+        m.x = pyo.Var(bounds=(0.5, 4), initialize=1.0)
+        m.obj = pyo.Objective(expr=pyo.cosh(m.x))
+        with self.assertRaises(CertificateError) as ctx:
+            check_model_is_certifiable(m)
+        self.assertIn("objective", str(ctx.exception))
+
+    def test_the_supported_functions_are_still_accepted(self):
+        # A guard that refuses a model the certificate could have handled is
+        # the worse error, so pin the accept side too.
+        for name in ("exp", "log", "log10", "sqrt", "sin", "cos", "tan",
+                     "atan"):
+            with self.subTest(name):
+                check_model_is_certifiable(self._model(getattr(pyo, name)))
+
+    def test_polynomials_and_plain_models_are_untouched(self):
+        check_model_is_certifiable(self._model(lambda x: x ** 2))
+        check_model_is_certifiable(self._model(lambda x: 3 * x + 1))
+
+    def test_a_named_expression_component_is_transparent(self):
+        """The false rejection this guard shipped with for one commit.
+
+        `m.e = pyo.Expression(...)` is a CONTAINER, not an operation:
+        differentiate sees through it. Its type is absent from the dispatch
+        table for that reason, so type-checking it rejects every model that
+        uses one -- which farmer's objective does, and most real models do.
+        The synthetic fixtures above all build bare expressions, which is
+        exactly why none of them caught it; only the real model did.
+        """
+        m = pyo.ConcreteModel()
+        m.x = pyo.Var(bounds=(0, 4), initialize=1.0)
+        m.e = pyo.Expression(expr=m.x ** 2 + 3 * m.x)
+        m.obj = pyo.Objective(expr=m.e)
+        check_model_is_certifiable(m)
+
+        # and a named Expression must not HIDE an unsupported function either
+        m2 = pyo.ConcreteModel()
+        m2.x = pyo.Var(bounds=(0.5, 4), initialize=1.0)
+        m2.e = pyo.Expression(expr=pyo.cosh(m2.x))
+        m2.obj = pyo.Objective(expr=m2.e)
+        with self.assertRaisesRegex(CertificateError, "cosh"):
+            check_model_is_certifiable(m2)
+
+    def test_the_real_farmer_model_is_accepted(self):
+        """The guard is worthless if it refuses the model in examples/."""
+        import os
+        import sys
+        here = os.path.dirname(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))))
+        farmer_dir = os.path.join(here, "examples", "farmer")
+        if not os.path.isdir(farmer_dir):
+            self.skipTest("examples/farmer is not present")
+        sys.path.insert(0, farmer_dir)
+        try:
+            import farmer
+        finally:
+            sys.path.remove(farmer_dir)
+        scenario = farmer.scenario_creator(
+            "scen0", use_integer=False, sense=1, crops_multiplier=1)
+        check_model_is_certifiable(scenario)
+
+    def test_abs_is_accepted_because_its_failure_is_a_point_not_a_model(self):
+        """differentiate handles abs everywhere except exactly at the kink.
+
+        That is a property of the iterate, not of the model, so refusing it at
+        setup would reject a model that works for every point but one. It
+        stays with the runtime stand-down.
+        """
+        m = self._model(abs)
+        check_model_is_certifiable(m)
+        m.x.set_value(0.0)                      # on the kink
+        check_model_is_certifiable(m)           # still a setup-legal model
+
+
 class TestWithIpopt(unittest.TestCase):
     """The parts that can only be checked against the real solver: that ipopt's
     reported dual signs are what the table in dual_certificate.py assumes."""

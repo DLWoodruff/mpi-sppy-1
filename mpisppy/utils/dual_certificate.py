@@ -149,6 +149,63 @@ _SIGN_CONVENTIONS = {
 }
 
 
+# What Pyomo's `differentiate` actually has rules for. Read from its own
+# dispatch tables rather than restated here, so a Pyomo release that adds a rule
+# is picked up instead of being refused by a stale copy of the list.
+#
+# If the private names ever move, the check below is skipped rather than
+# guessed at: refusing a model the certificate could have handled is the worse
+# error, and the spoke already stands down gracefully at runtime on anything
+# differentiate raises -- this guard buys a clear message at setup, not
+# soundness.
+try:
+    from pyomo.core.expr.calculus.diff_with_pyomo import (
+        _diff_map as _PYOMO_DIFF_MAP,
+        _unary_map as _PYOMO_UNARY_MAP,
+    )
+    _DIFFERENTIABLE_NODES = frozenset(_PYOMO_DIFF_MAP)
+    _DIFFERENTIABLE_UNARY = frozenset(_PYOMO_UNARY_MAP)
+except ImportError:                                   # pragma: no cover
+    _DIFFERENTIABLE_NODES = None
+    _DIFFERENTIABLE_UNARY = None
+
+
+def _undifferentiable_parts(expr, where):
+    """Names of sub-expressions in `expr` that differentiate has no rule for.
+
+    Structural only. `abs` is deliberately NOT reported: differentiate handles
+    it everywhere except exactly at the kink, which depends on the point and
+    not on the model, so it belongs to the runtime stand-down rather than to a
+    setup guard that would refuse a usable model.
+    """
+    if _DIFFERENTIABLE_NODES is None:
+        return []
+    from pyomo.core.expr.numeric_expr import (
+        UnaryFunctionExpression, NPV_UnaryFunctionExpression,
+    )
+    unary_types = (UnaryFunctionExpression, NPV_UnaryFunctionExpression)
+
+    found, stack = [], [expr]
+    while stack:
+        node = stack.pop()
+        if not getattr(node, "is_expression_type", lambda: False)():
+            continue
+        if node.is_named_expression_type():
+            # A named Expression component (`m.e = pyo.Expression(...)`) is a
+            # container, not an operation: differentiate sees through it to the
+            # expression inside. Its type is absent from the dispatch table for
+            # that reason, so type-checking it rejects any model that uses one
+            # -- which farmer's objective does, along with most real models.
+            pass
+        elif isinstance(node, unary_types):
+            if node.getname() not in _DIFFERENTIABLE_UNARY:
+                found.append(f"{node.getname()}() in {where}")
+        elif node.__class__ not in _DIFFERENTIABLE_NODES:
+            found.append(f"{node.__class__.__name__} in {where}")
+        stack.extend(node.args)
+    return found
+
+
 def check_model_is_certifiable(model):
     """Raise CertificateError if `model` violates an assumption the
     certificate depends on.
@@ -208,6 +265,36 @@ def check_model_is_certifiable(model):
             "rows; offending constraints: "
             f"{', '.join(sorted(nonlinear_ranged)[:10])}"
             + (" ..." if len(nonlinear_ranged) > 10 else "")
+        )
+
+    # The certificate needs grad phi(vhat), and phi is built from the objective
+    # and the constraint bodies, so anything differentiate cannot handle there
+    # means no bound is EVER available for this scenario -- not on this
+    # iteration, on any of them. Ebound is all-or-nothing, so one such scenario
+    # silences the whole cylinder for the whole run while it goes on solving
+    # every subproblem and discarding the result.
+    #
+    # Convex and unsupported are not the same thing: cosh(x) <= y is a model
+    # this spoke is FOR, and differentiate simply has no rule for it. Saying so
+    # at setup, naming the function, is the only way the user learns which one
+    # it was.
+    undifferentiable = _undifferentiable_parts(obj.expr, f"objective {obj.name}")
+    for con in model.component_data_objects(
+        pyo.Constraint, active=True, descend_into=True
+    ):
+        undifferentiable += _undifferentiable_parts(
+            con.body, f"constraint {con.name}")
+    if undifferentiable:
+        raise CertificateError(
+            "the certificate differentiates the objective and the constraint "
+            "bodies, and Pyomo's differentiate has no rule for: "
+            f"{', '.join(sorted(set(undifferentiable))[:10])}"
+            + (" ..." if len(set(undifferentiable)) > 10 else "")
+            + ". Convexity is not the issue -- cosh is convex and unsupported "
+            "alike -- so this cannot be worked around by asserting it; the "
+            "expression has to be rewritten in terms differentiate knows "
+            f"({', '.join(sorted(_DIFFERENTIABLE_UNARY))}) or this spoke "
+            "left off the run."
         )
 
 

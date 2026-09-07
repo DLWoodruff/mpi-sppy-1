@@ -923,30 +923,36 @@ class TestCertificateFailureStandsDown(unittest.TestCase):
         return m
 
     def _scenario_differentiate_cannot_handle(self):
-        """A model certified_lower_bound cannot differentiate.
+        """A model that PASSES setup and still cannot be differentiated.
 
-        cosh IS convex, so check_model_is_certifiable admits it and this is a
-        model the spoke targets, not an abuse. Pyomo's differentiate has no
-        rule for it and raises DifferentiationException, which derives
+        abs is deliberately the case here, not cosh. The structurally
+        unsupported functions -- cosh, sinh, tanh, ceil, floor, Expr_if -- are
+        now a hard error in check_model_is_certifiable, so a scenario carrying
+        one never reaches the iteration loop and could not exercise the
+        stand-down. abs is the case that survives that guard: differentiate
+        handles it everywhere except exactly at the kink, which depends on the
+        POINT and not on the model, so it cannot be decided at setup. The
+        iterate landing on x=0 raises DifferentiationException, which derives
         straight from Exception -- not ValueError, not ArithmeticError, not
-        even PyomoException -- so the enumerated catch this replaces let it
-        out of the iteration loop, every iteration, aborting the wheel.
-        sinh, tanh, ceil, floor, Expr_if and abs(x) at x=0 are the same story.
+        even PyomoException.
         """
         m = pyo.ConcreteModel()                   # unnamed on purpose
-        m.x = pyo.Var(bounds=(-2, 2), initialize=0.5)
+        m.x = pyo.Var(bounds=(-1, 1), initialize=0.0)   # exactly on the kink
         m.y = pyo.Var(bounds=(0, 100), initialize=5.0)
         m.dual = pyo.Suffix(direction=pyo.Suffix.IMPORT)
-        m.c = pyo.Constraint(expr=pyo.cosh(m.x) <= m.y)
+        m.c = pyo.Constraint(expr=abs(m.x) <= m.y)
         m.dual[m.c] = -1.0
         m.obj = pyo.Objective(expr=m.y)
         m._mpisppy_data = type(
             "_D", (), {"solution_available": True, "outer_bound": "UNSET"})()
         return m
 
-    def test_the_model_is_one_the_spoke_targets(self):
-        # Otherwise the test below is about an abuse rather than about a
-        # convex model the certificate is supposed to handle.
+    def test_the_model_reaches_the_iteration_loop_at_all(self):
+        """Otherwise the stand-down test below exercises an unreachable path.
+
+        The setup guard must NOT reject this one: if it ever does, the case is
+        being caught earlier and this class stops testing the runtime catch.
+        """
         from mpisppy.utils.dual_certificate import check_model_is_certifiable
         check_model_is_certifiable(self._scenario_differentiate_cannot_handle())
 
