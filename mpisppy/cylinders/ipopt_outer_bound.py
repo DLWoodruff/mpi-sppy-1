@@ -25,7 +25,6 @@ import warnings
 
 import pyomo.environ as pyo
 
-from pyomo.common.errors import PyomoException
 from pyomo.contrib.fbbt.fbbt import InfeasibleConstraintException
 
 from mpisppy import MPI
@@ -99,7 +98,12 @@ class IpoptOuterBound(LagrangianOuterBound):
         guard below it is the kind that only fails on someone else's model.
         """
         problem = None
-        for s in self.opt.local_scenarios.values():
+        # .items(), not .values(): the messages below must name the scenario by
+        # its local_scenarios key, as every other guard here does. s.name is
+        # the Pyomo model name, which SPBase never sets -- it is whatever the
+        # scenario_creator chose, and an unnamed ConcreteModel reports
+        # "unknown", which would tell the user nothing.
+        for sname, s in self.opt.local_scenarios.items():
             # Existence is not enough: a scenario_creator may already attach an
             # EXPORT or LOCAL `dual` suffix (a common way to supply dual warm
             # starts), and reusing that would import nothing.
@@ -112,14 +116,14 @@ class IpoptOuterBound(LagrangianOuterBound):
                 # this the next line raises AttributeError from inside
                 # lagrangian_prep, naming neither this spoke nor the component.
                 problem = problem or (
-                    f"scenario {s.name} already has a component named `dual` "
+                    f"scenario {sname} already has a component named `dual` "
                     f"that is not a Suffix (it is a "
                     f"{type(existing).__name__}); the certificate needs a "
                     "Suffix.IMPORT named `dual` to receive the solver's duals."
                 )
             elif not existing.import_enabled():
                 problem = problem or (
-                    f"scenario {s.name} already has a `dual` Suffix that does "
+                    f"scenario {sname} already has a `dual` Suffix that does "
                     "not import; the certificate needs the solver's duals. Use "
                     "Suffix.IMPORT or Suffix.IMPORT_EXPORT."
                 )
@@ -195,19 +199,31 @@ class IpoptOuterBound(LagrangianOuterBound):
                 # policy this spoke states for itself.
                 infeasible.append(f"{sname} ({e})")
                 continue
-            except PyomoException as e:
-                # fbbt raises more than the infeasibility it is asked about:
-                # pyomo.contrib.fbbt.interval raises IntervalException on rows
-                # it cannot bound, e.g. `x**y <= 10` with x allowed negative
-                # ("Cannot raise a negative variable to a fractional power").
-                # check_model_is_certifiable admits that row -- a one-sided
-                # nonlinear body is the caller's convexity assertion -- so it
-                # reaches here, and the narrow catch above used to let it out
-                # of lagrangian_prep and abort the whole wheel.
+            except Exception as e:
+                # `except Exception` is deliberate, and naming the classes
+                # instead was tried twice and was wrong twice. fbbt raises a
+                # whole zoo on models check_model_is_certifiable admits, since
+                # a one-sided nonlinear body is the caller's convexity
+                # assertion and fbbt has to bound it anyway:
+                #   x**y <= 10, x in [-5,-1]   -> IntervalException
+                #   x**3 <= y,  x in [1,1e200] -> OverflowError, which is not
+                #                                 a PyomoException at all
+                # and pyomo.contrib.fbbt.interval raises a bare ValueError on
+                # yet another path. Enumerating them tracks Pyomo's interval
+                # arithmetic release by release, and every one missed aborts
+                # the hub and every other cylinder from a call this spoke makes
+                # only to tighten a box and print a diagnostic. The property is
+                # that NOTHING raised here is worth the wheel, so catch on
+                # that and not on a list.
+                #
+                # The cost is that a genuine bug in our own code is swallowed
+                # too, so the warning reports the exception class and message
+                # rather than just a count.
                 #
                 # Tightening is only ever an improvement, so losing it costs
-                # looseness and nothing else. Redo the scan without fbbt to
-                # keep the unbounded-variable diagnostic.
+                # looseness and nothing else. Redo the scan without fbbt -- a
+                # pure component_data_objects walk that cannot itself raise --
+                # to keep the unbounded-variable diagnostic.
                 fbbt_failed.append(f"{sname} ({type(e).__name__}: {e})")
                 names = unbounded_variables(s, do_fbbt=False)
             if names:
@@ -415,7 +431,10 @@ class IpoptOuterBound(LagrangianOuterBound):
 
         failures = []
         no_dual = []
-        for s in self.opt.local_scenarios.values():
+        # .items() for the same reason as _attach_dual_suffixes: the failure
+        # message has to name the scenario by its local_scenarios key. s.name
+        # is the Pyomo model name, which SPBase never sets.
+        for sname, s in self.opt.local_scenarios.items():
             # solve_loop has just written results.Problem[0].Lower_bound here,
             # which for Ipopt is -inf. Overwrite it with the certificate, or
             # with None when there is no certificate to be had -- Ebound then
@@ -438,7 +457,7 @@ class IpoptOuterBound(LagrangianOuterBound):
                 # from an overflow. All three mean the same thing here -- no
                 # certificate this iteration -- and none is worth taking down
                 # the hub and every other spoke from inside the iteration loop.
-                failures.append(f"{s.name} ({e})")
+                failures.append(f"{sname} ({e})")
                 s._mpisppy_data.outer_bound = None
 
         self._warn_once_collectively(

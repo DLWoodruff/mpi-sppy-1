@@ -451,14 +451,24 @@ class TestDualSuffixGuard(unittest.TestCase):
         # raised AttributeError out of lagrangian_prep, naming neither this
         # spoke nor the component; every other setup problem here is a
         # CertificateError naming the scenario.
-        m = _certifiable_scenario()
+        # Deliberately UNNAMED, while the local_scenarios key is "Scen0".
+        # _certifiable_scenario() names the model "Scen0" too, which would let
+        # this pass whether the message used the key or the model name.
+        m = pyo.ConcreteModel()
+        self.assertEqual(m.name, "unknown")       # the premise
+        m.x = pyo.Var(bounds=(0, 10), initialize=1.0)
+        m.c = pyo.Constraint(expr=m.x >= 1)
+        m.obj = pyo.Objective(expr=m.x, sense=pyo.minimize)
         m.dual = pyo.Var(initialize=0.0)
         with self.assertRaises(CertificateError) as ctx:
             self._spoke_over(m)._attach_dual_suffixes()
         message = str(ctx.exception)
-        self.assertIn("Scen0", message)
         self.assertIn("not a Suffix", message)
         self.assertIn("ScalarVar", message)
+        # By the local_scenarios KEY. s.name is the Pyomo model name, which
+        # SPBase never sets -- an unnamed ConcreteModel reports "unknown".
+        self.assertIn("Scen0", message)
+        self.assertNotIn("unknown", message)
 
 
 class TestNewlyFixedNonants(unittest.TestCase):
@@ -571,14 +581,14 @@ class TestFbbtExceptionsStandDown(unittest.TestCase):
         spoke._warned = set()
         return spoke
 
-    def _interval_exception_scenario(self):
-        """A model whose fbbt raises IntervalException, not infeasibility.
-
-        pyomo.contrib.fbbt.interval refuses to bound a negative base raised to
-        a variable power. check_model_is_certifiable admits the row -- a
-        one-sided nonlinear body is the caller's convexity assertion -- so it
-        reaches the fbbt call.
-        """
+    # Models fbbt cannot analyze, one per exception class it is known to
+    # raise. Enumerating exception classes in the GUARD was tried twice and was
+    # wrong twice -- IntervalException was caught, then PyomoException, and
+    # OverflowError is neither -- so the guard now catches Exception and this
+    # list is what keeps that honest. Each entry must be admitted by
+    # check_model_is_certifiable, or it would never reach the fbbt call.
+    def _negative_base_scenario(self):
+        """IntervalException: a negative base raised to a variable power."""
         m = pyo.ConcreteModel(name="Scen0")
         m.x = pyo.Var(bounds=(-5, -1), initialize=-2.0)
         m.y = pyo.Var(bounds=(0.5, 2), initialize=1.0)
@@ -587,39 +597,75 @@ class TestFbbtExceptionsStandDown(unittest.TestCase):
         m.obj = pyo.Objective(expr=m.x + m.y + m.z, sense=pyo.minimize)
         return m
 
-    def test_the_scenario_is_admitted_by_the_certifiability_check(self):
-        # If this ever stops holding, the fbbt call is unreachable for this
-        # model and the test below stops testing anything.
+    def _overflowing_power_scenario(self):
+        """OverflowError: interval.power computes xu**yu unguarded.
+
+        Not a PyomoException, which is what makes it the case that a
+        PyomoException catch still let through.
+        """
+        m = pyo.ConcreteModel(name="Scen0")
+        m.x = pyo.Var(bounds=(1.0, 1e200), initialize=1.0)
+        m.y = pyo.Var(bounds=(0, None), initialize=1.0)
+        m.z = pyo.Var(initialize=0.0)             # deliberately unbounded
+        m.c = pyo.Constraint(expr=m.x ** 3 <= m.y)
+        m.obj = pyo.Objective(expr=m.y + m.z, sense=pyo.minimize)
+        return m
+
+    def _unanalyzable_scenarios(self):
+        return {
+            "negative base to a variable power": self._negative_base_scenario,
+            "overflow in interval.power": self._overflowing_power_scenario,
+        }
+
+    def test_the_scenarios_are_admitted_by_the_certifiability_check(self):
+        # If this ever stops holding, the fbbt call is unreachable for that
+        # model and its case below stops testing anything.
         from mpisppy.utils.dual_certificate import check_model_is_certifiable
-        check_model_is_certifiable(self._interval_exception_scenario())
+        for label, build in self._unanalyzable_scenarios().items():
+            with self.subTest(label):
+                check_model_is_certifiable(build())
+
+    def test_fbbt_really_raises_on_each_of_them(self):
+        # The premise of the test below: no exception, nothing being caught.
+        from mpisppy.utils.dual_certificate import unbounded_variables
+        for label, build in self._unanalyzable_scenarios().items():
+            with self.subTest(label):
+                with self.assertRaises(Exception):
+                    unbounded_variables(build(), do_fbbt=True)
 
     def test_fbbt_raising_does_not_escape_the_guard(self):
-        from pyomo.common.errors import IntervalException
-        from mpisppy.utils.dual_certificate import unbounded_variables
+        for label, build in self._unanalyzable_scenarios().items():
+            with self.subTest(label):
+                spoke = self._spoke_over(build())
+                with warnings.catch_warnings(record=True) as caught:
+                    warnings.simplefilter("always")
+                    spoke._check_setup_guards()   # must not raise
+                self.assertTrue(
+                    any("could not analyze" in str(w.message) for w in caught),
+                    "stood down silently; it should say the box is untightened")
 
-        scenario = self._interval_exception_scenario()
-        # the call really does raise, so the guard really is catching it
-        with self.assertRaises(IntervalException):
-            unbounded_variables(scenario, do_fbbt=True)
-
-        spoke = self._spoke_over(self._interval_exception_scenario())
+    def test_the_warning_names_the_exception_class(self):
+        # The wide catch swallows a genuine bug in our own code too, so the
+        # message has to carry enough to recognize one.
+        spoke = self._spoke_over(self._overflowing_power_scenario())
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
-            spoke._check_setup_guards()           # must not raise
+            spoke._check_setup_guards()
         self.assertTrue(
-            any("could not analyze" in str(w.message) for w in caught),
-            "the run stood down silently; it should say the box is untightened")
+            any("OverflowError" in str(w.message) for w in caught))
 
     def test_the_unbounded_diagnostic_survives_fbbt_bailing(self):
         # Losing the tightening costs looseness. Losing the diagnostic would
         # cost the user the one message that explains an empty 'N' column, so
         # the scan is redone without fbbt.
-        spoke = self._spoke_over(self._interval_exception_scenario())
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            spoke._check_setup_guards()
-        self.assertTrue(
-            any("no finite bound" in str(w.message) for w in caught))
+        for label, build in self._unanalyzable_scenarios().items():
+            with self.subTest(label):
+                spoke = self._spoke_over(build())
+                with warnings.catch_warnings(record=True) as caught:
+                    warnings.simplefilter("always")
+                    spoke._check_setup_guards()
+                self.assertTrue(
+                    any("no finite bound" in str(w.message) for w in caught))
 
 
 class TestCollectiveRaise(unittest.TestCase):
@@ -656,8 +702,7 @@ class TestCollectiveRaise(unittest.TestCase):
         spoke.cylinder_comm = _TwoRanks()
         return spoke
 
-    def test_a_clean_rank_still_raises_when_its_peer_did_not(self):
-        # rank 0 saw nothing and neither did rank 1
+    def test_no_rank_raises_when_no_rank_saw_a_problem(self):
         self._spoke(rank=0, peer_saw_it=False)._raise_collectively(None)
 
     def test_a_clean_rank_raises_when_its_peer_saw_the_problem(self):
