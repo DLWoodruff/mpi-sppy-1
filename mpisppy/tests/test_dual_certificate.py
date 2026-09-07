@@ -224,6 +224,49 @@ class TestCertificateMath(unittest.TestCase):
         self.assertEqual(certified_lower_bound(m, eps_rel=0.0), OPT)
 
 
+class TestPointOutsideTheBox(unittest.TestCase):
+    """`v̂` need not lie in `B`, and Ipopt's `v̂` sometimes does not.
+
+    The theorem's hypothesis is convexity on an OPEN SET CONTAINING `B`, not on
+    `B` -- the minimization runs over `v in B` while `v̂` only has to be a point
+    where phi is convex and differentiable. That distinction is load-bearing
+    rather than pedantic: `bound_relax_factor` relaxes the variable bounds
+    before solving, so the point Ipopt returns can sit slightly outside `B`,
+    and a certificate that required `v̂ in B` would not cover the points this
+    cylinder is actually handed.
+    """
+
+    def _qhat(self, vhat):
+        # min x^2 over x in [1, 3]; true optimum 1.0 at x = 1
+        m = pyo.ConcreteModel()
+        m.x = pyo.Var(bounds=(1, 3), initialize=vhat)
+        m.dual = pyo.Suffix(direction=pyo.Suffix.IMPORT)
+        m.obj = pyo.Objective(expr=m.x ** 2)
+        return certified_lower_bound(m, sign_convention="ipopt", eps_rel=0.0)
+
+    def test_valid_from_a_point_outside_the_box(self):
+        true_opt = 1.0
+        for vhat in (1.0, 2.0, 3.0,        # inside
+                     0.99, 0.5, -4.0,      # below
+                     3.01, 7.0):           # above
+            with self.subTest(vhat=vhat):
+                self.assertLessEqual(
+                    self._qhat(vhat), true_opt + 1e-12,
+                    "a point outside the box produced an INVALID bound")
+
+    def test_a_point_just_outside_is_barely_looser(self):
+        # bound_relax_factor puts v̂ a hair outside, so that case has to stay
+        # usable rather than merely valid.
+        self.assertAlmostEqual(self._qhat(1.0), 1.0, places=12)
+        self.assertAlmostEqual(self._qhat(0.99), self._qhat(1.0), delta=0.05)
+
+    def test_far_outside_costs_looseness_not_validity(self):
+        # Monotone in the distance, and always below the optimum.
+        near, far = self._qhat(0.5), self._qhat(-4.0)
+        self.assertLess(far, near)
+        self.assertLessEqual(near, 1.0 + 1e-12)
+
+
 class TestCushion(unittest.TestCase):
     """eps_rel is subtracted, so it is the one argument that can turn a valid
     bound into an invalid one."""

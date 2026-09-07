@@ -127,7 +127,8 @@ cylinder (solve, take λ, solve the dual, report) does not give a valid bound.
 
 ### 3.3 What does give one: a linear underestimator over the box
 
-`φ_s` is convex on `B`, so for any point `v̂ ∈ B` the tangent at `v̂` lies below it:
+`φ_s` is convex on an **open set containing** `B` — not merely on `B`, which
+matters below — so for any `v̂` in that set the tangent at `v̂` lies below it:
 
 ```
     φ_s(v) ≥ φ_s(v̂) + ∇φ_s(v̂)ᵀ (v − v̂)       for all v
@@ -145,11 +146,23 @@ Minimizing the right-hand side over the box is separable and closed-form, so
 Call the right-hand side `q̂_s`. Then
 
 ```
-    q̂_s  ≤  L_s(W_s)      for ANY v̂ ∈ B, ANY λ ≥ 0, ANY μ
+    q̂_s  ≤  L_s(W_s)      for ANY v̂, ANY λ ≥ 0, ANY μ
 ```
 
 and the cylinder reports `Σ_s p_s q̂_s`. One gradient evaluation and a loop over
 variables — no second solve, no tolerance argument, no feasibility requirement on `v̂`.
+
+Note what `v̂` is *not* required to be. It need not be feasible, it need not be
+optimal, and it need not lie in `B`: the minimization is over `v ∈ B`, while `v̂`
+only has to be a point where `φ_s` is convex and differentiable, which is why the
+hypothesis is an open set containing `B` rather than `B` itself. That is not
+pedantry. Ipopt's `bound_relax_factor` relaxes the variable bounds by a small
+amount before solving, so the point it returns can sit slightly *outside* `B` —
+and a theorem stated for `v̂ ∈ B` would not cover the points this cylinder
+actually receives. The closed form above needs no adjustment for it: minimizing
+`∂_i φ · (v_i − v̂_i)` over `[lo_i, hi_i]` picks the endpoint the sign of the
+gradient selects wherever `v̂_i` happens to sit, and a `v̂` far outside the box
+costs looseness, never validity.
 
 **Looseness has a closed form, and it is the box width that sets it.** Each term is
 `|∂_i φ|` times the distance from `v̂_i` to the far end of its interval, so
