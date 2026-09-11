@@ -63,6 +63,69 @@ honestly.
 What *is* rigorous is Lagrangian weak duality, which needs no convergence assumption
 at all. That is what this cylinder computes.
 
+### 2.1 Measured: a convex QP where Ipopt reports `optimal` and its value is not a bound
+
+The argument above is structural, and the standard reply to it is that these models are
+convex, so a solve reporting `optimal` has found the minimum and its objective value can
+be trusted. This is the family that answers that reply, with the optimum known exactly.
+
+Take the Hilbert QP of §5.3 with its variable bounds removed:
+
+```
+    min ½ xᵀHx − 1ᵀx      s.t.  Σx ≤ 5,   x free,   H_ij = 1/(i+j+1)
+```
+
+`H` is positive definite, so the problem is convex and every hypothesis holds. Dropping
+the bounds is what makes an exact reference available: the one constraint is active and
+there is no other active set to determine, so the KKT conditions are a single linear
+system and can be solved in rational arithmetic. Ipopt reported `optimal` at every size
+below.
+
+| n | exact optimum | exact ‖x*‖∞ | Ipopt's ‖x̂‖∞ | Ipopt's value | value − optimum |
+|---|---|---|---|---|---|
+| 10 | −39/8 = −4.875000000000 | 3.50e5 | 3.50e5 | −4.874999577980 | **+4.2e−7** |
+| 12 | −1415/288 = −4.913194444444 | 8.66e6 | 8.70e6 | −4.912905741134 | **+2.9e−4** |
+| 14 | −1935/392 = −4.936224489796 | 2.09e8 | 1.82e5 | −4.912217323377 | **+2.4e−2** |
+| 16 | −2535/512 = −4.951171875000 | 5.56e9 | 1.93e5 | −4.924764205425 | **+2.6e−2** |
+
+Every value in the last column is positive, which is to say every one of them is above
+the optimum and none of them is an outer bound. Two different mechanisms produce that,
+and the second is what makes the error grow:
+
+**At n=10 the optimizer is not at fault.** Ipopt lands within a rounding of `x*`, and
+`f` evaluated at Ipopt's own point in exact arithmetic is `−4.875000044826` — *below*
+the optimum, the harmless side, because the point carries a little constraint violation.
+The `+4.2e−7` is introduced by evaluating `f` in double precision at `‖x‖ ~ 3.5e5`,
+where individual terms reach `4.35e9` and cancel down to `4.875`. Tightening `tol` does
+not touch this, and neither would a better NLP code.
+
+**At n=14 and n=16 the solve stops short and says otherwise.** `x*` is three to four
+orders of magnitude further out than where Ipopt stops, and the termination test passes anyway
+because it is applied to the *scaled* KKT residual. Here the overshoot is an optimality
+error, and at 2.6e−2 on a quantity of size 5 it is wrong in the third significant digit.
+
+Both arrive labelled `optimal`, and nothing else in the solver's output separates them
+from a well-behaved solve. This is `TestObjectiveValueIsNotAnOuterBound` in
+`mpisppy/tests/test_dual_certificate.py`, which recomputes the optimum in rationals and
+verifies all four KKT conditions exactly, so the comparison cannot drift.
+
+The caveat belongs with the claim: on a well-scaled model with modest variable
+magnitudes the returned value usually *is* close enough that nobody notices. The claim
+is not that it is always wrong. It is that nothing in the output says when.
+
+And the alternative is not expensive in tightness. On the same problem with bounds at
+±10, at convergence, the certificate and `f(v̂)` agree to `1.2e−8`.
+
+### 2.2 An invalid outer bound is not self-correcting
+
+`OuterBoundUpdate` in `mpisppy/cylinders/spcommunicator.py` keeps the better of the new
+and the current value, so the outer bound is a monotone latch. One over-high value, from
+one scenario, in one iteration, is never revised: it sets the reported gap and feeds the
+convergence test for the rest of the run. An over-optimistic *inner* bound is replaced
+as soon as a better incumbent turns up; an over-optimistic outer bound has no such
+mechanism. So what "usually close enough" costs is not a slightly wrong number in one
+iteration — it is a wrong gap for the run, and possibly an early termination on it.
+
 ## 3. The bound
 
 ### 3.1 Setting
@@ -555,7 +618,7 @@ another's message for the run:
 
 - **`fbbt` proved a scenario infeasible**, or **could not analyze it**. The call
   is made to tighten the box and build a diagnostic, so nothing it raises is
-  worth the wheel; the box is then used as the model states it.
+  worth ending the run; the box is then used as the model states it.
 - **A variable with no finite bound after `fbbt`** (§6.1).
 - **The certificate raised**, keyed by exception class. A model this cylinder
   targets can still defeat Pyomo's `differentiate` at a particular point —

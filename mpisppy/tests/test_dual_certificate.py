@@ -21,8 +21,10 @@
 # whose optimum is x=1, y=0 with value 8 and multiplier 4 -- all analytic, so
 # every expected number below is exact rather than a recorded observation.
 
+import functools
 import math
 import unittest
+from fractions import Fraction
 
 import pyomo.environ as pyo
 
@@ -761,6 +763,151 @@ class TestIllConditioning(unittest.TestCase):
             self._solve(_hilbert_qp(10, rowscale=1e-8)), eps_rel=0.0)
         self.assertIsNotNone(bad)
         self.assertLessEqual(bad, bad_upper + 1e-12 * (1.0 + abs(bad_upper)))
+
+
+# ---------------------------------------------------------------------------
+# Why the solver's objective value is not an outer bound
+#
+# The proposal these answer is "the subproblems are convex, so ipopt finds the
+# minimum, so report f(vhat) + W'xhat and skip the certificate".  The reply is
+# that `optimal` is a statement about a scaled KKT residual, not about the
+# objective, and that what separates the two is the conditioning.
+#
+# The family is the Hilbert QP of the section above with its variable bounds
+# removed:
+#
+#     min 1/2 x'Hx - 1'x   s.t.  sum(x) <= 5,   x free,   H_ij = 1/(i+j+1)
+#
+# Dropping the bounds is what makes an exact reference available.  The single
+# constraint is active and there is no other active set to determine, so the
+# KKT conditions are one linear system, and _exact_hilbert_optimum solves it in
+# rationals and then verifies all four conditions exactly.  For a convex
+# problem those four are sufficient, so what comes back is the optimum rather
+# than an estimate of it.  That is what the comparison needs: the discrepancy
+# under test is in the seventh significant digit at n=10, and a
+# double-precision reference could not settle a question that fine -- which is
+# the same trap `_rigorous_upper_bound` exists to avoid, reached from the other
+# side.
+# ---------------------------------------------------------------------------
+
+
+def _unbounded_hilbert_qp(n):
+    """The Hilbert QP with no variable bounds at all."""
+    m = pyo.ConcreteModel()
+    m.I = pyo.RangeSet(0, n - 1)
+    m.x = pyo.Var(m.I, initialize=0.0)
+    m.obj = pyo.Objective(
+        expr=0.5 * sum(m.x[i] * m.x[j] / (i + j + 1) for i in range(n) for j in range(n))
+        - sum(m.x[i] for i in range(n))
+    )
+    m.c = pyo.Constraint(expr=sum(m.x[i] for i in range(n)) <= HILBERT_RHS)
+    m.dual = pyo.Suffix(direction=pyo.Suffix.IMPORT)
+    return m
+
+
+def _exact_hilbert_optimum(n):
+    """(f*, lam*) for _unbounded_hilbert_qp(n), in exact rational arithmetic.
+
+    Solves  H x + lam*1 = 1,  sum(x) = 5  over the rationals by Gauss-Jordan
+    with partial pivoting, then checks stationarity, primal feasibility, dual
+    feasibility and complementarity -- rather than trusting the elimination.
+    Every check is an equality, because nothing here is floating point.
+    """
+    size = n + 1
+    A = [[Fraction(0)] * size for _ in range(size)]
+    b = [Fraction(0)] * size
+    for i in range(n):
+        for j in range(n):
+            A[i][j] = Fraction(1, i + j + 1)
+        A[i][n] = Fraction(1)
+        A[n][i] = Fraction(1)
+        b[i] = Fraction(1)
+    b[n] = Fraction(HILBERT_RHS)
+    for col in range(size):
+        piv = max(range(col, size), key=lambda r: abs(A[r][col]))
+        A[col], A[piv] = A[piv], A[col]
+        b[col], b[piv] = b[piv], b[col]
+        for row in range(size):
+            if row == col or A[row][col] == 0:
+                continue
+            factor = A[row][col] / A[col][col]
+            for k in range(col, size):
+                A[row][k] -= factor * A[col][k]
+            b[row] -= factor * b[col]
+    sol = [b[i] / A[i][i] for i in range(size)]
+    x, lam = sol[:n], sol[n]
+
+    for i in range(n):
+        assert sum(Fraction(1, i + j + 1) * x[j] for j in range(n)) - 1 + lam == 0
+    assert sum(x) == Fraction(HILBERT_RHS)      # active: feasible and complementary
+    assert lam >= 0                             # dual feasible
+    f = Fraction(1, 2) * sum(
+        x[i] * x[j] * Fraction(1, i + j + 1) for i in range(n) for j in range(n)
+    ) - sum(x)
+    return f, lam
+
+
+@functools.lru_cache(maxsize=None)
+def _overshoot_table(sizes):
+    """(n, f(vhat) - f*, certificate) per size, at ipopt's own stopping point.
+
+    Solved once and cached: the tests below read different columns of the same
+    table, and re-solving per test would say nothing extra.
+    """
+    rows = []
+    for n in sizes:
+        fstar = float(_exact_hilbert_optimum(n)[0])
+        m = _unbounded_hilbert_qp(n)
+        res = pyo.SolverFactory("ipopt").solve(m)
+        # The whole point is that the solver reports success.  If some ipopt
+        # build stops reporting it, these tests are no longer testing what they
+        # were written to test, and should say so rather than pass.
+        assert (
+            res.solver.termination_condition == pyo.TerminationCondition.optimal
+        ), f"n={n}: ipopt reported {res.solver.termination_condition}, not optimal"
+        rows.append((n, pyo.value(m.obj) - fstar, certified_lower_bound(m)))
+    return tuple(rows)
+
+
+@unittest.skipUnless(ipopt_available, "ipopt is not available")
+class TestObjectiveValueIsNotAnOuterBound(unittest.TestCase):
+    """A successful convex solve does not make f(vhat) a lower bound."""
+
+    SIZES = (10, 12, 14, 16)
+
+    def test_the_exact_optimum_is_what_the_comparison_needs(self):
+        # Pinned in closed form and separately from its use: if the rational
+        # solve ever drifts, every number below is being compared against the
+        # wrong thing, and it should fail here where that is obvious.
+        self.assertEqual(_exact_hilbert_optimum(10), (Fraction(-39, 8), Fraction(19, 20)))
+        self.assertEqual(_exact_hilbert_optimum(16)[0], Fraction(-2535, 512))
+
+    def test_the_solver_value_can_sit_above_the_true_optimum(self):
+        table = _overshoot_table(self.SIZES)
+        self.assertGreater(
+            max(over for _, over, _ in table), 0.0,
+            f"expected a size where f(vhat) > f* with ipopt reporting optimal; "
+            f"got {[(n, over) for n, over, _ in table]}",
+        )
+
+    def test_ill_conditioning_makes_the_overshoot_large(self):
+        # At n=10 the overshoot is about 4e-7, which is easy to dismiss.  The
+        # larger sizes are here because nothing the solver reports bounds it:
+        # at n=16 the exact optimum sits at |x*| = 5.6e9, ipopt stops four
+        # orders of magnitude short of that and still reports `optimal`, and
+        # the value it returns is ~2.6e-2 above the optimum -- wrong in the
+        # third significant digit of a quantity of size 5.
+        worst = max(over for n, over, _ in _overshoot_table(self.SIZES) if n >= 14)
+        self.assertGreater(worst, 1e-3)
+
+    def test_the_certificate_declines_rather_than_returning_it(self):
+        # Same models, same solves.  With no finite bounds the box
+        # minimisation is -inf in any descending direction, so the contract is
+        # "no bound this time" instead of the number the objective value would
+        # have supplied.
+        for n, _, q in _overshoot_table(self.SIZES):
+            with self.subTest(n=n):
+                self.assertIsNone(q)
 
 
 if __name__ == "__main__":

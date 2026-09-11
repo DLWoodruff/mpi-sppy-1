@@ -74,6 +74,55 @@ on the objective error, and the two error sources point opposite ways ---
 optimality error stops slightly above the optimum, while constraint violation
 can place the iterate slightly below it.
 
+\begin{remark}[A convex QP where Ipopt reports \texttt{optimal} and its value is
+not a bound]\label{rem:measured}
+The objection to the preceding paragraph is that the subproblems are convex, so
+a solve reporting \texttt{optimal} has found the minimum.  Consider the Hilbert
+QP with no variable bounds,
+\[
+  \min \tfrac12 x^{\top} H x - \mathbf{1}^{\top} x
+  \quad \text{s.t.} \quad \mathbf{1}^{\top} x \le 5,
+  \qquad H_{ij} = 1/(i+j+1),
+\]
+which is convex, since $H \succ 0$.  With the bounds dropped the single
+constraint is active and no other active set has to be determined, so the KKT
+conditions form one linear system and the optimum is available in exact rational
+arithmetic.  Ipopt reported \texttt{optimal} in every row below.
+
+\begin{center}
+\begin{tabular}{rlrrrr}
+\toprule
+$n$ & exact optimum & $\|x^{*}\|_{\infty}$ & $\|\vhat\|_{\infty}$
+    & Ipopt's value & value $-$ optimum \\
+\midrule
+10 & $-39/8$      & 3.50e5 & 3.50e5 & $-4.874999577980$ & $+4.2\mathrm{e}{-7}$ \\
+12 & $-1415/288$  & 8.66e6 & 8.70e6 & $-4.912905741134$ & $+2.9\mathrm{e}{-4}$ \\
+14 & $-1935/392$  & 2.09e8 & 1.82e5 & $-4.912217323377$ & $+2.4\mathrm{e}{-2}$ \\
+16 & $-2535/512$  & 5.56e9 & 1.93e5 & $-4.924764205425$ & $+2.6\mathrm{e}{-2}$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Every entry in the last column is positive: each reported value lies above the
+optimum, so none of them is an outer bound.  Two mechanisms are at work.  At
+$n=10$ the optimizer is not at fault --- $\vhat$ is within a rounding of
+$x^{*}$, and $f(\vhat)$ in exact arithmetic is $-4.875000044826$, \emph{below}
+the optimum, because $\vhat$ carries a little constraint violation.  The
+$+4.2\mathrm{e}{-7}$ enters when $f$ is evaluated in double precision at
+$\|x\| \sim 3.5\mathrm{e}5$, where individual terms reach $4.35\mathrm{e}9$ and
+cancel down to $4.875$; this is Remark~\ref{rem:rounding}, not a convergence
+failure, and tightening \texttt{tol} does not reach it.  At $n = 14$ and
+$n = 16$ the solve stops three to four orders of magnitude short of $x^{*}$ and
+reports
+success anyway, the termination test being applied to the scaled KKT residual;
+there the overshoot is an optimality error, and $2.6\mathrm{e}{-2}$ on a
+quantity of size $5$ is wrong in the third significant digit.  Both arrive
+labelled \texttt{optimal}, and nothing else in the solver's output distinguishes
+them from a well-behaved solve.  On a well-scaled model with modest variable
+magnitudes the returned value usually is close enough to pass unnoticed; the
+claim is not that it is always wrong, but that nothing reported says when.
+\end{remark}
+
 \section{Weak duality}
 
 \begin{lemma}[Weak duality]\label{lem:weak}
