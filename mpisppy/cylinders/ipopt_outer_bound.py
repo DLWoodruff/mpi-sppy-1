@@ -94,7 +94,7 @@ class IpoptOuterBound(LagrangianOuterBound):
     def _attach_dual_suffixes(self):
         """Give every subproblem a dual Suffix that actually imports.
 
-        Its own method so it can be tested without standing up a wheel; the
+        Its own method so it can be tested without standing up a full run; the
         guard below it is the kind that only fails on someone else's model.
         """
         problem = None
@@ -213,7 +213,7 @@ class IpoptOuterBound(LagrangianOuterBound):
                 # arithmetic release by release, and every one missed aborts
                 # the hub and every other cylinder from a call this spoke makes
                 # only to tighten a box and print a diagnostic. The property is
-                # that NOTHING raised here is worth the wheel, so catch on
+                # that NOTHING raised here is worth ending the run, so catch on
                 # that and not on a list.
                 #
                 # The cost is that a genuine bug in our own code is swallowed
@@ -329,7 +329,7 @@ class IpoptOuterBound(LagrangianOuterBound):
         problem leaves the others in the next allreduce with no partner, and
         the run hangs rather than reporting the model error that caused it.
         Today it dies instead of hanging, but only because WheelSpinner.run
-        wraps the wheel in MPI_Abort (#852); driven any other way, or with that
+        wraps the run in MPI_Abort (#852); driven any other way, or with that
         wrapper bypassed, it is a hang with no traceback.
 
         `local_problem` is the message for THIS rank's problem, or None. The
@@ -510,7 +510,7 @@ class IpoptOuterBound(LagrangianOuterBound):
                 # cylinder from inside the iteration loop, every iteration.
                 #
                 # The property is the one already stated below: no certificate
-                # this iteration is not worth the wheel. The exception class is
+                # this iteration is not worth ending the run. The exception class is
                 # reported so a genuine bug in our own code is still legible.
                 failures_by_class.setdefault(
                     type(e).__name__, []).append(f"{sname} ({e})")
@@ -621,7 +621,7 @@ class IpoptOuterBound(LagrangianOuterBound):
         for tag in all_tags:
             here = no_bound_by_cause.get(tag, [])
             # .get, not [tag]: a return-None site recording a NEW tag would
-            # otherwise KeyError inside lagrangian() and abort the wheel every
+            # otherwise KeyError inside lagrangian() and abort the run every
             # iteration -- worse than the wrong-advice symptom the
             # "unclassified" entry was added to prevent, and the harder half of
             # the same gap. That entry reads correctly for any unknown tag.

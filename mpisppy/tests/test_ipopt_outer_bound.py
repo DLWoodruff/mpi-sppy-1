@@ -294,7 +294,7 @@ class _SerialComm:
 class TestSetupGuards(unittest.TestCase):
     """The guards that belong to the spoke rather than the certificate engine.
 
-    Constructed without running a wheel: the guard reads self.opt.options, so a
+    Constructed without running the cylinders: the guard reads self.opt.options, so a
     lightweight stand-in exercises it without a solve.
     """
 
@@ -575,7 +575,7 @@ class TestFbbtExceptionsStandDown(unittest.TestCase):
     """fbbt raises more than the infeasibility the guard asks it about.
 
     unbounded_variables(do_fbbt=True) is called to TIGHTEN the box and to build
-    a diagnostic. Nothing it raises is worth aborting the wheel, and an
+    a diagnostic. Nothing it raises is worth aborting the run, and an
     exception escaping lagrangian_prep does exactly that.
     """
 
@@ -878,7 +878,7 @@ class TestCollectiveWarning(unittest.TestCase):
 
 class TestCertificateFailureStandsDown(unittest.TestCase):
     """Evaluating phi at the returned point can raise things that are not
-    CertificateError, and none of them is worth aborting the wheel."""
+    CertificateError, and none of them is worth aborting the run."""
 
     def _spoke_over(self, scenario):
         from mpisppy.cylinders.ipopt_outer_bound import IpoptOuterBound
@@ -1145,7 +1145,7 @@ class TestCertificateFailureStandsDown(unittest.TestCase):
         self.assertFalse(any("finite bound is the fix" in m for m in messages),
                          messages)
 
-    def test_a_failed_solution_load_does_not_take_down_the_wheel(self):
+    def test_a_failed_solution_load_does_not_take_down_the_run(self):
         """need_solution=False, so spopt hands the load failure back.
 
         With True it re-raises from inside the iteration loop, which
@@ -1353,9 +1353,9 @@ class TestCertificateFailureStandsDown(unittest.TestCase):
             any("unbounded below" in m for m in messages),
             f"the earlier unbounded component won the race: {messages}")
 
-    def test_an_unknown_tag_does_not_abort_the_wheel(self):
+    def test_an_unknown_tag_does_not_abort_the_run(self):
         """A new return-None site recording a NEW tag used to KeyError inside
-        lagrangian(), aborting the wheel every iteration."""
+        lagrangian(), aborting the run every iteration."""
         from unittest import mock
         scenario = self._scenario_with_a_bound_and_a_missing_dual()
         spoke = self._spoke_over(scenario)

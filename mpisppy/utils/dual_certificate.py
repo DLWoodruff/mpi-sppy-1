@@ -113,7 +113,7 @@ def _active_objective(model):
 
     The finder raises RuntimeError for a missing or ambiguous objective; every
     other failure here is a CertificateError, and the spoke stands down on that
-    rather than aborting the wheel.
+    rather than aborting the run.
     """
     try:
         return _find_active_objective(model)
