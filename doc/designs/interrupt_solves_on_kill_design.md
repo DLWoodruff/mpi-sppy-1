@@ -27,7 +27,7 @@ arrives.
 Consequence to accept: a bound the spoke would have delivered by finishing
 its solve during the shutdown wait is not delivered.
 
-## 1. What aph-fw does (commit b19eabb, PR #79)
+## 1. What aph-fw does
 
 - The controller thread does all MPI and decides termination. It sets a
   per-scenario `std::atomic<bool>` abort flag and then, from the controller
@@ -44,7 +44,7 @@ its solve during the shutdown wait is not delivered.
 - The abort flag is reset when a task is dispatched, so the final
   Lagrangian solves at shutdown run normally.
 - `--abort-inflight-solves` (default on) turns it off.
-- The commit reports shutdown on sslp_10_50_500_b10_50 (np=4, 15 s wall
+- aph-fw reports shutdown on sslp_10_50_500_b10_50 (np=4, 15 s wall
   limit) dropping from about 10 s to 4.4 s with the same final bound.
 
 ## 2. Approaches measured
@@ -70,17 +70,25 @@ overhead. Median of 3.
 | none | 10.06 s | 6.30 s |
 | no-op Python function | ×1.06 | ×1.06 |
 | `time.monotonic()` rate-limit check (kill check minus the RMA read) | ×1.08 | ×1.09 |
-| what `TimedMIPGapCB` does today (3 `cbGet` at MIP) | ×1.09 | ×1.11 |
 
 Spare cores do not help (Threads=4 ran on a 16-core machine): the solver
 waits for each Python callback to return, and they are serialized on one
-thread. markshare2 has very cheap nodes and so a lot of callbacks per second
-(about 745,000 in 5 s); models with more expensive nodes may pay less, which
-has not been measured. This cost is paid by every spoke solve for the whole
-run to shorten one shutdown, so the approach is rejected.
+thread.
 
-Other findings from this approach, kept because they matter for
-`TimedMIPGapCB`:
+The cost scales with callbacks per second, not with solve length.
+markshare2 has very cheap nodes (about 50,000 nodes/s) and makes about
+150,000 callbacks/s. The sslp EFs in `examples/sslp/data` (each solves to
+optimality in about 1 s) make 1,400–5,100 callbacks/s, mostly POLLING. With
+an installed callback they measured ×1.005–×1.024, about the same as the
+spread between repeated runs without one (up to ×1.011). A single
+sslp_15_45_15 scenario (a root-node solve of about 15 ms) measured
+×1.03–×1.05.
+
+A kill check would be installed on every spoke solve for the whole run to
+shorten one shutdown. Small, hard models with cheap nodes would pay the full
+markshare2 rate, so the approach is rejected.
+
+Other findings from this approach:
 
 - Callback threads (4 solver threads). Gurobi: every `where`, MIP and LP
   (simplex, barrier, concurrent), on the main thread only. CPLEX:
@@ -252,9 +260,9 @@ if interrupter.fired_during_solve and was_interrupted(s._solver_plugin):
 
 - Both conditions are needed. `fired_during_solve` alone is wrong when the
   `terminate()` landed after the solve finished; the solve reports OPTIMAL
-  and keeps its result. The solver status alone is wrong when something
-  else interrupted the solve (`TimedMIPGapCB`), because that result is
-  wanted.
+  and keeps its result. The solver status alone is wrong when a termination
+  callback (`utils/callbacks/termination`) interrupted the solve, because
+  that result is wanted.
 - Use Gurobi's status, not the Pyomo termination condition. Pyomo maps
   `INTERRUPTED` to `TerminationCondition.error`; only
   `set_gurobi_callback`'s `_postsolve` wrapper rewrites it to
@@ -295,7 +303,6 @@ Default on or off is open (§7).
 - Agnostic guests: their solve runs through the guest's own code, which may
   make MPI calls, so the MPI rule in §3.2 does not hold.
 - `appsi_gurobi` and the `pyomo.contrib.solver` Gurobi interface.
-- The cost of `TimedMIPGapCB`'s callback (§2.1). Separate design.
 
 ## 6. Testing
 
