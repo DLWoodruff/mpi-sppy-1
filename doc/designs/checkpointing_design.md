@@ -1310,6 +1310,27 @@ as a branch stacked on the 1a PR.
   keeps the cylinder an ordinary PH object with solvers created and prox terms
   spliced.
 
+  What the restore checks before the cylinder publishes anything. The file's
+  metadata answers "does this describe this model?" — format version,
+  structural fingerprint, this rank's scenario names, a weight for every
+  nonant, and (across ranks) one iteration for all of them. None of that looks
+  at the numbers, and the numbers become another cylinder's bound:
+  `LagrangianOuterBound` receives these weights as `Field.DUALS` and turns them
+  into an outer bound the hub keeps as best-so-far. That bound is only a bound
+  when `sum_s p_s W_s = 0`, which is the same normalization the DUALS transport
+  already relies on within an iteration (`_STRICT_COHERENCE_FIELDS` in
+  `spcommunicator.py`). So the restore ends by computing E[W] over the
+  cylinder's comms (`phbase.Wbar_by_node`) and refusing a file whose weights
+  are not a dual point, to `E1_tolerance` — the check `wxbarutils.set_W_from_file`
+  has always made of the other way of putting weights on a model from a file,
+  `--init-W-fname`. Measured on farmer: a clean checkpoint's largest E[W] entry
+  is 8e-14, and adding 1.0 to one scenario's weights is refused by name.
+  The invariant rests on rho being the same in every scenario for a given
+  nonant, which is what `Update_W` assumes against a probability-weighted
+  xbar; should scenario-dependent rho ever be introduced, something will have
+  to re-establish E[W] = 0 before the weights are published, and this refusal
+  is where that would first be seen.
+
   Three things this deliberately does not do. It does not dill the cylinder's
   models: rho comes back from the rho setter, xbar from the values, the prox
   terms from `PH_Prep`, and carrying them would be carrying a copy of a

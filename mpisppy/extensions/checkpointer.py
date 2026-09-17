@@ -346,6 +346,12 @@ class Checkpointer(Extension):
             lambda: ckpt.restore_dual_spoke_state(self.opt, state),
             "put their checkpointed dual weights back on their models, so "
             "none of them restores any")
+        # What every check up to here asks is whether the file describes this
+        # model. This asks whether what it holds is a dual point at all: the
+        # weights this cylinder is about to publish become another cylinder's
+        # Lagrangian bound, which is only a bound when they sum to zero.
+        ckpt.require_restored_duals_sum_to_zero(self.opt, cylinder,
+                                                state["generation"])
         self.restored_dual_generation = state["generation"]
         global_toc(f"Restored the checkpointed dual weights for {cylinder} "
                    f"(written at its iteration {state['generation']})", rank0)

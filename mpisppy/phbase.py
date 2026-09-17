@@ -123,16 +123,26 @@ def _Compute_Xbar(opt, verbose=False):
                            opt.cylinder_rank, k, ndn, node.nonant_vardata_list[i].name,
                            pyo.value(s._mpisppy_model.xbars[(ndn,i)]))
 
-def _Compute_Wbar(opt, verbose=False, repair=True):
-    """ Seldom used (mainly for diagnostics); gather  Wbar for each node.
+def Wbar_by_node(opt):
+    """E[W] per tree node: the probability-weighted sum of W over scenarios.
+
+    PH keeps this at zero -- sum_s p_s W_s = 0 is the dual feasibility a
+    Lagrangian bound built from W relies on -- so every entry of what comes
+    back should be zero to within opt.E1_tolerance. It is what makes W a
+    point in the orthogonal complement of the nonanticipativity subspace.
+
+    Collective: the scenarios of a node are spread over the ranks, so the sum
+    is an Allreduce over that node's comm and every rank gets the same
+    answer. Returns {node name: numpy array over the node's nonants}.
+
+    NOTE: the invariant holds because Update_W adds rho * (x_s - xbar) with
+    the same rho in every scenario and an xbar that is the probability
+    weighted mean. A scenario-dependent rho would not preserve it, and would
+    need something else to restore E[W] = 0 before the weights are used as
+    duals.
 
     Args:
         opt (phbase or xhat_eval object): object with the local scenarios
-        verbose (boolean):
-            If True, prints verbose output.
-        repair (boolean):
-            If True, normalize the W values so EW = 0
-
     """
     nodenames = [] # to transmit to comms
     local_concats = {}   # keys are tree node names
@@ -171,6 +181,22 @@ def _Compute_Wbar(opt, verbose=False, repair=True):
             [local_concats[nodename], MPI.DOUBLE],
             [global_concats[nodename], MPI.DOUBLE],
             op=MPI.SUM)
+
+    return global_concats
+
+
+def _Compute_Wbar(opt, verbose=False, repair=True):
+    """ Seldom used (mainly for diagnostics); gather  Wbar for each node.
+
+    Args:
+        opt (phbase or xhat_eval object): object with the local scenarios
+        verbose (boolean):
+            If True, prints verbose output.
+        repair (boolean):
+            If True, normalize the W values so EW = 0
+
+    """
+    global_concats = Wbar_by_node(opt)
 
     # check the Wbar
     for k,s in opt.local_scenarios.items():

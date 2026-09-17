@@ -1565,3 +1565,60 @@ def restore_dual_spoke_state(opt, state):
             model.W[ndn_i]._value = saved_w[ndn_i]
             if var.name in by_name:
                 var._value = by_name[var.name]
+
+
+def require_restored_duals_sum_to_zero(opt, cylinder, generation):
+    """Refuse restored dual weights that are not a dual-feasible point.
+
+    PH keeps ``sum_s p_s W_s = 0``: the weights live in the orthogonal
+    complement of the nonanticipativity subspace, and that is exactly the
+    property a Lagrangian bound computed from them relies on -- with weights
+    that do not sum to zero, the "bound" is not one. A bad bound is worse
+    than a missing one here, because the hub keeps the best it has ever been
+    told and never revisits it.
+
+    The rest of this cylinder's restore checks that the file describes this
+    model: its format, its fingerprint, this rank's scenario names, that
+    every nonant has a weight, and that every rank restored the same
+    iteration. None of that looks at the numbers. This does, and it is the
+    same check ``wxbarutils.set_W_from_file`` has always made of the other
+    way of putting weights on a model from a file (``--init-W-fname``).
+
+    Collective: the sum spans the scenarios of a tree node and so the ranks
+    of the cylinder (see ``phbase.Wbar_by_node``). Every rank computes the
+    same sums and therefore makes the same refusal.
+    """
+    # Here rather than at module scope: phbase imports this module.
+    from mpisppy.phbase import Wbar_by_node
+
+    worst, worst_name = 0.0, None
+    for ndn, Wbars in Wbar_by_node(opt).items():
+        for i, Wbar in enumerate(Wbars):
+            if abs(Wbar) > abs(worst):
+                worst = float(Wbar)
+                worst_name = _nonant_name(opt, ndn, i)
+
+    if abs(worst) > opt.E1_tolerance:
+        raise CheckpointMismatch(
+            f"The dual weights restored for {cylinder} from the checkpoint "
+            f"it wrote at its iteration {generation} do not sum to zero over "
+            f"the scenarios: the largest probability-weighted sum is "
+            f"{worst:.6e} at '{worst_name}', against a tolerance of "
+            f"{opt.E1_tolerance:.1e}. PH maintains sum_s p_s W_s = 0, so "
+            f"these are not the weights of a run of this model -- the file "
+            f"has been changed or truncated, or the scenario probabilities "
+            f"have. A Lagrangian bound computed from them would not be a "
+            f"bound, and the hub keeps the best bound it is ever told, so "
+            f"this refuses rather than resumes. Remove the file to start "
+            f"this cylinder from W = 0, or resume from a checkpoint this "
+            f"model wrote."
+        )
+
+
+def _nonant_name(opt, ndn, i):
+    """The name of nonant ``i`` of node ``ndn``, for an error message."""
+    for s in opt.local_scenarios.values():
+        for node in s._mpisppy_node_list:
+            if node.name == ndn and i < len(node.nonant_vardata_list):
+                return node.nonant_vardata_list[i].name
+    return f"{ndn}[{i}]"

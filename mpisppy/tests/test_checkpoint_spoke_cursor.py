@@ -26,13 +26,21 @@ because they are what the design leans on:
 * **A cursor move costs a subproblem solve.** So writing the small spoke file
   whenever the cursor moves is negligible against what caused the move, while
   a pass that solves nothing writes nothing.
+
+This branch also gives the dual cylinders back their own W, and the serial
+half of that lives here too: what a restored set of weights has to satisfy
+before this cylinder publishes it. The half that needs several ranks -- every
+rank restoring the same iteration -- is in ``test_checkpoint_multirank.py``.
 """
 
 import os
 import tempfile
 import unittest
 
+import mpisppy.utils.checkpointing as checkpointing
+import mpisppy.tests.examples.farmer as farmer
 from mpisppy.cylinders.xhatshufflelooper_bounder import ScenarioCycler
+from mpisppy.opt.ph import PH
 from mpisppy.tests.utils import get_solver
 
 solver_available, solver_name, persistent_available, persistent_solver_name = \
@@ -294,6 +302,86 @@ class TestSpokeWritesWhenTheCursorMoves(unittest.TestCase):
         ext.maybe_checkpoint()
         with open(self._spoke_file(), "rb") as f:
             self.assertIsNone(pickle.load(f)["loop_state"])
+
+
+class TestRestoredDualsMustSumToZero(unittest.TestCase):
+    """A dual cylinder's restored W has to be a dual point.
+
+    Every other check on that file asks whether it describes this model --
+    its fingerprint, this rank's scenario names, a weight for every nonant.
+    None of them looks at the numbers, and the numbers are what another
+    cylinder turns into a Lagrangian bound: with weights that do not satisfy
+    sum_s p_s W_s = 0 that bound is not a bound, and the hub keeps the best
+    bound it is ever told.
+
+    No solver and no mpiexec: PH_Prep attaches W, and setting it by hand is
+    exactly the state a restore leaves behind.
+    """
+
+    CYLINDER = "RelaxedPHSpoke"
+
+    def _prepped_ph(self):
+        """A PH whose models carry W, with no solve having happened."""
+        opt = PH(
+            {"solver_name": solver_name or "unused", "PHIterLimit": 1,
+             "defaultPHrho": 1.0, "convthresh": 1e-4, "verbose": False,
+             "display_progress": False, "display_timing": False,
+             "iter0_solver_options": None, "iterk_solver_options": None,
+             "tee-rank0-solves": False, "smoothed": 0},
+            ["scen0", "scen1", "scen2"],
+            farmer.scenario_creator, farmer.scenario_denouement,
+            scenario_creator_kwargs={"use_integer": False,
+                                     "crops_multiplier": 1},
+        )
+        opt.PH_Prep(attach_prox=False)
+        return opt
+
+    def _set_W(self, opt, per_scenario):
+        for sname, s in opt.local_scenarios.items():
+            for ndn_i in s._mpisppy_data.nonant_indices:
+                s._mpisppy_model.W[ndn_i]._value = per_scenario[sname]
+
+    def test_weights_that_sum_to_zero_are_accepted(self):
+        """Equal probabilities, so these three average to zero."""
+        opt = self._prepped_ph()
+        self._set_W(opt, {"scen0": 10.0, "scen1": -4.0, "scen2": -6.0})
+        checkpointing.require_restored_duals_sum_to_zero(
+            opt, self.CYLINDER, 7)
+
+    def test_all_zero_weights_are_accepted(self):
+        """What a cylinder that found no file starts from."""
+        opt = self._prepped_ph()
+        self._set_W(opt, {"scen0": 0.0, "scen1": 0.0, "scen2": 0.0})
+        checkpointing.require_restored_duals_sum_to_zero(
+            opt, self.CYLINDER, 0)
+
+    def test_weights_that_do_not_sum_to_zero_are_refused(self):
+        """The same number in every scenario is the clearest violation.
+
+        The message has to name the cylinder, the iteration the file was
+        written at and a variable, because what it is reporting is a file on
+        disk rather than anything in the run that reads it.
+        """
+        opt = self._prepped_ph()
+        self._set_W(opt, {"scen0": 10.0, "scen1": -4.0, "scen2": -5.0})
+        with self.assertRaises(checkpointing.CheckpointMismatch) as ctx:
+            checkpointing.require_restored_duals_sum_to_zero(
+                opt, self.CYLINDER, 7)
+        message = str(ctx.exception)
+        self.assertIn("do not sum to zero", message)
+        self.assertIn(self.CYLINDER, message)
+        self.assertIn("iteration 7", message)
+        self.assertIn("DevotedAcreage", message)
+
+    def test_a_violation_within_tolerance_is_accepted(self):
+        """E1_tolerance, not exact arithmetic: the weights come back through
+        a float round trip and the sums are accumulated."""
+        opt = self._prepped_ph()
+        slack = opt.E1_tolerance / 2
+        self._set_W(opt, {"scen0": 10.0, "scen1": -5.0,
+                          "scen2": -5.0 + 3 * slack})
+        checkpointing.require_restored_duals_sum_to_zero(
+            opt, self.CYLINDER, 7)
 
 
 if __name__ == "__main__":

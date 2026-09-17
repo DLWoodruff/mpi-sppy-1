@@ -1316,6 +1316,7 @@ class TestEveryCheckpointStepOnThosePathsIsAgreed(unittest.TestCase):
         "probe_model_is_dillable",
         "agree_spoke_restore",
         "agree_dual_spoke_restore",
+        "require_restored_duals_sum_to_zero",
     })
 
     #: And calls that need no agreement because there is nothing in them for
