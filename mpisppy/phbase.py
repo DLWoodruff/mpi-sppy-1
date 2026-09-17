@@ -1282,6 +1282,14 @@ class PHBase(mpisppy.spopt.SPOpt):
                 f"--resume-from, or run PH."
             )
 
+        # Also the read-side counterpart of the Checkpointer's backend
+        # refusal, for a resume that runs without one attached: without it,
+        # `--resume-from ckpt --checkpoint-backend leaf` would go ahead on the
+        # manifest's backend and ignore the one it was asked for.
+        checkpointing.require_implemented_backend(
+            self.options.get("checkpoint_backend",
+                             checkpointing.DILL_RELOAD_BACKEND))
+
         # The splice below is this rank's own work from end to end: it reads
         # the file named after this rank and checks it against the scenarios
         # this rank owns, so it refuses on the ranks the checkpoint does not

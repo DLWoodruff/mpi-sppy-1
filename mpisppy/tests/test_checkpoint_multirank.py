@@ -860,16 +860,22 @@ class TestEveryCheckpointStepOnThosePathsIsAgreed(unittest.TestCase):
     #: an agreement, which is the whole subject of this class.
     RANK_INDEPENDENT_RAISES = {
         "Checkpointer.__init__": (
-            4, "the options and the cylinder's class: an --checkpoint-every "
-               "below 1, neither writing nor resuming, a backend it does not "
-               "know, and spoke mode on something that is not an Xhat_Eval. "
-               "Every rank of the wheel is given the same command line."),
+            3, "the options and the cylinder's class: an --checkpoint-every "
+               "below 1, neither writing nor resuming, and spoke mode on "
+               "something that is not an Xhat_Eval. Every rank of the wheel "
+               "is given the same command line. The backend refusal is the "
+               "fourth of these and now lives in "
+               "require_implemented_backend, below."),
         "Checkpointer._spoke_identity": (
             1, "the cylinder has no spcomm, which is a property of how the "
                "wheel was built rather than of anything this rank read."),
         "PHBase._restore_from_checkpoint_if_resuming": (
             1, "this hub is not a PH, which is the same object on every rank "
                "of the cylinder."),
+        "require_implemented_backend": (
+            1, "--checkpoint-backend names a backend that is designed but "
+               "not built. The value comes from the command line the wheel "
+               "hands every rank, and nothing else is consulted."),
     }
 
     #: Checkpointing calls that agree across the cylinder themselves, so they
@@ -877,6 +883,17 @@ class TestEveryCheckpointStepOnThosePathsIsAgreed(unittest.TestCase):
     AGREE_THEMSELVES = frozenset({
         "run_agreed",
         "probe_model_is_dillable",
+    })
+
+    #: Checkpointing calls that reach the same answer on every rank without
+    #: talking to any other rank, because the only thing they consult is the
+    #: command line the wheel hands all of them. These may be called from a
+    #: path directly for the reason the refusals in RANK_INDEPENDENT_RAISES
+    #: may be written there: they arrive on every rank or on none. A call
+    #: that reads a file, a model, or anything else only this rank can see
+    #: does not belong here, however cheap it looks.
+    RANK_INDEPENDENT_STEPS = frozenset({
+        "require_implemented_backend",
     })
 
     #: Modules whose callables do this rank's own work: they touch the file
@@ -1056,7 +1073,9 @@ class TestEveryCheckpointStepOnThosePathsIsAgreed(unittest.TestCase):
         for name, entry in self.PATHS:
             for qualname, func, tree, agreed, ns in self._closure(entry):
                 for node, called in self._checkpointing_calls(func, tree, ns):
-                    if called in self.AGREE_THEMSELVES or id(node) in agreed:
+                    if (called in self.AGREE_THEMSELVES
+                            or called in self.RANK_INDEPENDENT_STEPS
+                            or id(node) in agreed):
                         continue
                     with self.subTest(path=name, function=qualname,
                                       step=called):
@@ -1064,9 +1083,12 @@ class TestEveryCheckpointStepOnThosePathsIsAgreed(unittest.TestCase):
                             f"{qualname}, reached from {name}, calls "
                             f"checkpointing.{called} outside run_agreed. If "
                             f"it agrees across the ranks itself, say so by "
-                            f"naming it in AGREE_THEMSELVES; otherwise the "
-                            f"rank it fails on leaves the rest of the "
-                            f"cylinder waiting in the next collective.")
+                            f"naming it in AGREE_THEMSELVES; if it consults "
+                            f"nothing but the command line every rank was "
+                            f"given, name it in RANK_INDEPENDENT_STEPS; "
+                            f"otherwise the rank it fails on leaves the rest "
+                            f"of the cylinder waiting in the next "
+                            f"collective.")
 
     def test_no_path_does_a_rank_s_own_file_handling_inline(self):
         for name, entry in self.PATHS:
