@@ -837,6 +837,8 @@ class TestEveryCheckpointStepOnThosePathsIsAgreed(unittest.TestCase):
         ("Checkpointer._restore_incumbent", Checkpointer._restore_incumbent),
         ("PHBase._restore_from_checkpoint_if_resuming",
          PHBase._restore_from_checkpoint_if_resuming),
+        ("PHBase._restore_extension_state_if_resuming",
+         PHBase._restore_extension_state_if_resuming),
     )
 
     #: Every agreement reached from those paths, by the function it is
@@ -851,6 +853,8 @@ class TestEveryCheckpointStepOnThosePathsIsAgreed(unittest.TestCase):
         "Checkpointer._restore_incumbent": ("load_spoke_incumbent",
                                             "restore_spoke_incumbent"),
         "PHBase._restore_from_checkpoint_if_resuming": ("load_checkpoint",),
+        "PHBase._restore_extension_state_if_resuming":
+            ("restore_extension_state",),
     }
 
     #: The raises reached from these paths that every rank of a cylinder
@@ -885,14 +889,13 @@ class TestEveryCheckpointStepOnThosePathsIsAgreed(unittest.TestCase):
         "probe_model_is_dillable",
     })
 
-    #: Checkpointing calls that reach the same answer on every rank without
-    #: talking to any other rank, because the only thing they consult is the
-    #: command line the wheel hands all of them. These may be called from a
-    #: path directly for the reason the refusals in RANK_INDEPENDENT_RAISES
-    #: may be written there: they arrive on every rank or on none. A call
-    #: that reads a file, a model, or anything else only this rank can see
-    #: does not belong here, however cheap it looks.
-    RANK_INDEPENDENT_STEPS = frozenset({
+    #: And calls that need no agreement because there is nothing in them for
+    #: one rank to fail at: they read what is already in memory -- the
+    #: command line every rank was given, say -- and return an answer, so
+    #: they arrive at the same one on every rank or raise on all of them.
+    #: Nothing that touches a file or a model belongs here.
+    CANNOT_FAIL_ON_ONE_RANK = frozenset({
+        "converger_state_is_carried",
         "require_implemented_backend",
     })
 
@@ -904,7 +907,7 @@ class TestEveryCheckpointStepOnThosePathsIsAgreed(unittest.TestCase):
     #: jobs before it was found.
     LOCAL_WORK_MODULES = frozenset({
         "os", "posix", "nt", "shutil", "pickle", "dill", "json", "io",
-        "_io", "pathlib", "tempfile", "glob",
+        "_io", "pathlib", "tempfile", "glob"
     })
 
     #: And the same idea reached through an object, where there is no module
@@ -1074,7 +1077,7 @@ class TestEveryCheckpointStepOnThosePathsIsAgreed(unittest.TestCase):
             for qualname, func, tree, agreed, ns in self._closure(entry):
                 for node, called in self._checkpointing_calls(func, tree, ns):
                     if (called in self.AGREE_THEMSELVES
-                            or called in self.RANK_INDEPENDENT_STEPS
+                            or called in self.CANNOT_FAIL_ON_ONE_RANK
                             or id(node) in agreed):
                         continue
                     with self.subTest(path=name, function=qualname,
@@ -1082,13 +1085,12 @@ class TestEveryCheckpointStepOnThosePathsIsAgreed(unittest.TestCase):
                         self.fail(
                             f"{qualname}, reached from {name}, calls "
                             f"checkpointing.{called} outside run_agreed. If "
-                            f"it agrees across the ranks itself, say so by "
-                            f"naming it in AGREE_THEMSELVES; if it consults "
-                            f"nothing but the command line every rank was "
-                            f"given, name it in RANK_INDEPENDENT_STEPS; "
-                            f"otherwise the rank it fails on leaves the rest "
-                            f"of the cylinder waiting in the next "
-                            f"collective.")
+                            f"it agrees across the ranks itself, or reads "
+                            f"nothing a single rank can fail at, say so by "
+                            f"naming it in AGREE_THEMSELVES or "
+                            f"CANNOT_FAIL_ON_ONE_RANK; otherwise the rank it "
+                            f"fails on leaves the rest of the cylinder "
+                            f"waiting in the next collective.")
 
     def test_no_path_does_a_rank_s_own_file_handling_inline(self):
         for name, entry in self.PATHS:
