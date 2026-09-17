@@ -1567,6 +1567,18 @@ def restore_dual_spoke_state(opt, state):
                 var._value = by_name[var.name]
 
 
+#: How far E[W] may stray from zero, as a fraction of the size of the weights
+#: being summed (E[|W|]). PH's dual feasibility is exact in arithmetic and
+#: approximate in floating point: accumulating sums of numbers of size M
+#: strays by a small multiple of machine epsilon times M, which is around
+#: 1e-16 relative and grows slowly with the number of scenarios and
+#: iterations behind the weights. A million times that leaves the drift of
+#: even a very long run far inside, while a file that is stale, truncated or
+#: from another model is off by a visible fraction of its own weights --
+#: measured at 1.7e-3 of them for a one-scenario perturbation on farmer.
+DUAL_FEASIBILITY_RTOL = 1e-6
+
+
 def require_restored_duals_sum_to_zero(opt, cylinder, generation):
     """Refuse restored dual weights that are not a dual-feasible point.
 
@@ -1587,31 +1599,49 @@ def require_restored_duals_sum_to_zero(opt, cylinder, generation):
     Collective: the sum spans the scenarios of a tree node and so the ranks
     of the cylinder (see ``phbase.Wbar_by_node``). Every rank computes the
     same sums and therefore makes the same refusal.
+
+    The tolerance is deliberately generous -- ``E1_tolerance`` plus
+    ``DUAL_FEASIBILITY_RTOL`` of the size of the weights being summed. This
+    exists to catch a file that does not hold this study's duals, not to
+    audit anyone's arithmetic, and a resume wrongly refused is worse than the
+    drift it would be refused for.
     """
     # Here rather than at module scope: phbase imports this module.
-    from mpisppy.phbase import Wbar_by_node
+    from mpisppy.phbase import Wbar_by_node, W_magnitude_by_node
 
-    worst, worst_name = 0.0, None
-    for ndn, Wbars in Wbar_by_node(opt).items():
+    # Judged against the size of the weights, not against zero: what counts
+    # as dust in a sum depends on what was summed, and weights an order of
+    # magnitude apart are ordinary across models. A fixed absolute threshold
+    # would refuse a long run on a large-cost model for its own rounding.
+    bars = Wbar_by_node(opt)
+    sizes = W_magnitude_by_node(opt)
+
+    worst = None
+    for ndn, Wbars in bars.items():
         for i, Wbar in enumerate(Wbars):
-            if abs(Wbar) > abs(worst):
-                worst = float(Wbar)
-                worst_name = _nonant_name(opt, ndn, i)
+            size = float(sizes[ndn][i])
+            tolerance = opt.E1_tolerance + DUAL_FEASIBILITY_RTOL * size
+            excess = abs(float(Wbar)) / tolerance
+            if worst is None or excess > worst[0]:
+                worst = (excess, float(Wbar), size, tolerance, ndn, i)
 
-    if abs(worst) > opt.E1_tolerance:
+    if worst is not None and worst[0] > 1.0:
+        _, Wbar, size, tolerance, ndn, i = worst
         raise CheckpointMismatch(
             f"The dual weights restored for {cylinder} from the checkpoint "
             f"it wrote at its iteration {generation} do not sum to zero over "
-            f"the scenarios: the largest probability-weighted sum is "
-            f"{worst:.6e} at '{worst_name}', against a tolerance of "
-            f"{opt.E1_tolerance:.1e}. PH maintains sum_s p_s W_s = 0, so "
-            f"these are not the weights of a run of this model -- the file "
-            f"has been changed or truncated, or the scenario probabilities "
-            f"have. A Lagrangian bound computed from them would not be a "
-            f"bound, and the hub keeps the best bound it is ever told, so "
-            f"this refuses rather than resumes. Remove the file to start "
-            f"this cylinder from W = 0, or resume from a checkpoint this "
-            f"model wrote."
+            f"the scenarios: at '{_nonant_name(opt, ndn, i)}' the "
+            f"probability-weighted sum is {Wbar:.6e}, against a tolerance of "
+            f"{tolerance:.3e} -- E1_tolerance ({opt.E1_tolerance:.1e}) plus "
+            f"{DUAL_FEASIBILITY_RTOL:.0e} of the size of the weights summed "
+            f"there ({size:.6e}). PH maintains sum_s p_s W_s = 0, so these "
+            f"are not the weights of a run of this model -- the file has "
+            f"been changed or truncated, or the scenario probabilities have. "
+            f"A Lagrangian bound computed from them would not be a bound, "
+            f"and the hub keeps the best bound it is ever told, so this "
+            f"refuses rather than resumes. Remove the file to start this "
+            f"cylinder from W = 0, or resume from a checkpoint this model "
+            f"wrote."
         )
 
 

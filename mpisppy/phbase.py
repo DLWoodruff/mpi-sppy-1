@@ -128,8 +128,10 @@ def Wbar_by_node(opt):
 
     PH keeps this at zero -- sum_s p_s W_s = 0 is the dual feasibility a
     Lagrangian bound built from W relies on -- so every entry of what comes
-    back should be zero to within opt.E1_tolerance. It is what makes W a
-    point in the orthogonal complement of the nonanticipativity subspace.
+    back should be zero up to the drift of accumulating it in floating point,
+    which is a fraction of the size of the weights themselves (see
+    W_magnitude_by_node). It is what makes W a point in the orthogonal
+    complement of the nonanticipativity subspace.
 
     Collective: the scenarios of a node are spread over the ranks, so the sum
     is an Allreduce over that node's comm and every rank gets the same
@@ -144,6 +146,25 @@ def Wbar_by_node(opt):
     Args:
         opt (phbase or xhat_eval object): object with the local scenarios
     """
+    return _prob_weighted_W_by_node(opt, magnitude=False)
+
+
+def W_magnitude_by_node(opt):
+    """E[|W|] per tree node: how big the numbers behind E[W] are.
+
+    The companion to Wbar_by_node, for judging one of its entries. Whether a
+    given E[W] is "zero" is a question about the size of the terms that were
+    summed to get it: a sum of 1e-6 is float dust beside weights of 1e6 and a
+    real violation beside weights of 1e-3. Same collective shape.
+
+    Args:
+        opt (phbase or xhat_eval object): object with the local scenarios
+    """
+    return _prob_weighted_W_by_node(opt, magnitude=True)
+
+
+def _prob_weighted_W_by_node(opt, magnitude):
+    """Sum_s p_s W_s per node, or sum_s p_s |W_s| when magnitude is True."""
     nodenames = [] # to transmit to comms
     local_concats = {}   # keys are tree node names
     global_concats =  {} # values are concat of xbar and xsqbar
@@ -173,6 +194,8 @@ def Wbar_by_node(opt):
             Wnonants_array = np.fromiter((pyo.value(s._mpisppy_model.W[idx]) for idx in s._mpisppy_data.nonant_indices if idx[0] == ndn),
                                         dtype='d', count=nlen)
             probs = s._mpisppy_data.prob_coeff[ndn] * np.ones(nlen)
+            if magnitude:
+                Wnonants_array = np.abs(Wnonants_array)
             Wbars += probs * Wnonants_array
 
     # compute node xbar values(reduction)

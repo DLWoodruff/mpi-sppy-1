@@ -1321,10 +1321,18 @@ as a branch stacked on the 1a PR.
   already relies on within an iteration (`_STRICT_COHERENCE_FIELDS` in
   `spcommunicator.py`). So the restore ends by computing E[W] over the
   cylinder's comms (`phbase.Wbar_by_node`) and refusing a file whose weights
-  are not a dual point, to `E1_tolerance` — the check `wxbarutils.set_W_from_file`
-  has always made of the other way of putting weights on a model from a file,
-  `--init-W-fname`. Measured on farmer: a clean checkpoint's largest E[W] entry
-  is 8e-14, and adding 1.0 to one scenario's weights is refused by name.
+  are not a dual point — the check `wxbarutils.set_W_from_file` has always
+  made of the other way of putting weights on a model from a file,
+  `--init-W-fname`. The tolerance is deliberately loose, and relative rather
+  than absolute: `E1_tolerance` plus a millionth of the size of the weights
+  being summed (`phbase.W_magnitude_by_node`). Dual feasibility is exact in
+  arithmetic and approximate in floating point, and the drift is a fraction of
+  the magnitude of the weights, so a fixed absolute threshold would refuse a
+  long run on a large-cost model for its own rounding while a run on a small
+  one sailed through. A resume wrongly refused is worse than the drift it
+  would be refused for. Measured on farmer: a clean checkpoint's largest E[W]
+  entry is 8e-14 against weights of order 10, and adding 1.0 to one scenario's
+  weights — 1.7e-3 of them — is refused by name.
   The invariant rests on rho being the same in every scenario for a given
   nonant, which is what `Update_W` assumes against a probability-weighted
   xbar; should scenario-dependent rho ever be introduced, something will have

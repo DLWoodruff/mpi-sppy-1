@@ -372,16 +372,48 @@ class TestRestoredDualsMustSumToZero(unittest.TestCase):
         self.assertIn(self.CYLINDER, message)
         self.assertIn("iteration 7", message)
         self.assertIn("DevotedAcreage", message)
+        # The tolerance it was judged against, and what went into it: a
+        # reader who thinks this refusal is wrong needs both numbers.
+        self.assertIn("E1_tolerance", message)
+        self.assertIn("size of the weights", message)
 
-    def test_a_violation_within_tolerance_is_accepted(self):
-        """E1_tolerance, not exact arithmetic: the weights come back through
-        a float round trip and the sums are accumulated."""
+    def test_a_violation_within_the_absolute_floor_is_accepted(self):
+        """Not exact arithmetic: the sums are accumulated in floating point."""
         opt = self._prepped_ph()
         slack = opt.E1_tolerance / 2
         self._set_W(opt, {"scen0": 10.0, "scen1": -5.0,
                           "scen2": -5.0 + 3 * slack})
         checkpointing.require_restored_duals_sum_to_zero(
             opt, self.CYLINDER, 7)
+
+    def test_drift_that_is_tiny_beside_the_weights_is_accepted(self):
+        """The reason the tolerance is not a fixed absolute number.
+
+        Weights of 1e9 are ordinary on a large-cost model, and accumulating
+        sums of numbers that size strays by far more than E1_tolerance for
+        no reason but arithmetic. Judged against zero this run would be
+        refused a resume it has every right to; judged against the size of
+        its own weights the drift is 12 orders of magnitude inside.
+        """
+        opt = self._prepped_ph()
+        drift = 1e-3                     # 100x the absolute floor
+        self._set_W(opt, {"scen0": 1e9, "scen1": -5e8,
+                          "scen2": -5e8 + 3 * drift})
+        checkpointing.require_restored_duals_sum_to_zero(
+            opt, self.CYLINDER, 7)
+
+    def test_a_violation_that_scales_with_the_weights_is_still_refused(self):
+        """And the reason it is a fraction rather than a free pass.
+
+        The same weights as above, thrown off by a ten-thousandth of
+        themselves -- the scale a stale or edited file is wrong by.
+        """
+        opt = self._prepped_ph()
+        self._set_W(opt, {"scen0": 1e9, "scen1": -5e8, "scen2": -5e8 + 3e5})
+        with self.assertRaises(checkpointing.CheckpointMismatch) as ctx:
+            checkpointing.require_restored_duals_sum_to_zero(
+                opt, self.CYLINDER, 7)
+        self.assertIn("do not sum to zero", str(ctx.exception))
 
 
 if __name__ == "__main__":
