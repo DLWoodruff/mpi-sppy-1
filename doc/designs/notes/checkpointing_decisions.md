@@ -36,10 +36,10 @@ Measured: with `W`, `xbars`, `xsqbars` and `z` cached, a checkpoint labelled
 iteration 4 still carried iteration **5**'s rho. The pathology was not fixed,
 only relocated.
 
-**Therefore:** write only where the state is already coherent. `enditer` fires
-after the solve, so a checkpoint written there always describes a completed
-iteration, whatever extensions are loaded and whatever they touched. The
-invariant needs no knowledge of any extension, which is the whole point.
+**Therefore:** write only where the state is already coherent. The checkpoint
+hook fires after the solve, so a checkpoint written there always describes a
+completed iteration, whatever extensions are loaded and whatever they touched.
+The invariant needs no knowledge of any extension, which is the whole point.
 
 ## Checkpointing iteration 0
 
