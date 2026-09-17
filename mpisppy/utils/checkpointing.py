@@ -456,6 +456,18 @@ def run_agreed(opt, work, what):
         f"ranks of this cylinder could not {what}. {detail}"
     ) from failure
 
+def require_implemented_backend(backend):
+    """Refuse a backend that is only designed, or not known at all.
+
+    Shared by the write side (Checkpointer) and the read side (the resume
+    branch in PHBase), because a resume need not have a Checkpointer
+    attached.
+    """
+    if backend != DILL_RELOAD_BACKEND:
+        raise RuntimeError(
+            f"--checkpoint-backend '{backend}' is not implemented. "
+            f"The only supported backend is '{DILL_RELOAD_BACKEND}'."
+        )
 
 def agree_spoke_restore(opt, state):
     """Agree across an xhat spoke's ranks on the parts of a restore that are
