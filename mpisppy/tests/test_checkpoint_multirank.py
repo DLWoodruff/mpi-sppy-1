@@ -864,16 +864,22 @@ class TestEveryCheckpointStepOnThosePathsIsAgreed(unittest.TestCase):
     #: an agreement, which is the whole subject of this class.
     RANK_INDEPENDENT_RAISES = {
         "Checkpointer.__init__": (
-            4, "the options and the cylinder's class: an --checkpoint-every "
-               "below 1, neither writing nor resuming, a backend it does not "
-               "know, and spoke mode on something that is not an Xhat_Eval. "
-               "Every rank of the wheel is given the same command line."),
+            3, "the options and the cylinder's class: an --checkpoint-every "
+               "below 1, neither writing nor resuming, and spoke mode on "
+               "something that is not an Xhat_Eval. Every rank of the wheel "
+               "is given the same command line. The backend refusal is the "
+               "fourth of these and now lives in "
+               "require_implemented_backend, below."),
         "Checkpointer._spoke_identity": (
             1, "the cylinder has no spcomm, which is a property of how the "
                "wheel was built rather than of anything this rank read."),
         "PHBase._restore_from_checkpoint_if_resuming": (
             1, "this hub is not a PH, which is the same object on every rank "
                "of the cylinder."),
+        "require_implemented_backend": (
+            1, "--checkpoint-backend names a backend that is designed but "
+               "not built. The value comes from the command line the wheel "
+               "hands every rank, and nothing else is consulted."),
     }
 
     #: Checkpointing calls that agree across the cylinder themselves, so they
@@ -884,10 +890,13 @@ class TestEveryCheckpointStepOnThosePathsIsAgreed(unittest.TestCase):
     })
 
     #: And calls that need no agreement because there is nothing in them for
-    #: one rank to fail at: they read what is already in memory and return an
-    #: answer. Nothing that touches a file or a model belongs here.
+    #: one rank to fail at: they read what is already in memory -- the
+    #: command line every rank was given, say -- and return an answer, so
+    #: they arrive at the same one on every rank or raise on all of them.
+    #: Nothing that touches a file or a model belongs here.
     CANNOT_FAIL_ON_ONE_RANK = frozenset({
         "converger_state_is_carried",
+        "require_implemented_backend",
     })
 
     #: Modules whose callables do this rank's own work: they touch the file
