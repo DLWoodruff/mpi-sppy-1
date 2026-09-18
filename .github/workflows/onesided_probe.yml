@@ -46,15 +46,8 @@ jobs:
           Get-ChildItem "$env:CONDA_PREFIX\Library\bin" -Filter "*mpi*" -ErrorAction SilentlyContinue | Format-Table Name, Length
           Get-ChildItem Env: | Where-Object { $_.Name -match "MPI" } | Format-Table -AutoSize
 
-      - name: MS-MPI mpiexec help (look for progress settings)
-        continue-on-error: true
-        run: |
-          $mx = Join-Path $env:MSMPI_BIN "mpiexec.exe"
-          foreach ($h in "-help", "-help2", "-help3") {
-            Write-Output "===== mpiexec $h ====="
-            & $mx $h
-          }
-
+      # python -m mpi4py: a rank that raises aborts the job, as the console
+      # script does; under plain python the other rank waits in Win.Free.
       - name: Original test, and the probe with each mpiexec
         continue-on-error: true
         timeout-minutes: 15
@@ -63,14 +56,16 @@ jobs:
           $condaExec = Join-Path $env:CONDA_PREFIX "Library\bin\mpiexec.exe"
           if (Test-Path $condaExec) { $execs += $condaExec }
           foreach ($mx in $execs) {
-            Write-Output "===== mpiexec: $mx ====="
-            Write-Output "--- original mpi_one_sided_test.py ---"
-            & $mx -n 2 python mpi_one_sided_test.py
-            Write-Output "exit code $LASTEXITCODE"
-            foreach ($mode in "sleep", "poll") {
-              foreach ($lock in "exclusive", "shared") {
-                & $mx -n 2 python .github/probe/onesided_probe.py $mode $lock
-                Write-Output "exit code $LASTEXITCODE"
+            foreach ($envargs in @(@(), @("-env", "MSMPI_DISABLE_SHM", "1"))) {
+              Write-Output "===== mpiexec: $mx $envargs ====="
+              Write-Output "--- original mpi_one_sided_test.py ---"
+              & $mx -timeout 60 @envargs -n 2 python -m mpi4py mpi_one_sided_test.py
+              Write-Output "exit code $LASTEXITCODE"
+              foreach ($mode in "sleep", "poll") {
+                foreach ($lock in "exclusive", "shared") {
+                  & $mx -timeout 60 @envargs -n 2 python -m mpi4py .github/probe/onesided_probe.py $mode $lock
+                  Write-Output "exit code $LASTEXITCODE"
+                }
               }
             }
           }
