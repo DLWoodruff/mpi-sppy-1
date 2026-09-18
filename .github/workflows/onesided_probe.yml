@@ -7,19 +7,17 @@ on:
       - onesided_msmpi_probe
   workflow_dispatch: {}
 
-defaults:
-  run:
-    shell: pwsh
-
 jobs:
-  probe:
-    name: probe (mpi4py from ${{ matrix.mpi4py }})
+  # Does a spoke that is busy (no MPI calls) stall the hub's reads of its
+  # window?  See .github/probe/stall_probe.py.
+  stall-windows:
+    name: stall probe (Windows, MS-MPI)
     runs-on: windows-latest
     timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        mpi4py: [conda-forge, pip]
+    defaults:
+      run:
+        shell: pwsh
+        working-directory: examples/farmer
     steps:
       - uses: actions/checkout@v4
       - uses: mpi4py/setup-mpi@v1
@@ -29,43 +27,58 @@ jobs:
         with:
           activate-environment: probe-env
           python-version: "3.12"
-
-      - name: Install mpi4py from conda-forge
-        if: ${{ matrix.mpi4py == 'conda-forge' }}
-        run: conda install -y -c conda-forge mpi4py numpy
-
-      - name: Install mpi4py from pip
-        if: ${{ matrix.mpi4py == 'pip' }}
-        run: pip install mpi4py numpy
-
-      - name: Which MPI
+      - name: Install
+        working-directory: .
         run: |
-          python -c "import mpi4py; from mpi4py import MPI; print('mpi4py', mpi4py.__version__, mpi4py.__file__); print(MPI.Get_library_version()); print(mpi4py.get_config())"
-          Get-Command mpiexec -All | Format-Table -AutoSize Source, Version
-          conda list mpi
-          Get-ChildItem "$env:CONDA_PREFIX\Library\bin" -Filter "*mpi*" -ErrorAction SilentlyContinue | Format-Table Name, Length
-          Get-ChildItem Env: | Where-Object { $_.Name -match "MPI" } | Format-Table -AutoSize
-
-      # python -m mpi4py: a rank that raises aborts the job, as the console
-      # script does; under plain python the other rank waits in Win.Free.
-      - name: Original test, and the probe with each mpiexec
-        continue-on-error: true
-        timeout-minutes: 15
+          conda install -y -c conda-forge mpi4py
+          pip install -e . gurobipy
+      - name: Stall probe
+        timeout-minutes: 10
         run: |
-          $execs = @(Join-Path $env:MSMPI_BIN "mpiexec.exe")
-          $condaExec = Join-Path $env:CONDA_PREFIX "Library\bin\mpiexec.exe"
-          if (Test-Path $condaExec) { $execs += $condaExec }
-          foreach ($mx in $execs) {
-            foreach ($envargs in @(@(), @("-env", "MSMPI_DISABLE_SHM", "1"))) {
-              Write-Output "===== mpiexec: $mx $envargs ====="
-              Write-Output "--- original mpi_one_sided_test.py ---"
-              & $mx -timeout 60 @envargs -n 2 python -m mpi4py mpi_one_sided_test.py
-              Write-Output "exit code $LASTEXITCODE"
-              foreach ($mode in "sleep", "poll") {
-                foreach ($lock in "exclusive", "shared") {
-                  & $mx -timeout 60 @envargs -n 2 python -m mpi4py .github/probe/onesided_probe.py $mode $lock
-                  Write-Output "exit code $LASTEXITCODE"
-                }
-              }
-            }
+          foreach ($s in "0", "2") {
+            Write-Output "===== spoke sleep $s ====="
+            mpiexec -timeout 300 -n 2 python -m mpi4py ../../.github/probe/stall_probe.py --num-scens 3 --solver-name gurobi --max-iterations 10 --default-rho 1 --lagrangian --spoke-sleep $s
+            Write-Output "exit code $LASTEXITCODE"
           }
+
+  stall-linux:
+    name: stall probe (Linux, ${{ matrix.mpi }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        mpi: [openmpi, mpich]
+    env:
+      UCX_TLS: "self,sm,tcp"
+    defaults:
+      run:
+        shell: bash -el {0}
+        working-directory: examples/farmer
+    steps:
+      - uses: actions/checkout@v4
+      - uses: conda-incubator/setup-miniconda@v3
+        with:
+          activate-environment: probe-env
+          python-version: "3.12"
+      - name: Install
+        working-directory: .
+        run: |
+          conda install -y -c conda-forge mpi4py ${{ matrix.mpi }}
+          pip install -e . gurobipy
+          python -c "from mpi4py import MPI; print(MPI.Get_library_version())"
+      - name: One-sided probe
+        working-directory: .
+        run: |
+          timeout 60 mpiexec -n 2 python -m mpi4py mpi_one_sided_test.py; echo "exit code $?"
+          for m in sleep poll; do for l in exclusive shared; do
+            timeout 60 mpiexec -n 2 python -m mpi4py .github/probe/onesided_probe.py $m $l; echo "exit code $?"
+          done; done
+      - name: Stall probe
+        timeout-minutes: 10
+        run: |
+          for s in 0 2; do
+            echo "===== spoke sleep $s ====="
+            timeout 300 mpiexec -n 2 python -m mpi4py ../../.github/probe/stall_probe.py --num-scens 3 --solver-name gurobi --max-iterations 10 --default-rho 1 --lagrangian --spoke-sleep $s
+            echo "exit code $?"
+          done
