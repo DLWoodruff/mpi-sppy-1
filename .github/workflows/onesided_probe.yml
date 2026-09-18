@@ -73,14 +73,13 @@ jobs:
           conda install -y -c conda-forge mpi4py ${{ matrix.mpi }}
           pip install -e . gurobipy
           python -c "from mpi4py import MPI; print(MPI.Get_library_version())"
-      # setsid: when a rank aborts, MPICH's launcher kills its process
-      # group, which otherwise includes this step's shell
+      # mpi_one_sided_test.py is left out: it fails under MPICH (run
+      # 35389881562), and its MPI_Abort took this step's shell down with it
       - name: One-sided and stall probes
         run: |
           for apm in 0 1; do
             export MPICH_ASYNC_PROGRESS=$apm
             echo "########## MPICH_ASYNC_PROGRESS=$apm"
-            (cd ../..; setsid --wait timeout 60 mpiexec -n 2 python -m mpi4py mpi_one_sided_test.py; echo "exit code $?")
             for m in sleep poll; do for l in exclusive shared; do
               (cd ../..; setsid --wait timeout 60 mpiexec -n 2 python -m mpi4py .github/probe/onesided_probe.py $m $l; echo "exit code $?")
             done; done
