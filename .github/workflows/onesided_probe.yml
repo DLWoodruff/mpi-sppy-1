@@ -14,6 +14,8 @@ jobs:
     name: stall probe (Windows, MS-MPI)
     runs-on: windows-latest
     timeout-minutes: 30
+    env:
+      PYTHONPATH: ${{ github.workspace }}/examples/farmer
     defaults:
       run:
         shell: pwsh
@@ -51,9 +53,11 @@ jobs:
         mpi: [openmpi, mpich]
     env:
       UCX_TLS: "self,sm,tcp"
+      PYTHONPATH: ${{ github.workspace }}/examples/farmer
     defaults:
       run:
-        shell: bash -el {0}
+        # no -e: every probe line should run even after one fails
+        shell: bash -l {0}
         working-directory: examples/farmer
     steps:
       - uses: actions/checkout@v4
