@@ -12,6 +12,8 @@ jobs:
   # window?  See .github/probe/stall_probe.py.
   stall-windows:
     name: stall probe (Windows, MS-MPI)
+    # measured in run 35389881562; off while the MPICH job is rerun
+    if: false
     runs-on: windows-latest
     timeout-minutes: 30
     env:
@@ -50,7 +52,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        mpi: [openmpi, mpich]
+        mpi: [mpich]  # openmpi measured in run 35389881562
     env:
       UCX_TLS: "self,sm,tcp"
       PYTHONPATH: ${{ github.workspace }}/examples/farmer
@@ -71,18 +73,20 @@ jobs:
           conda install -y -c conda-forge mpi4py ${{ matrix.mpi }}
           pip install -e . gurobipy
           python -c "from mpi4py import MPI; print(MPI.Get_library_version())"
-      - name: One-sided probe
-        working-directory: .
+      # setsid: when a rank aborts, MPICH's launcher kills its process
+      # group, which otherwise includes this step's shell
+      - name: One-sided and stall probes
         run: |
-          timeout 60 mpiexec -n 2 python -m mpi4py mpi_one_sided_test.py; echo "exit code $?"
-          for m in sleep poll; do for l in exclusive shared; do
-            timeout 60 mpiexec -n 2 python -m mpi4py .github/probe/onesided_probe.py $m $l; echo "exit code $?"
-          done; done
-      - name: Stall probe
-        timeout-minutes: 10
-        run: |
-          for s in 0 2; do
-            echo "===== spoke sleep $s ====="
-            timeout 300 mpiexec -n 2 python -m mpi4py ../../.github/probe/stall_probe.py --num-scens 3 --solver-name gurobi --max-iterations 10 --default-rho 1 --lagrangian --spoke-sleep $s
-            echo "exit code $?"
+          for apm in 0 1; do
+            export MPICH_ASYNC_PROGRESS=$apm
+            echo "########## MPICH_ASYNC_PROGRESS=$apm"
+            (cd ../..; setsid --wait timeout 60 mpiexec -n 2 python -m mpi4py mpi_one_sided_test.py; echo "exit code $?")
+            for m in sleep poll; do for l in exclusive shared; do
+              (cd ../..; setsid --wait timeout 60 mpiexec -n 2 python -m mpi4py .github/probe/onesided_probe.py $m $l; echo "exit code $?")
+            done; done
+            for sl in 0 2; do
+              echo "===== spoke sleep $sl ====="
+              setsid --wait timeout 300 mpiexec -n 2 python -m mpi4py ../../.github/probe/stall_probe.py --num-scens 3 --solver-name gurobi --max-iterations 10 --default-rho 1 --lagrangian --spoke-sleep $sl
+              echo "exit code $?"
+            done
           done
