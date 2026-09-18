@@ -8,6 +8,79 @@ on:
   workflow_dispatch: {}
 
 jobs:
+  # Intel MPI (conda-forge impi_rt) on Windows: are reads of a busy rank's
+  # window served, by default or with I_MPI_ASYNC_PROGRESS=1?
+  impi-windows:
+    name: probes (Windows, Intel MPI)
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      PYTHONPATH: ${{ github.workspace }}/examples/farmer
+      MPIEXEC_TIMEOUT: "120"
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - uses: conda-incubator/setup-miniconda@v3
+        with:
+          activate-environment: probe-env
+          python-version: "3.12"
+      - name: Install mpi4py with Intel MPI
+        run: conda install -y -c conda-forge mpi4py impi_rt
+      - name: Install mpi-sppy and gurobi
+        run: pip install -e . gurobipy
+      - name: Which MPI
+        run: |
+          python -c "from mpi4py import MPI; print(MPI.Get_library_version())"
+          Get-Command mpiexec -All | Format-Table -AutoSize Source
+          Get-ChildItem "$env:CONDA_PREFIX\Library\bin" | Where-Object { $_.Name -match "mpi|hydra|pmi" } | Format-Table Name, Length
+          conda list mpi
+
+      # Intel MPI's Windows launcher may want its Hydra service; try the
+      # plain launch and the local-only forms, keep the first that works.
+      - name: Find a launch that works
+        timeout-minutes: 8
+        run: |
+          $hello = "from mpi4py import MPI; c = MPI.COMM_WORLD; print('HELLO', c.Get_rank(), c.Get_size())"
+          $found = ""
+          foreach ($extra in "", "-localonly", "-bootstrap service", "-bootstrap fork") {
+            Write-Output "===== mpiexec $extra -n 2 ====="
+            # each attempt gets 60 s: a launcher waiting for a service hangs
+            $argl = "$extra -n 2 python -c `"$hello`"".Trim()
+            $p = Start-Process mpiexec -ArgumentList $argl -NoNewWindow -PassThru -RedirectStandardOutput out.txt -RedirectStandardError err.txt
+            if (-not $p.WaitForExit(60000)) { Write-Output "TIMED OUT"; & taskkill /T /F /PID $p.Id | Out-Null }
+            $out = (Get-Content out.txt, err.txt -ErrorAction SilentlyContinue) -join "`n"
+            Write-Output $out
+            Write-Output "exit code $($p.ExitCode)"
+            if (-not $found -and ([regex]::Matches($out, "HELLO \d 2")).Count -eq 2) { $found = "ok:$extra" }
+          }
+          Write-Output "LAUNCH $found"
+          "LAUNCH_ARGS=$($found -replace '^ok:', '')" | Out-File -Append $env:GITHUB_ENV
+          if (-not $found) { exit 1 }
+
+      - name: One-sided and stall probes
+        timeout-minutes: 20
+        run: |
+          $a = @($env:LAUNCH_ARGS -split " " | Where-Object { $_ })
+          foreach ($apm in "0", "1") {
+            $env:I_MPI_ASYNC_PROGRESS = $apm
+            Write-Output "########## I_MPI_ASYNC_PROGRESS=$apm"
+            foreach ($mode in "sleep", "poll") {
+              foreach ($lock in "exclusive", "shared") {
+                & mpiexec @a -n 2 python -m mpi4py .github/probe/onesided_probe.py $mode $lock
+                Write-Output "exit code $LASTEXITCODE"
+              }
+            }
+            Push-Location examples/farmer
+            foreach ($sl in "0", "2") {
+              Write-Output "===== spoke sleep $sl ====="
+              & mpiexec @a -n 2 python -m mpi4py ../../.github/probe/stall_probe.py --num-scens 3 --solver-name gurobi --max-iterations 10 --default-rho 1 --lagrangian --spoke-sleep $sl
+              Write-Output "exit code $LASTEXITCODE"
+            }
+            Pop-Location
+          }
+
   # Does a spoke that is busy (no MPI calls) stall the hub's reads of its
   # window?  See .github/probe/stall_probe.py.
   stall-windows:
@@ -47,6 +120,8 @@ jobs:
 
   stall-linux:
     name: stall probe (Linux, ${{ matrix.mpi }})
+    # measured in runs 35389881562 (openmpi) and 35390350590 (mpich)
+    if: false
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
