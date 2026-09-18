@@ -1,0 +1,76 @@
+# Diagnostic for issue #869 (one-sided test under MS-MPI); scratch branch only.
+name: One-sided probe (MS-MPI)
+
+on:
+  push:
+    branches:
+      - onesided_msmpi_probe
+  workflow_dispatch: {}
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  probe:
+    name: probe (mpi4py from ${{ matrix.mpi4py }})
+    runs-on: windows-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        mpi4py: [conda-forge, pip]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mpi4py/setup-mpi@v1
+        with:
+          mpi: msmpi
+      - uses: conda-incubator/setup-miniconda@v3
+        with:
+          activate-environment: probe-env
+          python-version: "3.12"
+
+      - name: Install mpi4py from conda-forge
+        if: ${{ matrix.mpi4py == 'conda-forge' }}
+        run: conda install -y -c conda-forge mpi4py numpy
+
+      - name: Install mpi4py from pip
+        if: ${{ matrix.mpi4py == 'pip' }}
+        run: pip install mpi4py numpy
+
+      - name: Which MPI
+        run: |
+          python -c "import mpi4py; from mpi4py import MPI; print('mpi4py', mpi4py.__version__, mpi4py.__file__); print(MPI.Get_library_version()); print(mpi4py.get_config())"
+          Get-Command mpiexec -All | Format-Table -AutoSize Source, Version
+          conda list mpi
+          Get-ChildItem "$env:CONDA_PREFIX\Library\bin" -Filter "*mpi*" -ErrorAction SilentlyContinue | Format-Table Name, Length
+          Get-ChildItem Env: | Where-Object { $_.Name -match "MPI" } | Format-Table -AutoSize
+
+      - name: MS-MPI mpiexec help (look for progress settings)
+        continue-on-error: true
+        run: |
+          $mx = Join-Path $env:MSMPI_BIN "mpiexec.exe"
+          foreach ($h in "-help", "-help2", "-help3") {
+            Write-Output "===== mpiexec $h ====="
+            & $mx $h
+          }
+
+      - name: Original test, and the probe with each mpiexec
+        continue-on-error: true
+        timeout-minutes: 15
+        run: |
+          $execs = @(Join-Path $env:MSMPI_BIN "mpiexec.exe")
+          $condaExec = Join-Path $env:CONDA_PREFIX "Library\bin\mpiexec.exe"
+          if (Test-Path $condaExec) { $execs += $condaExec }
+          foreach ($mx in $execs) {
+            Write-Output "===== mpiexec: $mx ====="
+            Write-Output "--- original mpi_one_sided_test.py ---"
+            & $mx -n 2 python mpi_one_sided_test.py
+            Write-Output "exit code $LASTEXITCODE"
+            foreach ($mode in "sleep", "poll") {
+              foreach ($lock in "exclusive", "shared") {
+                & $mx -n 2 python .github/probe/onesided_probe.py $mode $lock
+                Write-Output "exit code $LASTEXITCODE"
+              }
+            }
+          }
