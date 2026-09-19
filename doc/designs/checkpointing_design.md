@@ -497,7 +497,12 @@ replaces that with the in-core resume branch (§5.1), which is itself unproven.
   uninterrupted run. That is expected, not a bug.
 - **Bounds and incumbent:** valid and best-so-far, not bit-reproducible (async,
   timing-dependent). Resume never reports a *worse* best-so-far than the
-  checkpoint.
+  checkpoint. This covers what the hub tracks (`best_bound_obj_val`,
+  `best_solution_obj_val`), not the serial xhat extensions (`XhatLooper`,
+  `XhatXbar`, `XhatClosest`, `XhatSpecific`): they evaluate the final iterate
+  in `post_everything`, after the last write, and cache the result on the
+  extension. Moving the write after them would undo §9 item 4, so a resumed
+  run evaluates its own final iterate instead, and the value can be worse.
 - **Leaf-rebuild on a deterministic LP/QP solver:** the primal trajectory (W,
   nonants, rho, xbar) *can* be bit-identical — this is what the PoC showed — but it
   is a bonus, not the target guarantee.

@@ -234,18 +234,21 @@ does not: ``--max-iterations`` bounds the run you are starting. To resume a run
 that stopped at iteration 4 and do two more, pass ``--max-iterations 2``, and
 the study ends at iteration 6.
 
-You can use ``--stop-at-iteration-number`` to say where the *study* should end .
+You can use ``--stop-at-iteration-number`` to say where the *study* should end
 and mpi-sppy will work the rest out::
 
   python -m mpisppy.generic_cylinders --module-name farmer --num-scens 3 \
       --solver-name cplex --max-iterations 100 --default-rho 1.0 \
-      --stop-at-iteration-number 500 --resume-from ./ckpt
+      --stop-at-iteration-number 500 --resume-from ./ckpt --checkpoint-dir ./ckpt
 
 That run does at most 100 iterations, and stops earlier if it reaches
 iteration 500 of the study. Submitting the same command each morning walks a
 500-iteration study forward in 100-iteration days without anyone having to
-subtract. A run that starts from a checkpoint at or past 500 reports that the
-study is already finished and does nothing, rather than quietly running on.
+subtract. The ``--checkpoint-dir`` is what makes that work: ``--resume-from``
+only reads, so without it each morning would resume from the same checkpoint
+and redo the same 100 iterations. A run that starts from a checkpoint at or
+past 500 reports that the study is already finished and does nothing, rather
+than quietly running on.
 
 Trying it out
 -------------
@@ -388,7 +391,8 @@ What resume guarantees
 ----------------------
 
 For the target case -- large MIP subproblems -- a resumed run **continues
-correctly**, and never loses or regresses the best solution found so far.
+correctly**, and never loses or regresses the bounds or the incumbent the run
+tracks.
 
 The reloaded models carry the recourse values from the last solve before the
 stop, so the first resumed solve *can* warm-start from them -- but only with
@@ -401,6 +405,12 @@ bug.
 
 Bounds and the incumbent are carried forward as valid best-so-far values. A
 resumed run never reports a worse best-so-far than its checkpoint.
+
+The xhat extensions that run inside the hub (``XhatLooper``, ``XhatXbar``,
+``XhatClosest`` and ``XhatSpecific``) are not covered by that promise. They
+evaluate the run's final iterate once, after the last checkpoint has been
+written, and keep the result to themselves. A resumed run evaluates its own
+final iterate, which can come out worse than the one before the stop.
 
 In a cylinders run the best solution does not live on the hub: the spoke that
 found it holds it. So each spoke that looks for one -- the xhat spokes, the
