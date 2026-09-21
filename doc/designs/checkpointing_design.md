@@ -363,9 +363,12 @@ None of this lives on a hub scenario model, so it is restored as leaf data under
 - `spcomm.BestInnerBound`, `spcomm.BestOuterBound`; `opt.best_bound_obj_val`,
   `opt.best_solution_obj_val`. Products of **async** spoke interaction — their
   timing is not reproducible, so they are carried forward as best-so-far. They
-  stay valid: a restored looser bound is improved again; a restored incumbent
-  objective is never regressed because `update_best_solution_if_improving`
-  (`spbase.py`) only accepts improvements. In cylinders the hub's
+  stay valid: a restored looser bound is improved again, and a restored
+  incumbent objective is assigned outright rather than filtered — the file is
+  this spoke's own last word, so there is nothing yet to improve on. What is
+  filtered is the *republish*: the deferred send at the first checkpoint point
+  publishes whichever of the restored bound and the spoke's current one is
+  better. In cylinders the hub's
   `best_solution_obj_val` is often `None` — the inner bound arrives as a scalar via
   `receive_innerbounds` (`spcommunicator.py`) into `spcomm.BestInnerBound`.
 - **The best xhat SOLUTION values live on the xhat spoke**, in
@@ -373,9 +376,10 @@ None of this lives on a hub scenario model, so it is restored as leaf data under
   `spoke.best_inner_bound`; `InnerBoundSpoke.finalize()` (`spoke.py`) loads
   them back. So **"keep the best xhat" requires checkpointing the spoke
   incumbent**, not just hub bounds. The spoke checkpoints its own cache **on its
-  own schedule** — on each improvement, reusing
-  `_maybe_write_incumbent_on_improvement`, independent of the hub checkpoint (§9,
-  item 6). Serialize the `ComponentMap` **by variable name** (`{var.name: value}`)
+  own schedule** — on each improvement, on the same trigger as
+  `_maybe_write_incumbent_on_improvement` but through its own writer
+  (`Checkpointer._spoke_checkpoint` calling `write_spoke_incumbent`, which share
+  no code with it), independent of the hub checkpoint (§9, item 6). Serialize the `ComponentMap` **by variable name** (`{var.name: value}`)
   and rebuild by name lookup on the reconstructed model.
 - **The initially-fixed-nonant baseline** (`opt._initial_fixed_varibles`), which
   gates whether the outer bound may be updated at all. It lives on the opt object
@@ -852,14 +856,16 @@ Touch-points an implementation needs beyond the PoC's extension/subclass hacks:
 5. **Geometry / cfg fingerprint** (§5.7) with a clear refusal on mismatch.
 6. **Async per-spoke incumbent checkpoints — no hub↔spoke coordination.** Each
    spoke serializes its *own* best incumbent (the best xhat solution values, §5.4)
-   and bound whenever its incumbent improves — reusing
-   `_maybe_write_incumbent_on_improvement` — to its own rank-tagged file with the
-   same atomic write (item 7). Spokes are **not** synchronized to the hub's
+   and bound whenever its incumbent improves — on the same trigger as
+   `_maybe_write_incumbent_on_improvement`, through a writer of its own — to its
+   own rank-tagged file with the same atomic write (item 7). Spokes are **not** synchronized to the hub's
    checkpoint iteration: the determinism contract (§7) makes bounds/incumbent
    best-so-far, not bit-reproducible, so a globally-consistent "snapshot at
    iteration `k`" across cylinders is unnecessary. On resume the hub restores its
-   primal state while each spoke reloads its latest incumbent/bound, all accepted
-   only if improving (`update_best_solution_if_improving` in `spbase.py`). This
+   primal state while each spoke reloads its latest incumbent/bound. The reload
+   is an assignment, not a filtered update; it is the republish to the hub that
+   sends the better of the restored bound and whatever the spoke has since
+   found. This
    also avoids a hub-triggered snapshot barrier and its stall/deadlock risk.
 7. **Atomic writes with a single published generation.** Each rank writes only its
    local state (dilled models + leaf non-model data) to rank-tagged temp files and
