@@ -221,7 +221,11 @@ multiple optima, so the resumed iterates may differ. That is expected, not a
 bug.
 
 Bounds and the incumbent are carried forward as valid best-so-far values. A
-resumed run never reports a worse best-so-far than its checkpoint.
+resumed run never reports a worse best-so-far than its checkpoint, provided
+the spoke that held the incumbent is still in the run. Each spoke keeps its
+own file, so dropping one leaves its incumbent behind: resuming
+``--xhatshuffle`` as ``--xhatxbar`` starts without the answer the first one
+found, and says so.
 
 The xhat extensions that run inside the hub (``XhatLooper``, ``XhatXbar``,
 ``XhatClosest`` and ``XhatSpecific``) are not covered by that promise. They
