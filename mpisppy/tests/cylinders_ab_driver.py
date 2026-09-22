@@ -218,11 +218,20 @@ def main():
                 json.dump(snapshot, f)
         with open(f"{out_path}.hubrank{wheel.cylinder_rank:04d}", "w") as f:
             json.dump(snapshot, f)
-    elif wheel.cylinder_rank == 0:
+    else:
         marker = _spoke_marker(wheel)
-        if marker is not None:
+        if marker is None:
+            return
+        if wheel.cylinder_rank == 0:
             with open(f"{out_path}.spoke{wheel.strata_rank}", "w") as f:
                 json.dump(marker, f)
+        # And every rank's own, under a name the single-rank harness's
+        # ".spoke" prefix does not match: a spoke's ranks each restore their
+        # own file, and only comparing them shows whether they agree.
+        marker["cylinder_rank"] = int(wheel.cylinder_rank)
+        with open(f"{out_path}.byrank.spoke{wheel.strata_rank}"
+                  f".{wheel.cylinder_rank:04d}", "w") as f:
+            json.dump(marker, f)
 
 
 if __name__ == "__main__":
