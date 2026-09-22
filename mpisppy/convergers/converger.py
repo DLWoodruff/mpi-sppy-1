@@ -27,6 +27,13 @@ class Converger:
         Args:
             opt (SPBase): The SPBase object for the current model
     '''
+    #: True on a converger that has nothing to carry across a checkpoint,
+    #: so a resume does not warn that it starts fresh. The same declaration
+    #: as ``Extension.checkpoint_stateless``, and deliberately not inherited
+    #: for the same reason: the check reads the class's own ``__dict__``, so a
+    #: subclass that adds state to a stateless parent is warned about.
+    checkpoint_stateless = False
+
     def __init__(self, opt):
         self.conv = None  # intended to be the value used for comparison
 

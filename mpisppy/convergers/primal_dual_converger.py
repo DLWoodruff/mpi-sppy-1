@@ -21,6 +21,13 @@ class PrimalDualConverger(mpisppy.convergers.converger.Converger):
         Dual convergence is measured as
         rho * ||\bar{x}_{t} - \bar{x}_{t-1}||_1
     """
+    #: Its one piece of history, ``prev_xbars``, comes back right on its own.
+    #: On a resume Iter0 builds this converger after the checkpointed models
+    #: are spliced in and computes no xbar, so ``__init__`` reads the xbars
+    #: of the last checkpointed iteration -- which is what ``prev_xbars``
+    #: held when the checkpoint was written.
+    checkpoint_stateless = True
+
     def __init__(self, ph):
         """ Initialization method for the PrimalDualConverger class."""
         super().__init__(ph)
@@ -143,24 +150,6 @@ class PrimalDualConverger(mpisppy.convergers.converger.Converger):
             self.tracker.add_row([self._ph._PHIter, primal_gap, dual_gap])
             self.tracker.write_out_data()
         return ret_val
-
-    def checkpoint_state(self):
-        """The previous iteration's xbars, which the dual residual is measured
-        against.
-
-        `_compute_dual_residual` is rho * ||xbar_t - xbar_{t-1}||_1, so
-        `prev_xbars` is the only thing here that reaches back past the current
-        iterate. A resumed run gets it from `__init__`, which reads the xbars
-        of the *reloaded* models -- that is xbar_t, not xbar_{t-1} -- so the
-        first dual residual after the stop would come out zero and this
-        converger could declare convergence an iteration early. Restoring it
-        is what keeps a resumed run stopping where the uninterrupted one
-        would.
-        """
-        return {"prev_xbars": dict(self.prev_xbars)}
-
-    def restore_state(self, state):
-        self.prev_xbars = dict(state["prev_xbars"])
 
     def plot_results(self):
         """

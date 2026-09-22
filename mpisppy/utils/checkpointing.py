@@ -765,6 +765,8 @@ def converger_state_is_carried(opt, state):
     convobject = getattr(opt, "convobject", None)
     if convobject is None:
         return True
+    if type(convobject).__dict__.get("checkpoint_stateless", False):
+        return True
     saved = (state or {}).get("converger")
     return (saved is not None
             and saved["class"] == type(convobject).__name__)
