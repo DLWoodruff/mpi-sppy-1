@@ -98,9 +98,10 @@ class XhatShuffleInnerBound(_PreLoopXhatMixin, XhatInnerBoundBase):
 
         # On self rather than local, so a checkpoint can reach them. The
         # cursor is where this spoke had got to in its exploration of the
-        # scenarios; a resumed spoke that started it over would re-try
-        # scenarios it has already tried, which costs a subproblem solve
-        # each. See doc/designs/checkpointing_design.md section 5.6.
+        # scenarios -- where the next epoch starts, and its position and
+        # direction in the order -- so a resumed spoke walks on the way the
+        # uninterrupted one would rather than from the start. See
+        # doc/designs/checkpointing_design.md section 5.6.
         self.scenario_cycler = ScenarioCycler(shuffled_scenarios,
                                               self.opt.nonleaves,
                                               self.reverse,

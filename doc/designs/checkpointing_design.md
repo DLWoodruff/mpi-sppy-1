@@ -1350,28 +1350,27 @@ as a branch stacked on the 1a PR.
   nonant, and (across ranks) one iteration for all of them. None of that looks
   at the numbers, and the numbers become another cylinder's bound:
   `LagrangianOuterBound` receives these weights as `Field.DUALS` and turns them
-  into an outer bound the hub keeps as best-so-far. That bound is only a bound
-  when `sum_s p_s W_s = 0`, which is the same normalization the DUALS transport
-  already relies on within an iteration (`_STRICT_COHERENCE_FIELDS` in
-  `spcommunicator.py`). So the restore ends by computing E[W] over the
-  cylinder's comms (`phbase.Wbar_by_node`) and refusing a file whose weights
-  are not a dual point — the check `wxbarutils.set_W_from_file` has always
-  made of the other way of putting weights on a model from a file,
-  `--init-W-fname`. The tolerance is deliberately loose, and relative rather
-  than absolute: `E1_tolerance` plus a millionth of the size of the weights
-  being summed (`phbase.W_magnitude_by_node`). Dual feasibility is exact in
-  arithmetic and approximate in floating point, and the drift is a fraction of
-  the magnitude of the weights, so a fixed absolute threshold would refuse a
-  long run on a large-cost model for its own rounding while a run on a small
-  one sailed through. A resume wrongly refused is worse than the drift it
-  would be refused for. Measured on farmer: a clean checkpoint's largest E[W]
-  entry is 8e-14 against weights of order 10, and adding 1.0 to one scenario's
-  weights — 1.7e-3 of them — is refused by name.
-  The invariant rests on rho being the same in every scenario for a given
-  nonant, which is what `Update_W` assumes against a probability-weighted
-  xbar; should scenario-dependent rho ever be introduced, something will have
-  to re-establish E[W] = 0 before the weights are published, and this refusal
-  is where that would first be seen.
+  into an outer bound the hub keeps as best-so-far. So the file also records
+  E[W] per node as the writing run computed it (`phbase.Wbar_by_node`, one
+  allreduce per iteration of the cylinder), and the restore ends by computing
+  it again from the restored models and refusing a file whose weights do not
+  reproduce it. That catches an edited file and changed scenario
+  probabilities; it compares a sum per variable, so it would not catch W
+  exchanged between two scenarios of equal probability. The tolerance is
+  `E1_tolerance` plus a millionth of the size of the weights being summed
+  (`phbase.W_magnitude_by_node`), relative so that a large-cost model is not
+  refused for its own rounding; in practice the two sums are of the same
+  numbers and agree exactly. Measured on farmer: adding 1.0 to one scenario's
+  weights is refused by name.
+
+  An earlier version refused weights whose E[W] was not zero, which is the
+  dual feasibility a Lagrangian bound relies on. PH keeps it only when rho is
+  the same in every scenario for a given nonant: with a scenario-dependent
+  rho the run that wrote the checkpoint finished normally and its resume was
+  refused, blaming the file. A resume should do what the run it continues
+  was doing, so the check is now of the file, not of the algorithm. Whether
+  the Lagrangian bound is valid under a scenario-dependent rho is a question
+  about PH that the uninterrupted run already has.
 
   Three things this deliberately does not do. It does not dill the cylinder's
   models: rho comes back from the rho setter, xbar from the values, the prox

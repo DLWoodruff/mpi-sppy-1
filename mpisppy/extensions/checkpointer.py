@@ -320,16 +320,6 @@ class Checkpointer(Extension):
             return
         cylinder, ordinal = self._spoke_identity()
         rank0 = self.opt.cylinder_rank == 0
-        # Only W crosses the checkpoint for a dual cylinder. Its own
-        # extensions -- --grad-rho on --ph-dual, say -- are rebuilt fresh,
-        # and a stateful one then does not retrace the uninterrupted run.
-        others = sorted(name for name, _ in ckpt._extension_objects(self.opt)
-                        if name != type(self).__name__)
-        if others:
-            global_toc(
-                f"WARNING: {cylinder} carries only its dual weights across a "
-                f"checkpoint; its own extensions ({', '.join(others)}) start "
-                f"fresh on this resumed run.", rank0)
         # Collective, for the reason given at the xhat spoke's load.
         state = ckpt.run_agreed(
             self.opt,
@@ -375,6 +365,16 @@ class Checkpointer(Extension):
         ckpt.require_restored_duals_match_their_file(
             self.opt, cylinder, state["generation"], state["Wbar"])
         self.restored_dual_generation = state["generation"]
+        # Only W crosses the checkpoint for a dual cylinder. Its own
+        # extensions -- --grad-rho on --ph-dual, say -- are rebuilt fresh,
+        # and a stateful one then does not retrace the uninterrupted run.
+        others = sorted(name for name, _ in ckpt._extension_objects(self.opt)
+                        if name != type(self).__name__)
+        if others:
+            global_toc(
+                f"WARNING: {cylinder} carries only its dual weights across a "
+                f"checkpoint; its own extensions ({', '.join(others)}) start "
+                f"fresh on this resumed run.", rank0)
         global_toc(f"Restored the checkpointed dual weights for {cylinder} "
                    f"(written at its iteration {state['generation']})", rank0)
 
@@ -403,9 +403,9 @@ class Checkpointer(Extension):
             global_toc(
                 f"WARNING: the checkpoint in {resume_from} holds a file for "
                 f"{cylinder} (ordinal {ordinal}), and no such cylinder runs "
-                f"in this resume, so what it held is not restored. If it held "
-                f"the study's best incumbent, this run starts from a worse "
-                f"one.", self.opt.cylinder_rank == 0)
+                f"in this resume, so what it held -- an incumbent, or a dual "
+                f"cylinder's weights -- is not restored.",
+                self.opt.cylinder_rank == 0)
 
     def _dual_spoke_checkpoint(self):
         """Write W at the end of a completed iteration of this cylinder.

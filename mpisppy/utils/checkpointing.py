@@ -1713,7 +1713,7 @@ RESTORED_WBAR_RTOL = 1e-6
 
 def require_restored_duals_match_their_file(opt, cylinder, generation,
                                             recorded):
-    """Refuse restored dual weights that are not the ones the file recorded.
+    """Refuse restored dual weights that do not reproduce the file's E[W].
 
     The rest of this cylinder's restore checks that the file describes this
     model: its format, its fingerprint, this rank's scenario names, that
@@ -1721,7 +1721,10 @@ def require_restored_duals_match_their_file(opt, cylinder, generation,
     iteration. None of that looks at the numbers, and the numbers become
     another cylinder's Lagrangian bound, which the hub keeps as best-so-far.
     This recomputes E[W] per node from the restored models and compares it
-    with the E[W] the writing run computed from the same weights.
+    with the E[W] the writing run computed from the same weights. That
+    catches an edited file and changed scenario probabilities. It compares a
+    sum per variable, so W exchanged between two scenarios of equal
+    probability passes.
 
     Not a check that E[W] is zero. PH keeps it at zero only when rho is the
     same in every scenario (see ``phbase.Wbar_by_node``); with a
@@ -1760,8 +1763,8 @@ def require_restored_duals_match_their_file(opt, cylinder, generation,
         _, Wbar, want, size, tolerance, ndn, i = worst
         raise CheckpointMismatch(
             f"The dual weights restored for {cylinder} from the checkpoint "
-            f"it wrote at its iteration {generation} are not the ones that "
-            f"file was written with: at '{_nonant_name(opt, ndn, i)}' the "
+            f"it wrote at its iteration {generation} do not reproduce the "
+            f"E[W] that file recorded: at '{_nonant_name(opt, ndn, i)}' the "
             f"probability-weighted sum of the restored weights is "
             f"{Wbar:.6e}, and the file recorded {want:.6e}, against a "
             f"tolerance of {tolerance:.3e} -- E1_tolerance "

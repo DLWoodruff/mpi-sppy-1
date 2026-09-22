@@ -471,8 +471,9 @@ The two dual cylinders, ``--relaxed-ph`` and ``--ph-dual``, keep a file of
 their own under ``spokes/`` too: their dual weights W, written at the end of
 every iteration. A resumed dual cylinder puts them back and carries on from
 them, which matters most under ``--ph-primal-hub``, where the hub's W is built
-from them. The resume checks that the weights it put back are the ones the
-file was written with, and refuses the file if not. Only W crosses the
+from them. The file also records the probability-weighted sum of W for each
+variable, and the resume refuses the file if the weights it put back do not
+reproduce it -- an edited file, or changed scenario probabilities. Only W crosses the
 checkpoint: a dual cylinder's own extensions, such as ``--grad-rho`` on
 ``--ph-dual``, start fresh, and the resume says so.
 

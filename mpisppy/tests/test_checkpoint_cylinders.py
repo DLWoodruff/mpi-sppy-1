@@ -570,14 +570,24 @@ class TestAFailedSpokeWriteIsNotRetriedEveryPass(unittest.TestCase):
             extdict={"Checkpointer": ext, "GradRho": other})
         ext._spoke_identity = lambda: ("PHDualSpoke", 0)
         assert isinstance(ext, Checkpointer)
-        with mock.patch.object(mod.ckpt, "run_agreed", return_value=None), \
-             mock.patch.object(mod.ckpt, "agree_dual_spoke_restore",
-                               return_value=(None, None)), \
-             mock.patch.object(mod, "global_toc") as toc:
-            ext.post_iter0()
-        said = " ".join(str(c.args[0]) for c in toc.call_args_list)
+        state = {"generation": 3, "class_count": None, "Wbar": {}}
+
+        def restore(found):
+            with mock.patch.object(mod.ckpt, "run_agreed",
+                                   return_value=found), \
+                 mock.patch.object(mod.ckpt, "agree_dual_spoke_restore",
+                                   return_value=(found, None)), \
+                 mock.patch.object(mod.ckpt,
+                                   "require_restored_duals_match_their_file"), \
+                 mock.patch.object(mod, "global_toc") as toc:
+                ext.post_iter0()
+            return " ".join(str(c.args[0]) for c in toc.call_args_list)
+
+        said = restore(state)
         self.assertIn("GradRho", said)
         self.assertNotIn("Checkpointer", said)
+        # Nothing restored, so nothing to say about what was not carried.
+        self.assertNotIn("GradRho", restore(None))
 
     def test_a_failure_on_any_rank_is_reported_by_that_rank(self):
         """Each rank writes its own file, so a failure on rank 1 is rank 1's

@@ -375,7 +375,8 @@ class TestRestoredDualsMustMatchTheirFile(unittest.TestCase):
         with self.assertRaises(checkpointing.CheckpointMismatch) as ctx:
             self._check(opt, recorded)
         message = str(ctx.exception)
-        self.assertIn("not the ones that file was written with", message)
+        self.assertIn("do not reproduce the E[W] that file recorded",
+                      message)
         self.assertIn(self.CYLINDER, message)
         self.assertIn("iteration 7", message)
         self.assertIn("DevotedAcreage", message)
