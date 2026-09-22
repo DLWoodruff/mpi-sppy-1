@@ -300,7 +300,7 @@ solution, and the spoke's place in its own scenario walk::
 
   Restored the checkpointed incumbent for XhatShuffleInnerBound (objective -108382.2222...)
   Resuming from checkpoint in ./ckpt (iteration 4)
-  Restored the checkpointed xhatshuffle cursor (pass 250, next scenario scen0)
+  Restored the checkpointed xhatshuffle cursor (pass 6668; the next epoch starts from scen2)
 
 It then starts at iteration 5 -- there is no iteration-0 solve and no repeat of
 iterations 1 through 4 -- and ends on the same numbers the reference run did:
@@ -456,14 +456,25 @@ it adopts may have belonged to the other one. That incumbent is still a
 feasible solution for the same model.
 
 An ``xhatshuffle`` spoke also records **where it had got to** in its walk
-through the scenarios, so a resumed spoke carries on exploring rather than
-re-trying candidates it has already tried. Each re-try it avoids is a
-subproblem solve. The scenario order itself is not stored -- the shuffle is
+through the scenarios -- the scenario its next epoch starts from, and its
+position and direction in the order -- so a resumed spoke's walk continues the
+way the uninterrupted one's would rather than starting over. The pass count
+in its log line counts passes of a loop that spins while it waits on the hub,
+so it varies from run to run. The scenario order itself is not stored -- the shuffle is
 seeded to a fixed value, so a resumed spoke reproduces it exactly -- only the
 position in it, which is why a run whose scenario list has changed discards the
 position (with a warning) and explores from the start again. The other xhat
 spokes re-evaluate from scratch whenever the hub sends new values, so they have
 no such position and store none.
+
+The two dual cylinders, ``--relaxed-ph`` and ``--ph-dual``, keep a file of
+their own under ``spokes/`` too: their dual weights W, written at the end of
+every iteration. A resumed dual cylinder puts them back and carries on from
+them, which matters most under ``--ph-primal-hub``, where the hub's W is built
+from them. The resume checks that the weights it put back are the ones the
+file was written with, and refuses the file if not. Only W crosses the
+checkpoint: a dual cylinder's own extensions, such as ``--grad-rho`` on
+``--ph-dual``, start fresh, and the resume says so.
 
 On a deterministic LP or QP solve the primal trajectory can come back
 bit-identical, but that is a bonus rather than the guarantee.

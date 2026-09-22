@@ -433,7 +433,11 @@ Consequences:
   `main()`** — unreachable. **Phase 5 hoisted them onto `self`** and carries the
   cursor in the spoke's file. Without it the spoke restarted its cursor; that
   only changes *which* scenario it tries next, not the preserved best (restored
-  from §5.4) — but each re-try it avoids is a subproblem solve.
+  from §5.4). What survives is `best` (where the next epoch starts), the cycle
+  position and the direction: the first pass after a resume always begins a
+  new epoch, because the hub's nonants are new to the resumed run, and that
+  resets the tried set and the current scenario exactly as it does in an
+  uninterrupted run.
 - lagrangian / lagranger spokes use **no RNG**; their bound is deterministic given
   the hub's `W`. State to carry: `_PHIter`, `trivial_bound`, last `bound`, received
   `localWs`.
