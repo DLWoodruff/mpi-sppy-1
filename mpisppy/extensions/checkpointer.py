@@ -240,6 +240,12 @@ class Checkpointer(Extension):
         #: Likewise for the loop cursor, which moves independently of the
         #: incumbent -- most cursor moves do not improve on the best xhat.
         self._last_written_loop_progress = None
+        #: The incumbent objective whose write last failed. Without it a
+        #: failure retries on every pass of that same loop, rebuilding and
+        #: pickling the whole incumbent and printing a warning each time.
+        #: A cursor move alone does not retry either: the warning promises
+        #: the next improvement, and the cursor moves far more often.
+        self._last_failed_obj = None
 
         if not self.write_enabled:
             # Nothing below is about reading, and a restore-only run must not
@@ -746,9 +752,10 @@ class Checkpointer(Extension):
             return
 
         obj = getattr(self.opt, "best_solution_obj_val", None)
-        if obj is None:
+        if obj is None or obj == self._last_failed_obj:
             # Nothing to write yet: the file carries a solution, and the
-            # cursor rides along with it rather than on its own.
+            # cursor rides along with it rather than on its own. Or the last
+            # write of this incumbent failed; wait for a new one.
             return
         loop_state = spoke.checkpoint_loop_state()
         # Compared on the progress projection rather than the whole state.
@@ -771,6 +778,7 @@ class Checkpointer(Extension):
                 loop_state=loop_state,
                 class_count=self._class_ordinal_and_count()[1])
         except Exception as exc:
+            self._last_failed_obj = obj
             global_toc(
                 f"WARNING: this spoke could not write its incumbent "
                 f"({type(exc).__name__}); the run continues and the next "
