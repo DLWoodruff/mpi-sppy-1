@@ -1182,9 +1182,13 @@ as a branch stacked on the 1a PR.
   is. Implemented for `NormRhoUpdater`, `MultRhoUpdater`, `Dyn_Rho_extension_base`
   (so `sep_rho`/`sensi_rho`/`grad_rho` at once), `fixer`, `slammer`,
   `integer_relax_then_enforce`, `wtracker_extension` (the last `wlen + 1` W
-  sets, which its end-of-run report reads) and `primal_dual_converger`;
+  sets, which its end-of-run report reads) and `SepRho`'s cost coefficients
+  (read from the objective as written, which a resumed objective no longer
+  is). `Converger` has the same `checkpoint_stateless` declaration as
+  `Extension`, and all three shipped convergers make it:
   `norm_rho_converger` and `fracintsnotconv` recompute everything each
-  iteration and correctly have none.
+  iteration, and `primal_dual_converger`'s one piece of history, `prev_xbars`,
+  is what its constructor reads from the resumed models.
 
   **Restore runs at the end of `Iter0`, not in the resume branch**, and the
   ordering is the whole trick: extensions rebuild their bookkeeping from the
@@ -1208,7 +1212,10 @@ as a branch stacked on the 1a PR.
      after a resume**, with a bare `KeyError` out of `WTracker.W_diff`, which
      indexes a W history the resumed run did not have. The checkpoint now carries
      the three entries that call reads — not the whole tracker, which grows by one
-     entry per iteration.
+     entry per iteration. `--sep-rho` then crashed one line later, at its first
+     rho recompute: it reads its cost coefficients from the objective as the
+     user wrote it, and on a resumed model that objective holds W and the
+     quadratic prox. They now cross the checkpoint by scenario name.
   3. **`Fixer.populate` zeroed the very counts the dill had just restored.** §5.5
      says the fixer's `conv_iter_count` "rides in the dilled model for free"; it
      does, and then the fixer's own `post_iter0` hook — which runs on a resumed run
@@ -1244,7 +1251,8 @@ as a branch stacked on the 1a PR.
   `integer_relax_then_enforce` (on `sizes`, stopped once in each integrality
   state, with a probe extension recording what the subproblems looked like
   *during* the resumed leg's iterations — the end of the run cannot tell a
-  re-relaxed leg from a clean one) and `primal_dual_converger`, each asserting
+  re-relaxed leg from a clean one) and `primal_dual_converger` (stopping at
+  the uninterrupted run's iteration, with no warning), each asserting
   both bit-identity *and* the specific state by name, plus contract unit tests for the aggregation, the flattening,
   and a resume with a changed extension or converger set. Each fix was verified
   to be load-bearing by reverting it and watching the matching test fail.
