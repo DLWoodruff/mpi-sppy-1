@@ -495,6 +495,20 @@ class TestAFailedSpokeWriteIsNotRetriedEveryPass(unittest.TestCase):
                              msg="a new incumbent was not tried after an "
                                  "earlier write failed")
 
+    def test_a_failure_on_any_rank_is_reported_by_that_rank(self):
+        """Each rank writes its own file, so a failure on rank 1 is rank 1's
+        alone; a rank-0-only warning left it silent."""
+        from mpisppy.extensions import checkpointer as mod
+        ext = self._checkpointer()
+        ext.opt.cylinder_rank = 1
+        writer = mock.Mock(side_effect=OSError("disk full"))
+        with mock.patch.object(mod.ckpt, "write_spoke_incumbent", writer), \
+             mock.patch.object(mod, "global_toc") as toc:
+            ext._spoke_checkpoint()
+        (message, prints), _ = toc.call_args
+        self.assertIn("rank 1", message)
+        self.assertTrue(prints, msg="rank 1's failure was not printed")
+
 
 class TestEverySpokeGivenTheCheckpointerDrivesIt(unittest.TestCase):
     """cfg_vanilla attaches the Checkpointer in one place, and the spokes that

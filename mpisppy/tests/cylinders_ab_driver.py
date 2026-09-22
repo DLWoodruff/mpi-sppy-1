@@ -245,6 +245,7 @@ def main():
         if wheel.cylinder_rank == 0:
             with open(f"{out_path}.spoke{wheel.strata_rank}", "w") as f:
                 json.dump(marker, f)
+        marker["cylinder_rank"] = int(wheel.cylinder_rank)
         with open(f"{out_path}.cyl{wheel.strata_rank}"
                   f"rank{wheel.cylinder_rank:04d}", "w") as f:
             json.dump(marker, f)

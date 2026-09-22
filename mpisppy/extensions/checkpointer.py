@@ -119,7 +119,10 @@ all-reduced objective evaluation, so the ranks are already in step; the design
 deliberately keeps spokes uncoordinated with the hub and with each other
 (section 9, item 6). A spoke has no use for the cadence or deadline triggers
 either -- it already writes whenever it has something new to write -- so both
-are hub-only and a spoke simply ignores them.
+are hub-only and a spoke simply ignores them. Being in step about *when* to
+write does not make the files one incumbent, though: a write can fail on one
+rank. So the restore checks across the spoke's ranks that every file holds
+the same incumbent and cursor, and drops them on every rank if not.
 
 See ``doc/designs/checkpointing_design.md``.
 """
@@ -779,11 +782,14 @@ class Checkpointer(Extension):
                 class_count=self._class_ordinal_and_count()[1])
         except Exception as exc:
             self._last_failed_obj = obj
+            # Printed by the rank that failed, whichever it is: each rank
+            # writes its own file, so the failure is this rank's alone, and a
+            # rank-0-only warning left every other rank's failures silent.
             global_toc(
-                f"WARNING: this spoke could not write its incumbent "
-                f"({type(exc).__name__}); the run continues and the next "
-                f"improvement will try again.\n{exc}",
-                self.opt.cylinder_rank == 0)
+                f"WARNING: rank {self.opt.cylinder_rank} of this spoke could "
+                f"not write its incumbent ({type(exc).__name__}); the run "
+                f"continues and the next improvement will try again.\n{exc}",
+                True)
             return
         if path is None:
             return

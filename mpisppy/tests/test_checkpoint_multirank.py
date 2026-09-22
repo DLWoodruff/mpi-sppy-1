@@ -131,6 +131,20 @@ def _spoke_ranks(out_path, cylinder):
     return markers
 
 
+def _checkpointed_outer_bounds(ckpt_dir):
+    """Each hub rank's best_outer_bound in the published generation."""
+    generation = _published_generation(ckpt_dir)["generation"]
+    gen_dir = os.path.join(ckpt_dir, "hub", f"gen_{generation:04d}")
+    bounds = {}
+    for fname in os.listdir(gen_dir):
+        if fname.startswith("hub_rank_") and fname.endswith(".pkl") \
+                and "_scen_" not in fname:
+            with open(os.path.join(gen_dir, fname), "rb") as f:
+                bounds[int(fname[len("hub_rank_"):-len(".pkl")])] = \
+                    pickle.load(f)["best_outer_bound"]
+    return bounds
+
+
 def _published_generation(ckpt_dir):
     with open(os.path.join(ckpt_dir, "manifest.json")) as f:
         return json.load(f)
@@ -285,14 +299,24 @@ class _MultiRankABMixin:
                     f"is {want}")
 
     def test_bounds_stay_valid_after_a_resume(self):
+        """Read from the wheel, where the bounds live.
+
+        The hub's own best_solution_obj_val is never set on a PH hub -- the
+        incumbent arrives from a spoke as a bare number -- so comparing it
+        checked nothing on any case here.
+        """
+        checkpointed = _checkpointed_outer_bounds(self.ckpt_dir)
+        self.assertEqual(sorted(checkpointed), list(range(self.HUB_RANKS)))
         for snap in self.resumed:
-            bound = snap["best_bound_obj_val"]
-            incumbent = snap["best_solution_obj_val"]
-            if bound is not None and incumbent is not None:
-                self.assertLessEqual(
-                    bound, incumbent,
-                    msg=f"rank {snap['cylinder_rank']}: the restored best "
-                        f"bound crossed the incumbent")
+            rank = snap["cylinder_rank"]
+            self.assertLessEqual(
+                snap["BestOuterBound"], snap["BestInnerBound"],
+                msg=f"rank {rank}: the outer bound crossed the incumbent")
+            self.assertIsNotNone(checkpointed[rank])
+            self.assertGreaterEqual(
+                snap["BestOuterBound"], checkpointed[rank],
+                msg=f"rank {rank}: the resumed run ended with a weaker "
+                    f"outer bound than its checkpoint holds")
 
 
 @unittest.skipIf(not solver_available, "no solver is available")
@@ -409,9 +433,11 @@ class TestSizesMultiRankHub(_MultiRankABMixin, unittest.TestCase):
 
     Under default solver settings section 7 promises a valid *continuation*,
     not a reproduced trajectory, so the inherited comparison runs to a
-    tolerance here. What this case is really for is the things a MIP resume
-    can lose outright: the warm start that rode back in the dill, and an
-    incumbent that must never regress across the stop.
+    tolerance here. What this case is really for is what a MIP resume can
+    lose outright: the warm start that rode back in the dill, and the trivial
+    bound, which a resume must carry rather than recompute. It has no
+    incumbent to protect -- nothing runs an xhat spoke -- which is
+    TestFarmerMultiRankCylinders' job.
     """
 
     MODULE = _SIZES
@@ -419,17 +445,6 @@ class TestSizesMultiRankHub(_MultiRankABMixin, unittest.TestCase):
     BIT_IDENTICAL = False
     N = 3
     STOP = 1
-
-    def test_the_incumbent_does_not_regress_across_the_stop(self):
-        for stopped, resumed in zip(self.stopped, self.resumed):
-            before = stopped["best_solution_obj_val"]
-            after = resumed["best_solution_obj_val"]
-            if before is None or after is None:
-                continue
-            self.assertLessEqual(
-                after, before,
-                msg=f"rank {resumed['cylinder_rank']}: the resumed run "
-                    f"reports a worse incumbent than its checkpoint")
 
     def test_the_trivial_bound_is_carried_not_recomputed(self):
         """Resume skips iteration 0, so the bound has to come from the file.
@@ -457,17 +472,120 @@ class TestFarmerMultiRankCylinders(_MultiRankABMixin, unittest.TestCase):
 
     NP = 6
     HUB_RANKS = 2
+    #: Late enough that the Lagrangian bounds a restarted spoke re-finds are
+    #: weaker than the checkpointed one, so losing the hub's outer bound
+    #: across the resume fails the bound test.
+    N = 8
+    STOP = 6
     MODULE = _FARMER
     MODEL_ARGS = ("--num-scens", "6", "--default-rho", "1")
     SPOKE_ARGS = ("--lagrangian", "--xhatshuffle")
 
+    SPOKE_RANKS = 2
+
     def test_the_spoke_incumbent_survives_the_stop(self):
         """The best solution lives on the spoke, one file per spoke rank."""
-        spokes_dir = os.path.join(self.ckpt_dir, "spokes")
-        written = os.listdir(spokes_dir)
-        self.assertTrue(
-            any(f.startswith("spoke_XhatShuffleInnerBound") for f in written),
-            msg=f"the xhat spoke checkpointed no incumbent: {written}")
+        written = sorted(
+            f for f in os.listdir(os.path.join(self.ckpt_dir, "spokes"))
+            if f.startswith("spoke_XhatShuffleInnerBound"))
+        self.assertEqual(
+            [f[-len("rank_0000.pkl"):] for f in written],
+            [f"rank_{r:04d}.pkl" for r in range(self.SPOKE_RANKS)],
+            msg=f"expected one incumbent file per spoke rank: {written}")
+
+    def test_every_spoke_rank_restores_the_same_incumbent(self):
+        markers = _spoke_ranks(os.path.join(self._tmp.name, "B2.json"),
+                               "XhatShuffleInnerBound")
+        self.assertEqual([m["cylinder_rank"] for m in markers],
+                         list(range(self.SPOKE_RANKS)))
+        restored = {m["restored_incumbent_obj"] for m in markers}
+        self.assertEqual(len(restored), 1,
+                         msg=f"the spoke's ranks restored different "
+                             f"incumbents: {restored}")
+        self.assertIsNotNone(restored.pop(),
+                             msg="the spoke restored no incumbent")
+
+    def test_the_incumbent_does_not_regress_across_the_stop(self):
+        """Against the hub's inner bound, which is where the spoke's
+        incumbent arrives -- the hub's best_solution_obj_val is never set."""
+        restored = _spoke_ranks(
+            os.path.join(self._tmp.name, "B2.json"),
+            "XhatShuffleInnerBound")[0]["restored_incumbent_obj"]
+        for snap in self.resumed:
+            self.assertLessEqual(
+                snap["BestInnerBound"], restored,
+                msg=f"rank {snap['cylinder_rank']}: the resumed run reports "
+                    f"a worse incumbent than the one it restored")
+
+
+@unittest.skipIf(not solver_available, "no solver is available")
+@unittest.skipIf(not mpiexec_available, "mpiexec is not available")
+class TestTornSpokeIncumbentIsDropped(unittest.TestCase):
+    """A two-rank xhat spoke whose ranks' files hold different incumbents.
+
+    What one rank's failed write leaves behind. Restoring it put a different
+    best-so-far on each rank: they then published different numbers of
+    times, after which the hub rejected everything the spoke sent, or walked
+    different scenario orders and hung in the spoke's broadcast.
+    """
+
+    NP = 4  # a two-rank hub and a two-rank xhatshuffle spoke
+    MODEL_ARGS = ("--num-scens", "6", "--default-rho", "1")
+    SPOKE_ARGS = ("--xhatshuffle",)
+
+    @classmethod
+    def setUpClass(cls):
+        cls._tmp = tempfile.TemporaryDirectory()
+        cls.ckpt_dir = os.path.join(cls._tmp.name, "ckpt")
+        _run_leg(cls._tmp.name, "B1", cls.NP, _FARMER, cls.MODEL_ARGS,
+                 cls.SPOKE_ARGS, ("--max-iterations", "2",
+                                  "--checkpoint-dir", cls.ckpt_dir))
+        spokes = os.path.join(cls.ckpt_dir, "spokes")
+        rank1 = [f for f in os.listdir(spokes) if f.endswith("rank_0001.pkl")]
+        assert len(rank1) == 1, os.listdir(spokes)
+        path = os.path.join(spokes, rank1[0])
+        with open(path, "rb") as f:
+            state = pickle.load(f)
+        # An older, worse incumbent: what rank 1 still holds when its latest
+        # write failed and rank 0's succeeded.
+        state["best_solution_obj_val"] += 100.0
+        state["best_inner_bound"] += 100.0
+        with open(path, "wb") as f:
+            pickle.dump(state, f)
+        cls.result, cls.out_path = _run_leg(
+            cls._tmp.name, "B2", cls.NP, _FARMER, cls.MODEL_ARGS,
+            cls.SPOKE_ARGS, ("--max-iterations", "3",
+                             "--resume-from", cls.ckpt_dir),
+            check=False)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._tmp.cleanup()
+
+    def test_the_resume_finishes(self):
+        self.assertEqual(self.result.returncode, 0,
+                         msg=self.result.stdout[-4000:] +
+                             self.result.stderr[-4000:])
+
+    def test_it_says_why(self):
+        self.assertIn("checkpointed different incumbents",
+                      self.result.stdout)
+
+    def test_no_spoke_rank_restores_either_one(self):
+        markers = _spoke_ranks(self.out_path, "XhatShuffleInnerBound")
+        self.assertEqual(len(markers), 2)
+        for m in markers:
+            self.assertIsNone(
+                m["restored_incumbent_obj"],
+                msg=f"spoke rank {m['cylinder_rank']} restored an incumbent "
+                    f"the other rank does not hold")
+
+    def test_the_hub_still_hears_the_spoke(self):
+        """The failure this guards left the hub's inner bound at inf."""
+        for snap in _hub_ranks(self.out_path):
+            self.assertLess(snap["BestInnerBound"], float("inf"),
+                            msg=f"hub rank {snap['cylinder_rank']} never "
+                                f"received an incumbent from the spoke")
 
 
 @unittest.skipIf(not solver_available, "no solver is available")
