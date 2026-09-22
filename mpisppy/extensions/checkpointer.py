@@ -122,7 +122,8 @@ either -- it already writes whenever it has something new to write -- so both
 are hub-only and a spoke simply ignores them. Being in step about *when* to
 write does not make the files one incumbent, though: a write can fail on one
 rank. So the restore checks across the spoke's ranks that every file holds
-the same incumbent and cursor, and drops them on every rank if not.
+the same incumbent, drops it on every rank if not, and otherwise gives every
+rank rank 0's cursor.
 
 See ``doc/designs/checkpointing_design.md``.
 """
@@ -384,11 +385,14 @@ class Checkpointer(Extension):
                 generation=int(getattr(self.opt, "_PHIter", 0)),
                 class_count=self._class_ordinal_and_count()[1])
         except Exception as exc:
+            # By the rank that failed, as for the xhat spokes: each rank
+            # writes its own file, so the failure is this rank's alone.
             global_toc(
-                f"WARNING: this cylinder could not write its dual weights "
-                f"({type(exc).__name__}); the run continues and the next "
-                f"iteration will try again.\n{exc}",
-                self.opt.cylinder_rank == 0)
+                f"WARNING: rank {self.opt.cylinder_rank} of this cylinder "
+                f"could not write its dual weights ({type(exc).__name__}); "
+                f"the run continues and the next iteration will try "
+                f"again.\n{exc}",
+                True)
 
     def _spoke_identity(self):
         """(cylinder name, ordinal among cylinders of that class).
