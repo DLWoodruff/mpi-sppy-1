@@ -611,7 +611,9 @@ class TestResumeABFarmer(unittest.TestCase):
         hub = os.path.join(self.ckpt_dir, "hub")
         enospc = OSError(errno.ENOSPC, "No space left on device")
         with mock.patch.object(checkpointing, fail_in, side_effect=enospc):
-            with self.assertRaises(OSError):
+            # OSError from rank 0's publish; a failure while staging is
+            # agreed across ranks and re-raised as RuntimeError.
+            with self.assertRaises((OSError, RuntimeError)):
                 checkpointing.write_checkpoint(opt, self.ckpt_dir,
                                                self.STOP + 1)
         self.assertEqual(sorted(os.listdir(hub)), [f"gen_{self.STOP:04d}"])
@@ -642,15 +644,16 @@ class TestResumeABFarmer(unittest.TestCase):
         os.makedirs(os.path.join(hub, f"gen_{self.STOP + 1:04d}.tmp"))
         os.makedirs(os.path.join(hub, f"gen_{self.STOP + 1:04d}"))
         seen = []
-        real = checkpointing._stage_and_publish
+        real = checkpointing._write_models
 
         def spy(*args, **kwargs):
             seen.append(sorted(os.listdir(hub)))
             return real(*args, **kwargs)
 
-        with mock.patch.object(checkpointing, "_stage_and_publish", spy):
+        with mock.patch.object(checkpointing, "_write_models", spy):
             checkpointing.write_checkpoint(opt, self.ckpt_dir, self.STOP + 2)
-        self.assertEqual(seen, [[f"gen_{self.STOP:04d}"]])
+        self.assertEqual(seen, [[f"gen_{self.STOP:04d}",
+                                 f"gen_{self.STOP + 2:04d}.tmp"]])
 
     def test_failure_keeps_the_retired_copy_the_manifest_depends_on(self):
         """After a kill between the publishing renames, the manifest's
@@ -664,7 +667,9 @@ class TestResumeABFarmer(unittest.TestCase):
         enospc = OSError(errno.ENOSPC, "No space left on device")
         with mock.patch.object(checkpointing, "_fsync_dir",
                                side_effect=enospc):
-            with self.assertRaises(OSError):
+            # OSError from rank 0's publish; a failure while staging is
+            # agreed across ranks and re-raised as RuntimeError.
+            with self.assertRaises((OSError, RuntimeError)):
                 checkpointing.write_checkpoint(opt, self.ckpt_dir,
                                                self.STOP + 1)
         self.assertEqual(sorted(os.listdir(hub)),
@@ -1057,10 +1062,15 @@ class TestSetupRefusals(unittest.TestCase):
             opt._restore_from_checkpoint_if_resuming()
         self.assertIn("not implemented", str(ctx.exception))
 
-    def test_multirank_is_refused_at_setup(self):
-        with self.assertRaises(RuntimeError) as ctx:
-            Checkpointer(self._stub(n_proc=2))
-        self.assertIn("single rank", str(ctx.exception))
+    def test_multirank_is_accepted_at_setup(self):
+        """Phase 2 removed the single-rank refusal.
+
+        Only the setup gate is checked here -- a real multi-rank write needs
+        real ranks, which `test_checkpoint_multirank.py` supplies under
+        mpiexec. This is what keeps the refusal from creeping back in.
+        """
+        ckpt = Checkpointer(self._stub(n_proc=2))
+        self.assertTrue(ckpt.write_enabled)
 
     def test_unwritable_directory_is_refused_at_setup(self):
         stub = self._stub()
