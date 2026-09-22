@@ -1320,6 +1320,44 @@ def load_spoke_incumbent(opt, ckpt_dir, cylinder, ordinal):
     return state
 
 
+def agree_on_spoke_incumbent(opt, state):
+    """Keep a loaded spoke incumbent only if every rank loaded the same one.
+
+    Each rank of a spoke writes its own file, so a write that fails on one
+    rank (a full disk on one node, an objective the write refuses) or a kill
+    between the ranks' renames leaves files from different incumbents. The
+    ranks stay in step only because each compares the same all-reduced
+    candidate objective against the same best-so-far; restore different
+    best-so-far values and they reach different verdicts, publish different
+    numbers of times -- after which the hub rejects everything the spoke
+    sends -- or walk different scenario orders into a collective and hang.
+
+    Returns ``(state, reason)``: the state unchanged when every rank has a
+    file and they all carry the same objective and inner bound; ``(None,
+    None)`` when no rank has one; otherwise ``(None, reason)`` on every rank.
+    Dropping it is safe because the file is an optimization: the spoke starts
+    without an incumbent, as it would with no checkpoint.
+
+    Collective: every rank of the cylinder must call it.
+    """
+    comm = _cylinder_comm(opt)
+    if comm is None:
+        return state, None
+    mine = None if state is None else (state["best_solution_obj_val"],
+                                       state["best_inner_bound"])
+    everyone = comm.allgather(mine)
+    if all(v is None for v in everyone):
+        return None, None
+    if None not in everyone and len(set(everyone)) == 1:
+        return state, None
+    missing = [rank for rank, v in enumerate(everyone) if v is None]
+    held = {v for v in everyone if v is not None}
+    reason = f"the files hold (objective, inner bound) {sorted(held, key=str)}"
+    if missing:
+        reason = f"rank(s) {missing} have no file; {reason}"
+    return None, reason
+
+
 def restore_spoke_incumbent(opt, state):
     """Rebuild ``best_solution_cache`` on this spoke's models from a loaded
     state, by variable name. Returns the incumbent objective value.

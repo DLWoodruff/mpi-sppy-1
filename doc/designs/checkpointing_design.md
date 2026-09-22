@@ -890,7 +890,15 @@ Touch-points an implementation needs beyond the PoC's extension/subclass hacks:
    The *spoke* incumbent write stays uncoordinated (item 6). Each rank writes
    only its own file, and the incumbent objective that gates the write comes
    from an all-reduced objective evaluation, so the ranks are already in step
-   without a barrier.
+   without a barrier. In step about *when* is not the same as one incumbent,
+   though: a write can fail on one rank, or a kill can land between the
+   ranks' renames, leaving files from different incumbents. The restore
+   therefore allgathers each rank's (objective, inner bound) and keeps the
+   incumbent only if every rank has a file and they all match; otherwise every
+   rank drops it (`agree_on_spoke_incumbent`). Restoring a different
+   best-so-far on each rank makes the ranks reach different verdicts on the
+   same candidate, after which the hub rejects everything the spoke sends or
+   the spoke hangs in its own broadcast.
 8. **A `Checkpointer` extension** that writes on its active triggers; restore
    itself is the in-core resume branch (item 2), with extension
    `restore_state` hooks (item 3) fired from it before `iterk_loop`:

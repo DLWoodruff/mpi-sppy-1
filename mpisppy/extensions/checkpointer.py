@@ -106,7 +106,10 @@ The *spoke* incumbent write needs none of that. Each rank writes only its own
 file, and the incumbent objective that gates the write comes from an
 all-reduced objective evaluation, so the ranks are already in step; the design
 deliberately keeps spokes uncoordinated with the hub and with each other
-(section 9, item 6).
+(section 9, item 6). Being in step about *when* to write does not make the
+files one incumbent, though: a write can fail on one rank. So the restore
+checks across the spoke's ranks that every file holds the same incumbent, and
+drops it on every rank if not.
 
 See ``doc/designs/checkpointing_design.md``.
 """
@@ -301,6 +304,16 @@ class Checkpointer(Extension):
             lambda: ckpt.load_spoke_incumbent(self.opt, resume_from,
                                               cylinder, ordinal),
             "read their checkpointed incumbent, so none of them restores one")
+        # Collective, and the only check across ranks of *what* was read:
+        # the agreement above is only on whether a read raised.
+        state, disagreement = ckpt.agree_on_spoke_incumbent(self.opt, state)
+        if disagreement is not None:
+            global_toc(
+                f"WARNING: the ranks of {cylinder} do not hold the same "
+                f"checkpointed incumbent ({disagreement}), so this spoke "
+                f"starts without one rather than with a different one on "
+                f"each rank.", rank0)
+            return
         if state is not None:
             # The ordinal is stable when an unrelated cylinder comes or goes,
             # but not when one of two same-class spokes does: the survivor's
@@ -535,11 +548,14 @@ class Checkpointer(Extension):
                 class_count=self._class_ordinal_and_count()[1])
         except Exception as exc:
             self._last_failed_obj = obj
+            # Printed by the rank that failed, whichever it is: each rank
+            # writes its own file, so the failure is this rank's alone, and a
+            # rank-0-only warning left every other rank's failures silent.
             global_toc(
-                f"WARNING: this spoke could not write its incumbent "
-                f"({type(exc).__name__}); the run continues and the next "
-                f"improvement will try again.\n{exc}",
-                self.opt.cylinder_rank == 0)
+                f"WARNING: rank {self.opt.cylinder_rank} of this spoke could "
+                f"not write its incumbent ({type(exc).__name__}); the run "
+                f"continues and the next improvement will try again.\n{exc}",
+                True)
             return
         if path is None:
             return
