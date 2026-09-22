@@ -233,6 +233,31 @@ def _model_filename(rank, sname):
     return f"hub_rank_{rank:04d}_scen_{sanitize_for_filename(sname)}.dill"
 
 
+_SPOKE_FILE_RE = re.compile(r"^spoke_(.+)_ordinal_(\d+)_rank_\d+\.pkl$")
+
+
+def unclaimed_spoke_files(opt, ckpt_dir, claimed):
+    """The (cylinder, ordinal) pairs with a file in the checkpoint that no
+    cylinder of this run will read, sorted.
+
+    ``claimed`` is the set of (cylinder class name, ordinal) this run
+    carries. A spoke that is dropped on resume leaves its file behind, and
+    with it whatever it held -- an incumbent that may be the study's best, or
+    a dual cylinder's W -- and the spoke that would have said so is the one
+    that is not there. ``opt`` is the hub's, and unused: it is the first
+    argument so this reads like every other restore step.
+    """
+    spokes_dir = os.path.join(ckpt_dir, SPOKES_SUBDIR)
+    if not os.path.isdir(spokes_dir):
+        return []
+    found = set()
+    for name in os.listdir(spokes_dir):
+        match = _SPOKE_FILE_RE.match(name)
+        if match:
+            found.add((match.group(1), int(match.group(2))))
+    return sorted(found - set(claimed))
+
+
 def _spoke_filename(cylinder, ordinal, rank):
     """One file per spoke per rank.
 
@@ -1544,11 +1569,14 @@ def restore_spoke_incumbent(opt, state):
 # which is what a cylinder nobody synchronizes with needs.
 # ---------------------------------------------------------------------------
 
-def dual_spoke_state(opt, cylinder, ordinal, generation, class_count=None):
+def dual_spoke_state(opt, cylinder, ordinal, generation, class_count=None,
+                     wbar=None):
     """The dict written by ``write_dual_spoke_state``.
 
     W is keyed by ``(ndn, i)`` and the values by variable name -- the two
     keyings the rest of this module uses, and neither of them an identity.
+    ``wbar`` is E[W] per node at the time of the write (``Wbar_by_node``),
+    which the restore checks the restored weights reproduce.
     """
     duals = {}
     for sname, s in opt.local_scenarios.items():
@@ -1576,19 +1604,21 @@ def dual_spoke_state(opt, cylinder, ordinal, generation, class_count=None):
         "generation": int(generation),
         "geometry": geometry(opt),
         "structural_fingerprint": structural_fingerprint(opt.options),
+        "Wbar": None if wbar is None else {
+            ndn: [float(v) for v in values] for ndn, values in wbar.items()},
         "duals": duals,
     }
 
 
 def write_dual_spoke_state(opt, ckpt_dir, cylinder, ordinal, generation,
-                           class_count=None):
+                           class_count=None, wbar=None):
     """Write this cylinder's PH state, latest-wins. Returns the path.
 
     Temp-then-rename like every other file here, so a kill mid-write leaves
     the previous iteration's state intact rather than a truncated file.
     """
     state = dual_spoke_state(opt, cylinder, ordinal, generation,
-                             class_count=class_count)
+                             class_count=class_count, wbar=wbar)
     spokes_dir = os.path.join(ckpt_dir, SPOKES_SUBDIR)
     os.makedirs(spokes_dir, exist_ok=True)
     path = os.path.join(
@@ -1672,81 +1702,76 @@ def restore_dual_spoke_state(opt, state):
                 var._value = by_name[var.name]
 
 
-#: How far E[W] may stray from zero, as a fraction of the size of the weights
-#: being summed (E[|W|]). PH's dual feasibility is exact in arithmetic and
-#: approximate in floating point: accumulating sums of numbers of size M
-#: strays by a small multiple of machine epsilon times M, which is around
-#: 1e-16 relative and grows slowly with the number of scenarios and
-#: iterations behind the weights. A million times that leaves the drift of
-#: even a very long run far inside, while a file that is stale, truncated or
-#: from another model is off by a visible fraction of its own weights --
-#: measured at 1.7e-3 of them for a one-scenario perturbation on farmer.
-DUAL_FEASIBILITY_RTOL = 1e-6
+#: How far the restored E[W] may stray from the E[W] recorded with the file,
+#: as a fraction of the size of the weights being summed (E[|W|]). The two are
+#: sums of the same numbers with the same probabilities, so in practice they
+#: agree exactly; the tolerance is only there so that a difference in the
+#: order of accumulation is never a refusal. A file that was edited, or
+#: probabilities that changed, are off by a visible fraction of the weights.
+RESTORED_WBAR_RTOL = 1e-6
 
 
-def require_restored_duals_sum_to_zero(opt, cylinder, generation):
-    """Refuse restored dual weights that are not a dual-feasible point.
-
-    PH keeps ``sum_s p_s W_s = 0``: the weights live in the orthogonal
-    complement of the nonanticipativity subspace, and that is exactly the
-    property a Lagrangian bound computed from them relies on -- with weights
-    that do not sum to zero, the "bound" is not one. A bad bound is worse
-    than a missing one here, because the hub keeps the best it has ever been
-    told and never revisits it.
+def require_restored_duals_match_their_file(opt, cylinder, generation,
+                                            recorded):
+    """Refuse restored dual weights that are not the ones the file recorded.
 
     The rest of this cylinder's restore checks that the file describes this
     model: its format, its fingerprint, this rank's scenario names, that
     every nonant has a weight, and that every rank restored the same
-    iteration. None of that looks at the numbers. This does, and it is the
-    same check ``wxbarutils.set_W_from_file`` has always made of the other
-    way of putting weights on a model from a file (``--init-W-fname``).
+    iteration. None of that looks at the numbers, and the numbers become
+    another cylinder's Lagrangian bound, which the hub keeps as best-so-far.
+    This recomputes E[W] per node from the restored models and compares it
+    with the E[W] the writing run computed from the same weights.
+
+    Not a check that E[W] is zero. PH keeps it at zero only when rho is the
+    same in every scenario (see ``phbase.Wbar_by_node``); with a
+    scenario-dependent rho the weights an uninterrupted run publishes do not
+    sum to zero either, and a resume has no business refusing what the run it
+    continues was doing. What a resume must not do is publish weights other
+    than the ones it was checkpointed with.
 
     Collective: the sum spans the scenarios of a tree node and so the ranks
-    of the cylinder (see ``phbase.Wbar_by_node``). Every rank computes the
-    same sums and therefore makes the same refusal.
-
-    The tolerance is deliberately generous -- ``E1_tolerance`` plus
-    ``DUAL_FEASIBILITY_RTOL`` of the size of the weights being summed. This
-    exists to catch a file that does not hold this study's duals, not to
-    audit anyone's arithmetic, and a resume wrongly refused is worse than the
-    drift it would be refused for.
+    of the cylinder. Every rank computes the same sums and so makes the same
+    refusal.
     """
     # Here rather than at module scope: phbase imports this module.
     from mpisppy.phbase import Wbar_by_node, W_magnitude_by_node
 
-    # Judged against the size of the weights, not against zero: what counts
-    # as dust in a sum depends on what was summed, and weights an order of
-    # magnitude apart are ordinary across models. A fixed absolute threshold
-    # would refuse a long run on a large-cost model for its own rounding.
     bars = Wbar_by_node(opt)
     sizes = W_magnitude_by_node(opt)
+    if recorded is None or set(recorded) != set(bars):
+        raise CheckpointMismatch(
+            f"The dual weights file {cylinder} wrote at its iteration "
+            f"{generation} does not record E[W] for this model's tree nodes "
+            f"({sorted(bars)}), so its weights cannot be checked. Remove the "
+            f"file to start this cylinder from W = 0.")
 
     worst = None
     for ndn, Wbars in bars.items():
         for i, Wbar in enumerate(Wbars):
+            want = float(recorded[ndn][i])
             size = float(sizes[ndn][i])
-            tolerance = opt.E1_tolerance + DUAL_FEASIBILITY_RTOL * size
-            excess = abs(float(Wbar)) / tolerance
+            tolerance = opt.E1_tolerance + RESTORED_WBAR_RTOL * size
+            excess = abs(float(Wbar) - want) / tolerance
             if worst is None or excess > worst[0]:
-                worst = (excess, float(Wbar), size, tolerance, ndn, i)
+                worst = (excess, float(Wbar), want, size, tolerance, ndn, i)
 
     if worst is not None and worst[0] > 1.0:
-        _, Wbar, size, tolerance, ndn, i = worst
+        _, Wbar, want, size, tolerance, ndn, i = worst
         raise CheckpointMismatch(
             f"The dual weights restored for {cylinder} from the checkpoint "
-            f"it wrote at its iteration {generation} do not sum to zero over "
-            f"the scenarios: at '{_nonant_name(opt, ndn, i)}' the "
-            f"probability-weighted sum is {Wbar:.6e}, against a tolerance of "
-            f"{tolerance:.3e} -- E1_tolerance ({opt.E1_tolerance:.1e}) plus "
-            f"{DUAL_FEASIBILITY_RTOL:.0e} of the size of the weights summed "
-            f"there ({size:.6e}). PH maintains sum_s p_s W_s = 0, so these "
-            f"are not the weights of a run of this model -- the file has "
-            f"been changed or truncated, or the scenario probabilities have. "
-            f"A Lagrangian bound computed from them would not be a bound, "
-            f"and the hub keeps the best bound it is ever told, so this "
-            f"refuses rather than resumes. Remove the file to start this "
-            f"cylinder from W = 0, or resume from a checkpoint this model "
-            f"wrote."
+            f"it wrote at its iteration {generation} are not the ones that "
+            f"file was written with: at '{_nonant_name(opt, ndn, i)}' the "
+            f"probability-weighted sum of the restored weights is "
+            f"{Wbar:.6e}, and the file recorded {want:.6e}, against a "
+            f"tolerance of {tolerance:.3e} -- E1_tolerance "
+            f"({opt.E1_tolerance:.1e}) plus {RESTORED_WBAR_RTOL:.0e} of the "
+            f"size of the weights summed there ({size:.6e}). The file has "
+            f"been changed, or the scenario probabilities have. A Lagrangian "
+            f"bound computed from them would not be the study's, and the hub "
+            f"keeps the best bound it is ever told, so this refuses rather "
+            f"than resumes. Remove the file to start this cylinder from "
+            f"W = 0."
         )
 
 

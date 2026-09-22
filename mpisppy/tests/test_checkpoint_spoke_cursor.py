@@ -81,45 +81,37 @@ class TestScenarioCyclerState(unittest.TestCase):
         self.assertEqual(restored.checkpoint_state(), saved)
 
     def test_a_restored_cycler_continues_where_the_other_left_off(self):
-        """The property that matters: the same scenarios come next.
+        """The property that matters, in the order the loop makes the calls.
 
-        Comparing the saved dict to itself only proves the fields round-trip.
-        This proves the cursor still *means* the same thing -- that the
-        resumed spoke tries what the uninterrupted one would have tried next,
-        rather than starting the walk again.
+        The xhatshuffle loop begins a new epoch whenever the hub sends new
+        nonants, and the first pass after a resume always has new ones, so a
+        restore is always followed by ``begin_epoch`` before ``get_next``.
+        That resets the tried set and the current scenario; what carries over
+        is ``best`` (where the epoch starts), the cycle position and the
+        direction. So the comparison is of what comes after ``begin_epoch``
+        -- and against a fresh cycler too, which would pass a comparison that
+        a restore doing nothing also passes.
         """
+        def walk(cycler):
+            cycler.begin_epoch()
+            return [cycler.get_next() for _ in range(len(self.NAMES))]
+
         uninterrupted = _cycler(self.NAMES)
         for _ in range(2):
             uninterrupted.get_next()
+        uninterrupted.best = "scen3"
+        saved = uninterrupted.checkpoint_state()
 
         resumed = _cycler(self.NAMES)
-        resumed.restore_state(_cycler_after(self.NAMES, 2))
+        self.assertEqual(resumed.restore_state(saved), [])
+        fresh = _cycler(self.NAMES)
+        fresh.best = "scen3"
 
-        for _ in range(len(self.NAMES)):
-            self.assertEqual(resumed.get_next(), uninterrupted.get_next())
-
-    def test_the_tried_set_survives_so_scenarios_are_not_re_tried(self):
-        """`get_next` returns None once the epoch is exhausted.
-
-        A resumed spoke that forgot which scenarios it had tried would hand
-        them all back a second time -- a subproblem solve each, for candidates
-        already known to be no better.
-        """
-        cycler = _cycler(self.NAMES)
-        tried = []
-        while True:
-            nxt = cycler.get_next()
-            if nxt is None:
-                break
-            tried.append(nxt["ROOT"])
-        self.assertEqual(len(tried), len(self.NAMES))
-
-        restored = _cycler(self.NAMES)
-        restored.restore_state(cycler.checkpoint_state())
-        self.assertIsNone(
-            restored.get_next(),
-            msg="the resumed cycler offered a scenario the checkpointed one "
-                "had already tried this epoch")
+        want = walk(uninterrupted)
+        self.assertEqual(walk(resumed), want)
+        self.assertNotEqual(walk(fresh), want,
+                            msg="a fresh cycler walks the same way, so this "
+                                "cannot tell a restore from none")
 
     def test_the_best_scenario_survives(self):
         """`best` decides where the next epoch starts, so it is trajectory."""
@@ -304,15 +296,19 @@ class TestSpokeWritesWhenTheCursorMoves(unittest.TestCase):
             self.assertIsNone(pickle.load(f)["loop_state"])
 
 
-class TestRestoredDualsMustSumToZero(unittest.TestCase):
-    """A dual cylinder's restored W has to be a dual point.
+class TestRestoredDualsMustMatchTheirFile(unittest.TestCase):
+    """A dual cylinder's restored W has to be the W its file was written with.
 
     Every other check on that file asks whether it describes this model --
     its fingerprint, this rank's scenario names, a weight for every nonant.
     None of them looks at the numbers, and the numbers are what another
-    cylinder turns into a Lagrangian bound: with weights that do not satisfy
-    sum_s p_s W_s = 0 that bound is not a bound, and the hub keeps the best
-    bound it is ever told.
+    cylinder turns into a Lagrangian bound, which the hub keeps as
+    best-so-far. So the file records E[W] as the writing run computed it, and
+    the restore recomputes it from the restored models.
+
+    It used to require E[W] = 0 instead, which PH keeps only when rho is the
+    same in every scenario: with a scenario-dependent rho the run that wrote
+    the file finished normally and its resume was refused, blaming the file.
 
     No solver and no mpiexec: PH_Prep attaches W, and setting it by hand is
     exactly the state a restore leaves behind.
@@ -341,34 +337,45 @@ class TestRestoredDualsMustSumToZero(unittest.TestCase):
             for ndn_i in s._mpisppy_data.nonant_indices:
                 s._mpisppy_model.W[ndn_i]._value = per_scenario[sname]
 
-    def test_weights_that_sum_to_zero_are_accepted(self):
-        """Equal probabilities, so these three average to zero."""
+    def _recorded(self, opt, per_scenario):
+        """What the writing run would have recorded for these weights."""
+        from mpisppy.phbase import Wbar_by_node
+        self._set_W(opt, per_scenario)
+        return Wbar_by_node(opt)
+
+    def _check(self, opt, recorded, generation=7):
+        checkpointing.require_restored_duals_match_their_file(
+            opt, self.CYLINDER, generation, recorded)
+
+    def test_the_weights_the_file_recorded_are_accepted(self):
         opt = self._prepped_ph()
-        self._set_W(opt, {"scen0": 10.0, "scen1": -4.0, "scen2": -6.0})
-        checkpointing.require_restored_duals_sum_to_zero(
-            opt, self.CYLINDER, 7)
+        recorded = self._recorded(opt, {"scen0": 10.0, "scen1": -4.0,
+                                        "scen2": -6.0})
+        self._check(opt, recorded)
 
-    def test_all_zero_weights_are_accepted(self):
-        """What a cylinder that found no file starts from."""
+    def test_weights_that_do_not_sum_to_zero_are_accepted_if_recorded(self):
+        """What PH produces with a scenario-dependent rho, and what the
+        uninterrupted run was publishing too."""
         opt = self._prepped_ph()
-        self._set_W(opt, {"scen0": 0.0, "scen1": 0.0, "scen2": 0.0})
-        checkpointing.require_restored_duals_sum_to_zero(
-            opt, self.CYLINDER, 0)
+        recorded = self._recorded(opt, {"scen0": 10.0, "scen1": -4.0,
+                                        "scen2": -5.0})
+        self.assertTrue(any(abs(v) > 0.1 for a in recorded.values()
+                            for v in a),
+                        msg="these weights were meant not to sum to zero")
+        self._check(opt, recorded)
 
-    def test_weights_that_do_not_sum_to_zero_are_refused(self):
-        """The same number in every scenario is the clearest violation.
-
-        The message has to name the cylinder, the iteration the file was
+    def test_weights_other_than_the_recorded_ones_are_refused(self):
+        """The message has to name the cylinder, the iteration the file was
         written at and a variable, because what it is reporting is a file on
-        disk rather than anything in the run that reads it.
-        """
+        disk rather than anything in the run that reads it."""
         opt = self._prepped_ph()
+        recorded = self._recorded(opt, {"scen0": 10.0, "scen1": -4.0,
+                                        "scen2": -6.0})
         self._set_W(opt, {"scen0": 10.0, "scen1": -4.0, "scen2": -5.0})
         with self.assertRaises(checkpointing.CheckpointMismatch) as ctx:
-            checkpointing.require_restored_duals_sum_to_zero(
-                opt, self.CYLINDER, 7)
+            self._check(opt, recorded)
         message = str(ctx.exception)
-        self.assertIn("do not sum to zero", message)
+        self.assertIn("not the ones that file was written with", message)
         self.assertIn(self.CYLINDER, message)
         self.assertIn("iteration 7", message)
         self.assertIn("DevotedAcreage", message)
@@ -377,43 +384,32 @@ class TestRestoredDualsMustSumToZero(unittest.TestCase):
         self.assertIn("E1_tolerance", message)
         self.assertIn("size of the weights", message)
 
-    def test_a_violation_within_the_absolute_floor_is_accepted(self):
-        """Not exact arithmetic: the sums are accumulated in floating point."""
+    def test_a_file_that_recorded_nothing_is_refused(self):
         opt = self._prepped_ph()
+        self._set_W(opt, {"scen0": 0.0, "scen1": 0.0, "scen2": 0.0})
+        with self.assertRaises(checkpointing.CheckpointMismatch):
+            self._check(opt, None)
+
+    def test_a_difference_within_the_absolute_floor_is_accepted(self):
+        opt = self._prepped_ph()
+        recorded = self._recorded(opt, {"scen0": 10.0, "scen1": -5.0,
+                                        "scen2": -5.0})
         slack = opt.E1_tolerance / 2
         self._set_W(opt, {"scen0": 10.0, "scen1": -5.0,
                           "scen2": -5.0 + 3 * slack})
-        checkpointing.require_restored_duals_sum_to_zero(
-            opt, self.CYLINDER, 7)
+        self._check(opt, recorded)
 
-    def test_drift_that_is_tiny_beside_the_weights_is_accepted(self):
-        """The reason the tolerance is not a fixed absolute number.
-
-        Weights of 1e9 are ordinary on a large-cost model, and accumulating
-        sums of numbers that size strays by far more than E1_tolerance for
-        no reason but arithmetic. Judged against zero this run would be
-        refused a resume it has every right to; judged against the size of
-        its own weights the drift is 12 orders of magnitude inside.
-        """
+    def test_a_difference_that_scales_with_the_weights_is_refused(self):
+        """Judged against the size of the weights, so a fraction of large
+        weights is refused and float dust beside them is not."""
         opt = self._prepped_ph()
-        drift = 1e-3                     # 100x the absolute floor
-        self._set_W(opt, {"scen0": 1e9, "scen1": -5e8,
-                          "scen2": -5e8 + 3 * drift})
-        checkpointing.require_restored_duals_sum_to_zero(
-            opt, self.CYLINDER, 7)
-
-    def test_a_violation_that_scales_with_the_weights_is_still_refused(self):
-        """And the reason it is a fraction rather than a free pass.
-
-        The same weights as above, thrown off by a ten-thousandth of
-        themselves -- the scale a stale or edited file is wrong by.
-        """
-        opt = self._prepped_ph()
+        recorded = self._recorded(opt, {"scen0": 1e9, "scen1": -5e8,
+                                        "scen2": -5e8})
+        self._set_W(opt, {"scen0": 1e9, "scen1": -5e8, "scen2": -5e8 + 3e-3})
+        self._check(opt, recorded)
         self._set_W(opt, {"scen0": 1e9, "scen1": -5e8, "scen2": -5e8 + 3e5})
-        with self.assertRaises(checkpointing.CheckpointMismatch) as ctx:
-            checkpointing.require_restored_duals_sum_to_zero(
-                opt, self.CYLINDER, 7)
-        self.assertIn("do not sum to zero", str(ctx.exception))
+        with self.assertRaises(checkpointing.CheckpointMismatch):
+            self._check(opt, recorded)
 
 
 if __name__ == "__main__":

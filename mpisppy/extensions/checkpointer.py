@@ -312,12 +312,24 @@ class Checkpointer(Extension):
         the cost of one solve round that a resumed run throws away.
         """
         if not self.dual_spoke_mode:
+            if not self.spoke_mode:
+                self._report_unclaimed_spoke_files()
             return
         resume_from = self.opt.options.get("resume_from", None)
         if not resume_from:
             return
         cylinder, ordinal = self._spoke_identity()
         rank0 = self.opt.cylinder_rank == 0
+        # Only W crosses the checkpoint for a dual cylinder. Its own
+        # extensions -- --grad-rho on --ph-dual, say -- are rebuilt fresh,
+        # and a stateful one then does not retrace the uninterrupted run.
+        others = sorted(name for name, _ in ckpt._extension_objects(self.opt)
+                        if name != type(self).__name__)
+        if others:
+            global_toc(
+                f"WARNING: {cylinder} carries only its dual weights across a "
+                f"checkpoint; its own extensions ({', '.join(others)}) start "
+                f"fresh on this resumed run.", rank0)
         # Collective, for the reason given at the xhat spoke's load.
         state = ckpt.run_agreed(
             self.opt,
@@ -357,14 +369,43 @@ class Checkpointer(Extension):
             "put their checkpointed dual weights back on their models, so "
             "none of them restores any")
         # What every check up to here asks is whether the file describes this
-        # model. This asks whether what it holds is a dual point at all: the
-        # weights this cylinder is about to publish become another cylinder's
-        # Lagrangian bound, which is only a bound when they sum to zero.
-        ckpt.require_restored_duals_sum_to_zero(self.opt, cylinder,
-                                                state["generation"])
+        # model. This asks whether the weights now on the models are the ones
+        # the file was written with: they become another cylinder's
+        # Lagrangian bound, which the hub keeps as best-so-far.
+        ckpt.require_restored_duals_match_their_file(
+            self.opt, cylinder, state["generation"], state["Wbar"])
         self.restored_dual_generation = state["generation"]
         global_toc(f"Restored the checkpointed dual weights for {cylinder} "
                    f"(written at its iteration {state['generation']})", rank0)
+
+    def _report_unclaimed_spoke_files(self):
+        """On the hub of a resumed run: name every spoke file nobody reads.
+
+        The spoke that would report its own file is the one that was dropped,
+        so it falls to the hub. Agreed like every other restore step: the
+        listing is this rank's own file handling, and the hub's next step is
+        collective.
+        """
+        resume_from = self.opt.options.get("resume_from", None)
+        if not resume_from:
+            return
+        communicators = getattr(getattr(self.opt, "spcomm", None),
+                                "communicators", None) or []
+        names = [d["spcomm_class"].__name__ for d in communicators]
+        claimed = {(name, names[:i].count(name))
+                   for i, name in enumerate(names) if i > 0}
+        unclaimed = ckpt.run_agreed(
+            self.opt,
+            lambda: ckpt.unclaimed_spoke_files(self.opt, resume_from,
+                                               claimed),
+            "list the spoke files in the checkpoint, so none of them resumes")
+        for cylinder, ordinal in unclaimed:
+            global_toc(
+                f"WARNING: the checkpoint in {resume_from} holds a file for "
+                f"{cylinder} (ordinal {ordinal}), and no such cylinder runs "
+                f"in this resume, so what it held is not restored. If it held "
+                f"the study's best incumbent, this run starts from a worse "
+                f"one.", self.opt.cylinder_rank == 0)
 
     def _dual_spoke_checkpoint(self):
         """Write W at the end of a completed iteration of this cylinder.
@@ -378,12 +419,18 @@ class Checkpointer(Extension):
         """
         if not self.write_enabled:
             return
+        # Collective, so outside the try and before anything a rank can fail
+        # at alone: every rank of the cylinder reaches this every iteration.
+        # Recorded so the restore can check it gets these weights back.
+        from mpisppy.phbase import Wbar_by_node
+        wbar = Wbar_by_node(self.opt)
         try:
             cylinder, ordinal = self._spoke_identity()
             ckpt.write_dual_spoke_state(
                 self.opt, self.ckpt_dir, cylinder, ordinal,
                 generation=int(getattr(self.opt, "_PHIter", 0)),
-                class_count=self._class_ordinal_and_count()[1])
+                class_count=self._class_ordinal_and_count()[1],
+                wbar=wbar)
         except Exception as exc:
             # By the rank that failed, as for the xhat spokes: each rank
             # writes its own file, so the failure is this rank's alone.

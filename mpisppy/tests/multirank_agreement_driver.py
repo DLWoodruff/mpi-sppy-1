@@ -67,6 +67,9 @@ STEPS = {
     # then puts it back, agreeing on each.
     "load_dual_spoke_state": (ckpt, "load_dual_spoke_state", None),
     "restore_dual_spoke_state": (ckpt, "restore_dual_spoke_state", None),
+    # Restore, on the hub: Checkpointer.post_iter0, which lists the spoke
+    # files no cylinder of this run will read.
+    "unclaimed_spoke_files": (ckpt, "unclaimed_spoke_files", None),
 }
 
 

@@ -254,10 +254,14 @@ class XhatShuffleInnerBound(_PreLoopXhatMixin, XhatInnerBoundBase):
             global_toc(f"WARNING: {message}", self.opt.cylinder_rank == 0)
         if not warnings:
             self.applied_loop_state = state
+            # The first pass after a resume always begins a new epoch (the
+            # hub's nonants are new to this run), and an epoch starts from
+            # the best scenario so far, so that is what is tried next.
+            best = self.scenario_cycler.best
             global_toc(
                 f"Restored the checkpointed xhatshuffle cursor "
-                f"(pass {self.xh_iter}, next scenario "
-                f"{self.scenario_cycler.nodescen_dict.get('ROOT')})",
+                f"(pass {self.xh_iter}; the next epoch starts from "
+                f"{'the start of the scenario order' if best is None else best})",
                 self.opt.cylinder_rank == 0)
 
 

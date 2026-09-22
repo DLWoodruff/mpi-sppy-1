@@ -1119,6 +1119,60 @@ class TestMultiRankSpokeCursorAgreement(unittest.TestCase):
 
 @unittest.skipIf(not solver_available, "no solver is available")
 @unittest.skipIf(not mpiexec_available, "mpiexec is not available")
+class TestScenarioDependentRhoDualResume(unittest.TestCase):
+    """A dual cylinder resumes when rho differs by scenario.
+
+    PH keeps sum_s p_s W_s = 0 only with the same rho in every scenario. The
+    restore used to require exactly that, so this run wrote its checkpoint
+    at exit 0 and its resume died at startup, blaming the file.
+    """
+
+    NP = 4
+    MODULE = "mpisppy.tests.examples.farmer_scenario_rho"
+    MODEL_ARGS = ("--num-scens", "6", "--default-rho", "1")
+    SPOKE_ARGS = ("--lagrangian", "--xhatshuffle", "--relaxed-ph",
+                  "--ph-primal-hub")
+    CYLINDER = "RelaxedPHSpoke"
+
+    @classmethod
+    def setUpClass(cls):
+        cls._tmp = tempfile.TemporaryDirectory()
+        cls.ckpt_dir = os.path.join(cls._tmp.name, "ckpt")
+        _run_leg(cls._tmp.name, "B1", cls.NP, cls.MODULE, cls.MODEL_ARGS,
+                 cls.SPOKE_ARGS, ("--max-iterations", "4",
+                                  "--checkpoint-dir", cls.ckpt_dir))
+        cls.result, cls.out_path = _run_leg(
+            cls._tmp.name, "B2", cls.NP, cls.MODULE, cls.MODEL_ARGS,
+            cls.SPOKE_ARGS, ("--max-iterations", "2",
+                             "--resume-from", cls.ckpt_dir),
+            check=False)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._tmp.cleanup()
+
+    def test_the_weights_really_do_not_sum_to_zero(self):
+        """Otherwise this is an ordinary resume and tests nothing new."""
+        spokes = os.path.join(self.ckpt_dir, "spokes")
+        (name,) = [f for f in os.listdir(spokes)
+                   if f.startswith(f"spoke_{self.CYLINDER}")]
+        with open(os.path.join(spokes, name), "rb") as f:
+            wbar = pickle.load(f)["Wbar"]
+        self.assertGreater(max(abs(v) for vals in wbar.values()
+                               for v in vals), 1e-3)
+
+    def test_the_resume_finishes(self):
+        self.assertEqual(self.result.returncode, 0,
+                         msg=self.result.stdout[-4000:] +
+                             self.result.stderr[-4000:])
+
+    def test_the_dual_cylinder_restored_its_weights(self):
+        (marker,) = _spoke_ranks(self.out_path, self.CYLINDER)
+        self.assertIsNotNone(marker["restored_dual_generation"])
+
+
+@unittest.skipIf(not solver_available, "no solver is available")
+@unittest.skipIf(not mpiexec_available, "mpiexec is not available")
 class TestMultiRankDualWeightAgreement(unittest.TestCase):
     """A multi-rank dual cylinder restores one iteration's W, not one each.
 
@@ -1398,6 +1452,8 @@ class TestEveryCheckpointStepOnThosePathsIsAgreed(unittest.TestCase):
             ("restore_extension_state",),
         "Checkpointer.post_iter0": ("load_dual_spoke_state",
                                     "restore_dual_spoke_state"),
+        "Checkpointer._report_unclaimed_spoke_files":
+            ("unclaimed_spoke_files",),
         "XhatInnerBoundBase._restore_extension_state_if_resuming":
             ("restore_extension_state_on_a_spoke",),
     }
@@ -1434,7 +1490,7 @@ class TestEveryCheckpointStepOnThosePathsIsAgreed(unittest.TestCase):
         "probe_model_is_dillable",
         "agree_spoke_restore",
         "agree_dual_spoke_restore",
-        "require_restored_duals_sum_to_zero",
+        "require_restored_duals_match_their_file",
     })
 
     #: And calls that need no agreement because there is nothing in them for
@@ -1445,6 +1501,8 @@ class TestEveryCheckpointStepOnThosePathsIsAgreed(unittest.TestCase):
     CANNOT_FAIL_ON_ONE_RANK = frozenset({
         "converger_state_is_carried",
         "require_implemented_backend",
+        # Walks the extension object's attributes; reads no file or model.
+        "_extension_objects",
     })
 
     #: Modules whose callables do this rank's own work: they touch the file

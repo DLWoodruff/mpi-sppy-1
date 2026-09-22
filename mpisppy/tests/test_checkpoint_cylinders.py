@@ -318,6 +318,56 @@ class TestStochAdmmCylindersResumeAB(_ResumeABMixin, unittest.TestCase):
     INCUMBENT_SPOKE = "XhatXbarInnerBound"
 
 
+@unittest.skipIf(not solver_available, "no solver is available")
+@unittest.skipIf(not mpiexec_available, "mpiexec is not available")
+class TestADroppedSpokeFileIsReported(unittest.TestCase):
+    """Resume without a spoke that held an incumbent, and the run says so.
+
+    The spoke that would have reported the file is the one that is not
+    running, so it falls to the hub. Without this the dropped spoke's
+    incumbent -- possibly the study's best -- was left behind in silence.
+    """
+
+    COMMON = ("--module-name", _FARMER, "--num-scens", "3",
+              "--default-rho", "1", "--lagrangian",
+              "--intra-hub-conv-thresh", "-1", "--rel-gap", "0.0",
+              "--abs-gap", "0.0")
+
+    def _run(self, np, *args):
+        cmd = ["mpiexec", "-np", str(np), sys.executable, "-m", "mpi4py",
+               "-m", "mpisppy.generic_cylinders", "--solver-name",
+               solver_name, *self.COMMON, *args]
+        result = subprocess.run(cmd, capture_output=True, text=True,
+                                timeout=1800, check=False)
+        self.assertEqual(result.returncode, 0,
+                         msg=result.stdout[-4000:] + result.stderr[-4000:])
+        return result.stdout
+
+    @classmethod
+    def setUpClass(cls):
+        cls._tmp = tempfile.TemporaryDirectory()
+        cls.ckpt_dir = os.path.join(cls._tmp.name, "ckpt")
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._tmp.cleanup()
+
+    def test_only_the_dropped_spoke_is_named(self):
+        self._run(4, "--xhatshuffle", "--xhatxbar", "--max-iterations", "3",
+                  "--checkpoint-dir", self.ckpt_dir)
+        written = os.listdir(os.path.join(self.ckpt_dir, "spokes"))
+        self.assertTrue(any("XhatXbarInnerBound" in f for f in written),
+                        msg=f"xhatxbar wrote no incumbent to drop: {written}")
+        same = self._run(4, "--xhatshuffle", "--xhatxbar",
+                         "--max-iterations", "1",
+                         "--resume-from", self.ckpt_dir)
+        self.assertNotIn("no such cylinder runs", same)
+        dropped = self._run(3, "--xhatshuffle", "--max-iterations", "1",
+                            "--resume-from", self.ckpt_dir)
+        self.assertIn("holds a file for XhatXbarInnerBound", dropped)
+        self.assertNotIn("holds a file for XhatShuffleInnerBound", dropped)
+
+
 class TestRestoredIncumbentIsRepublished(unittest.TestCase):
     """A spoke that restores an incumbent has written nothing to the directory
     this run writes to, unless that is the very directory it read.
@@ -502,11 +552,32 @@ class TestAFailedSpokeWriteIsNotRetriedEveryPass(unittest.TestCase):
         ext.opt._PHIter = 3
         writer = mock.Mock(side_effect=OSError("disk full"))
         with mock.patch.object(mod.ckpt, "write_dual_spoke_state", writer), \
+             mock.patch("mpisppy.phbase.Wbar_by_node", return_value={}), \
              mock.patch.object(mod, "global_toc") as toc:
             ext._dual_spoke_checkpoint()
         (message, prints), _ = toc.call_args
         self.assertIn("rank 1", message)
         self.assertTrue(prints, msg="rank 1's failure was not printed")
+
+    def test_a_dual_cylinder_names_the_extensions_it_does_not_carry(self):
+        from mpisppy.extensions import checkpointer as mod
+        from mpisppy.extensions.checkpointer import Checkpointer
+        ext = self._checkpointer()
+        ext.dual_spoke_mode = True
+        ext.opt.options = {"resume_from": "/tmp/ck"}
+        other = type("GradRho", (), {})()
+        ext.opt.extobject = types.SimpleNamespace(
+            extdict={"Checkpointer": ext, "GradRho": other})
+        ext._spoke_identity = lambda: ("PHDualSpoke", 0)
+        assert isinstance(ext, Checkpointer)
+        with mock.patch.object(mod.ckpt, "run_agreed", return_value=None), \
+             mock.patch.object(mod.ckpt, "agree_dual_spoke_restore",
+                               return_value=(None, None)), \
+             mock.patch.object(mod, "global_toc") as toc:
+            ext.post_iter0()
+        said = " ".join(str(c.args[0]) for c in toc.call_args_list)
+        self.assertIn("GradRho", said)
+        self.assertNotIn("Checkpointer", said)
 
     def test_a_failure_on_any_rank_is_reported_by_that_rank(self):
         """Each rank writes its own file, so a failure on rank 1 is rank 1's
