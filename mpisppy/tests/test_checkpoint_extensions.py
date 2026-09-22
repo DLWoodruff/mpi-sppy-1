@@ -995,13 +995,22 @@ class TestPrimalDualConvergerResume(_ABMixin, unittest.TestCase):
                         ph_converger=PrimalDualConverger)
 
     def test_the_resumed_run_stops_where_the_uninterrupted_one_does(self):
+        """Stopped one iteration short of where the reference converges.
+
+        Anywhere earlier, a wrong prev_xbars only changes the decision at the
+        first resumed iteration, which is nowhere near converging on either
+        leg, and the test passes regardless.
+        """
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            reference, stopped, resumed = self.run_ab()
-        self.assertLess(reference._PHIter, self.N,
-                        msg="the reference never converged, so this checks "
-                            "nothing about the converger")
-        self.assertGreater(reference._PHIter, self.STOP)
+            reference = self._ph(self.N)
+            reference.ph_main()
+            self.assertLess(reference._PHIter, self.N,
+                            msg="the reference never converged, so this "
+                                "checks nothing about the converger")
+            self.STOP = reference._PHIter - 1
+            self.assertGreater(self.STOP, 1)
+            _, _, resumed = self.run_ab()
         self.assertEqual(resumed._PHIter, reference._PHIter)
         self.assertNotIn("converger does not carry state", out.getvalue())
 
