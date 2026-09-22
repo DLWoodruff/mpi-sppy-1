@@ -6,14 +6,15 @@
 # All rights reserved. Please see the files COPYRIGHT.md and LICENSE.md for
 # full copyright and license information.
 ###############################################################################
-"""The xhatshuffle spoke's loop cursor across a checkpoint (design phase 5).
+"""The xhatshuffle spoke's loop cursor across a checkpoint.
 
-Phase 4 gave a spoke back its best solution; this gives it back its *place*.
-An xhatshuffle spoke walks a shuffled list of scenarios, trying each as a
-candidate xhat, and remembers which ones it has already tried this epoch. A
-resumed spoke that started that walk over would re-try scenarios it had
-already tried -- and every try is a subproblem solve, so on a large MIP that
-is real time spent re-learning what the checkpoint already knew.
+A spoke's incumbent file gives it back its best solution; the cursor gives it
+back its *place*. An xhatshuffle spoke walks a shuffled list of scenarios,
+trying each as a candidate xhat. A resume always begins a new epoch, so
+nothing is tried twice either way; what the cursor carries is where that
+epoch starts (the best scenario so far), the position in the order, and the
+direction, so the resumed spoke walks on the way the uninterrupted one would
+rather than from the start of the order.
 
 Two things make this cheaper than it sounds, and both are worth stating
 because they are what the design leans on:
@@ -27,8 +28,8 @@ because they are what the design leans on:
   whenever the cursor moves is negligible against what caused the move, while
   a pass that solves nothing writes nothing.
 
-This branch also gives the dual cylinders back their own W, and the serial
-half of that lives here too: what a restored set of weights has to satisfy
+The dual cylinders' own W also crosses the checkpoint, and the serial half
+of that lives here too: what a restored set of weights has to satisfy
 before this cylinder publishes it. The half that needs several ranks -- every
 rank restoring the same iteration -- is in ``test_checkpoint_multirank.py``.
 """
@@ -297,7 +298,7 @@ class TestSpokeWritesWhenTheCursorMoves(unittest.TestCase):
 
 
 class TestRestoredDualsMustMatchTheirFile(unittest.TestCase):
-    """A dual cylinder's restored W has to be the W its file was written with.
+    """A dual cylinder's restored W has to reproduce the E[W] its file recorded.
 
     Every other check on that file asks whether it describes this model --
     its fingerprint, this rank's scenario names, a weight for every nonant.

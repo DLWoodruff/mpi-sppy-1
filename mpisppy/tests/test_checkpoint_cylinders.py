@@ -252,10 +252,9 @@ class TestFarmerCylindersResumeAB(_ResumeABMixin, unittest.TestCase):
         """The spoke picks its exploration up rather than starting over.
 
         This leaves no trace in the answer -- farmer is deterministic, so the
-        resumed spoke reaches the same incumbent whether or not it re-walks
-        scenarios it had already tried -- so the only way to see it is to ask
-        the spoke what it was handed. Every re-try it avoids is a subproblem
-        solve it does not pay for.
+        resumed spoke reaches the same incumbent whether it walks on from
+        where it was or from the start of the order -- so the only way to see
+        it is to ask the spoke what it was handed.
         """
         _, stopped, resumed = self._run_ab()
 

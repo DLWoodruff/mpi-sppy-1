@@ -367,8 +367,8 @@ class Checkpointer(Extension):
             "put their checkpointed dual weights back on their models, so "
             "none of them restores any")
         # What every check up to here asks is whether the file describes this
-        # model. This asks whether the weights now on the models are the ones
-        # the file was written with: they become another cylinder's
+        # model. This asks whether the weights now on the models reproduce
+        # the E[W] the file recorded: they become another cylinder's
         # Lagrangian bound, which the hub keeps as best-so-far.
         ckpt.require_restored_duals_match_their_file(
             self.opt, cylinder, state["generation"], state["Wbar"])
