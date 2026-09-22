@@ -91,7 +91,7 @@ NON_STRUCTURAL_CFG_KEYS = frozenset({
     # cadence knob like the iteration limit: it changes what a stop costs, not
     # what problem the checkpoint describes.
     "checkpoint_dir", "checkpoint_backend", "checkpoint_every_iterations",
-    "resume_from",
+    "checkpoint_before_seconds", "resume_from",
     # Display, logging and output destinations.
     "verbose", "display_progress", "display_timing",
     "display_convergence_detail", "tee_rank0_solves", "trace_prefix",
@@ -231,6 +231,31 @@ def _leaf_filename(rank):
 
 def _model_filename(rank, sname):
     return f"hub_rank_{rank:04d}_scen_{sanitize_for_filename(sname)}.dill"
+
+
+_SPOKE_FILE_RE = re.compile(r"^spoke_(.+)_ordinal_(\d+)_rank_\d+\.pkl$")
+
+
+def unclaimed_spoke_files(opt, ckpt_dir, claimed):
+    """The (cylinder, ordinal) pairs with a file in the checkpoint that no
+    cylinder of this run will read, sorted.
+
+    ``claimed`` is the set of (cylinder class name, ordinal) this run
+    carries. A spoke that is dropped on resume leaves its file behind, and
+    with it whatever it held -- an incumbent that may be the study's best, or
+    a dual cylinder's W -- and the spoke that would have said so is the one
+    that is not there. ``opt`` is the hub's, and unused: it is the first
+    argument so this reads like every other restore step.
+    """
+    spokes_dir = os.path.join(ckpt_dir, SPOKES_SUBDIR)
+    if not os.path.isdir(spokes_dir):
+        return []
+    found = set()
+    for name in os.listdir(spokes_dir):
+        match = _SPOKE_FILE_RE.match(name)
+        if match:
+            found.add((match.group(1), int(match.group(2))))
+    return sorted(found - set(claimed))
 
 
 def _spoke_filename(cylinder, ordinal, rank):
@@ -373,6 +398,51 @@ def _first_failing_rank(comm, rank, failed):
     return None if int(worst[0]) == _NO_FAILURE else int(worst[0])
 
 
+def agree_one_write(opt, state, key):
+    """Do the ranks of this cylinder hold one checkpoint, written at once?
+
+    Each rank of a multi-rank cylinder reads its own file, because each owns
+    different scenarios -- and the files need not agree, because each rank
+    writes at the bottom of its own iteration or pass. A stop lands between
+    two of those writes, a rank whose write failed warned and carried on, and
+    a rank that had nothing to write wrote nothing.
+
+    Returns ``(verdict, detail)``:
+
+    * ``"none"``    -- no rank has a file.
+    * ``"partial"`` -- some ranks have one and some do not; detail is
+      ``(how many, out of how many)``.
+    * ``"differ"``  -- every rank has one, but ``key`` does not match across
+      them, so they are from different writes; detail is the values.
+    * ``"agreed"``  -- every rank has one, all from the same write; detail is
+      the agreed value.
+
+    ``key`` names the field that identifies the write: the objective of the
+    cached solution for an xhat spoke, the iteration for a dual cylinder.
+
+    Collective. Every rank of the cylinder must call it, including the ranks
+    whose ``state`` is None.
+    """
+    comm = _cylinder_comm(opt)
+    if comm is None:
+        return ("agreed" if state is not None else "none"), None
+    size = comm.Get_size()
+    have = comm.allreduce(1 if state is not None else 0, op=MPI.SUM)
+    if have == 0:
+        return "none", None
+    if have < size:
+        return "partial", (have, size)
+    # Every rank reads these out of the same collective -- an Eobjective
+    # reduction for the objective, the shared iteration counter for the
+    # generation -- so ranks from one write hold the identical value and an
+    # exact comparison is the right one. Gathered rather than reduced so a
+    # warning can name what disagrees, which is what a user needs to see.
+    values = comm.allgather(state.get(key))
+    if len(set(values)) != 1:
+        return "differ", values
+    return "agreed", values[0]
+
+
 def run_agreed(opt, work, what):
     """Run one local step of checkpoint setup or restore, and agree on it.
 
@@ -444,6 +514,88 @@ def require_implemented_backend(backend):
             f"--checkpoint-backend '{backend}' is not implemented. "
             f"The only supported backend is '{DILL_RELOAD_BACKEND}'."
         )
+
+def agree_spoke_restore(opt, state):
+    """Agree across an xhat spoke's ranks on the parts of a restore that are
+    the cylinder's rather than a rank's.
+
+    Two things in the file describe the cylinder: the loop cursor and the
+    inner bound. The cursor is the expensive one to get wrong. The
+    xhatshuffle loop is collective -- every rank picks the same scenario and
+    ``_try_one`` broadcasts its nonants from the rank that owns it -- so
+    ranks resuming from different cursors pick different scenarios, the
+    broadcast has a different root on each rank, and the objective the hub is
+    handed blends several scenarios' solutions instead of reporting any one
+    of them. It arrives as an ordinary feasible inner bound: no error, no
+    warning, exit 0.
+
+    The cached solution values stay rank-local, because each rank owns
+    different scenarios and there is nothing to broadcast. What has to be
+    agreed about them is that they all came from the same pass.
+
+    Returns ``(state, warning)``: rank 0's cursor and bound written into this
+    rank's own state, or ``(None, message)`` where the files do not describe
+    one incumbent.
+
+    Collective; see :func:`agree_one_write`.
+    """
+    verdict, detail = agree_one_write(opt, state, "best_solution_obj_val")
+    if verdict == "none":
+        return None, None
+    if verdict == "partial":
+        have, size = detail
+        return None, (
+            f"only {have} of {size} ranks of this spoke have a "
+            f"checkpointed incumbent, so none of them restores one: an "
+            f"incumbent assembled from some ranks and not others is not a "
+            f"solution this study ever found")
+    if verdict == "differ":
+        return None, (
+            f"the ranks of this spoke checkpointed different incumbents "
+            f"(objectives {detail}), so none of them restores one: the "
+            f"files were written at different passes, and half of one xhat "
+            f"beside half of another is not a solution this study ever found")
+    comm = _cylinder_comm(opt)
+    if comm is not None:
+        # Rank 0's, on every rank. Which rank is arbitrary -- what matters is
+        # that they stop differing -- so it is the one every other agreement
+        # here already uses.
+        loop_state, best_inner_bound = comm.bcast(
+            (state.get("loop_state"), state.get("best_inner_bound")), root=0)
+        state["loop_state"] = loop_state
+        state["best_inner_bound"] = best_inner_bound
+    return state, None
+
+
+def agree_dual_spoke_restore(opt, state):
+    """The same agreement for a dual cylinder's W, keyed on the iteration.
+
+    Nothing here is broadcast: W is per scenario and so per rank. What must
+    hold is that every rank restores the W of the *same* iteration. Ranks
+    that restore W from different iterations hand ``Compute_Xbar`` an
+    allreduce over values belonging to two different points of the run --
+    and under ``--ph-primal-hub`` that blended W is what the hub's W is
+    built from. No error and no warning, like the xhat case.
+
+    Returns ``(state, warning)``. Collective; see :func:`agree_one_write`.
+    """
+    verdict, detail = agree_one_write(opt, state, "generation")
+    if verdict == "none":
+        return None, None
+    if verdict == "partial":
+        have, size = detail
+        return None, (
+            f"only {have} of {size} ranks of this cylinder have checkpointed "
+            f"dual weights, so none of them restores any: a W taken from "
+            f"some ranks and not others is not the W this study had")
+    if verdict == "differ":
+        return None, (
+            f"the ranks of this cylinder checkpointed dual weights from "
+            f"different iterations ({detail}), so none of them restores any: "
+            f"a W half from one iteration and half from another is not the W "
+            f"this study had")
+    return state, None
+
 
 def require_dill(backend):
     if backend == DILL_RELOAD_BACKEND and not dill_available:
@@ -851,6 +1003,14 @@ def write_checkpoint(opt, ckpt_dir, generation, backend=DILL_RELOAD_BACKEND):
                 getattr(opt, "best_bound_obj_val", None)),
             "best_solution_obj_val": _as_float_or_none(
                 getattr(opt, "best_solution_obj_val", None)),
+            # How long a PH iteration of this run takes, so a resume can seed
+            # --checkpoint-before-seconds with a measurement instead of with
+            # its own iteration 0, which on a resume reloads models rather
+            # than solving them. This is the iteration *before* the one being
+            # written -- the current one is not over until after this write --
+            # which is the recent iteration the trigger wants either way.
+            "last_iteration_seconds": _as_float_or_none(
+                getattr(opt, "_last_iteration_seconds", None)),
             "best_outer_bound": _hub_best_outer_bound(opt),
         }
         _atomic_write_bytes(
@@ -1194,7 +1354,7 @@ def load_checkpoint(opt, ckpt_dir):
 
 
 def spoke_incumbent_state(opt, cylinder, ordinal, best_inner_bound=None,
-                          class_count=None):
+                          loop_state=None, class_count=None):
     """The dict written by ``write_spoke_incumbent``, or None if there is
     nothing to write yet. ``_cache_best_solution`` caches every scenario at
     once, so one scenario without a cache means none has one."""
@@ -1253,11 +1413,19 @@ def spoke_incumbent_state(opt, cylinder, ordinal, best_inner_bound=None,
         "best_solution_obj_val": _as_float_or_none(
             getattr(opt, "best_solution_obj_val", None)),
         "solutions": solutions,
+        # Where the spoke's own loop had got to. Only xhatshuffle has such a
+        # place; every other xhatter re-evaluates from scratch when new
+        # nonants arrive, so it says None and this stays None.
+        "loop_state": loop_state,
+        # Same contract as the hub's, for extensions attached to the spoke's
+        # Xhat_Eval rather than to the PH hub.
+        "extension_state": gather_extension_state(opt),
     }
 
 
 def write_spoke_incumbent(opt, ckpt_dir, cylinder, ordinal,
-                          best_inner_bound=None, class_count=None):
+                          best_inner_bound=None, loop_state=None,
+                          class_count=None):
     """Write this spoke's best incumbent, latest-wins. Returns the path, or
     None when there is no incumbent to write.
 
@@ -1269,6 +1437,7 @@ def write_spoke_incumbent(opt, ckpt_dir, cylinder, ordinal,
     """
     state = spoke_incumbent_state(opt, cylinder, ordinal,
                                   best_inner_bound=best_inner_bound,
+                                  loop_state=loop_state,
                                   class_count=class_count)
     if state is None:
         return None
@@ -1321,44 +1490,6 @@ def load_spoke_incumbent(opt, ckpt_dir, cylinder, ordinal):
             f"but '{path}' was written with {want} on that rank."
         )
     return state
-
-
-def agree_on_spoke_incumbent(opt, state):
-    """Keep a loaded spoke incumbent only if every rank loaded the same one.
-
-    Each rank of a spoke writes its own file, so a write that fails on one
-    rank (a full disk on one node, an objective the write refuses) or a kill
-    between the ranks' renames leaves files from different incumbents. The
-    ranks stay in step only because each compares the same all-reduced
-    candidate objective against the same best-so-far; restore different
-    best-so-far values and they reach different verdicts, publish different
-    numbers of times -- after which the hub rejects everything the spoke
-    sends -- or walk different scenario orders into a collective and hang.
-
-    Returns ``(state, reason)``: the state unchanged when every rank has a
-    file and they all carry the same objective and inner bound; ``(None,
-    None)`` when no rank has one; otherwise ``(None, reason)`` on every rank.
-    Dropping it is safe because the file is an optimization: the spoke starts
-    without an incumbent, as it would with no checkpoint.
-
-    Collective: every rank of the cylinder must call it.
-    """
-    comm = _cylinder_comm(opt)
-    if comm is None:
-        return state, None
-    mine = None if state is None else (state["best_solution_obj_val"],
-                                       state["best_inner_bound"])
-    everyone = comm.allgather(mine)
-    if all(v is None for v in everyone):
-        return None, None
-    if None not in everyone and len(set(everyone)) == 1:
-        return state, None
-    missing = [rank for rank, v in enumerate(everyone) if v is None]
-    held = {v for v in everyone if v is not None}
-    reason = f"the files hold (objective, inner bound) {sorted(held, key=str)}"
-    if missing:
-        reason = f"rank(s) {missing} have no file; {reason}"
-    return None, reason
 
 
 def restore_spoke_incumbent(opt, state):
@@ -1416,3 +1547,239 @@ def restore_spoke_incumbent(opt, state):
 
     opt.best_solution_obj_val = state["best_solution_obj_val"]
     return state["best_solution_obj_val"]
+
+
+# ---------------------------------------------------------------------------
+# The dual cylinders' own PH state.
+#
+# A cylinder that runs PH to produce duals -- relaxed_ph, ph_dual -- keeps the
+# state that matters on its own models, and none of it is in the hub's
+# checkpoint: the hub dills its scenarios, not theirs. So a resumed wheel that
+# restored the hub perfectly still handed it a cylinder starting from W = 0,
+# which under --ph-primal-hub is where the hub's own W comes from.
+#
+# What is written is W and the nonanticipative values, per scenario, and not
+# the models: W is what the next iteration's Update_W adds to, and the values
+# are what its Compute_Xbar averages. Everything else the cylinder needs it
+# rebuilds every run -- rho from the rho setter, xbar from the values, the
+# prox terms from PH_Prep -- so carrying it would be carrying a copy of a
+# derivation. That keeps this file small enough to write at every iteration,
+# which is what a cylinder nobody synchronizes with needs.
+# ---------------------------------------------------------------------------
+
+def dual_spoke_state(opt, cylinder, ordinal, generation, class_count=None,
+                     wbar=None):
+    """The dict written by ``write_dual_spoke_state``.
+
+    W is keyed by ``(ndn, i)`` and the values by variable name -- the two
+    keyings the rest of this module uses, and neither of them an identity.
+    ``wbar`` is E[W] per node at the time of the write (``Wbar_by_node``),
+    which the restore checks the restored weights reproduce.
+    """
+    duals = {}
+    for sname, s in opt.local_scenarios.items():
+        model = s._mpisppy_model
+        nonants = s._mpisppy_data.nonant_indices
+        duals[sname] = {
+            "W": {ndn_i: _as_float_or_none(model.W[ndn_i]._value)
+                  for ndn_i in nonants},
+            "values": {var.name: var._value for var in nonants.values()},
+        }
+    return {
+        "format_version": FORMAT_VERSION,
+        "kind": "dual-spoke-ph-state",
+        "cylinder": str(cylinder),
+        "ordinal": int(ordinal),
+        # As for the incumbent file: the ordinal means the same thing only
+        # while the wheel carries the same number of cylinders of this
+        # class. Recorded so a resume can say when it does not.
+        "class_count": None if class_count is None else int(class_count),
+        "rank": int(opt.cylinder_rank),
+        # This cylinder's own iteration count, which is not the hub's: the
+        # wheel does not march the cylinders in step and this is not an
+        # attempt to. It is recorded so a log can say how far the cylinder
+        # had got, and it is not compared against anything on the way back in.
+        "generation": int(generation),
+        "geometry": geometry(opt),
+        "structural_fingerprint": structural_fingerprint(opt.options),
+        "Wbar": None if wbar is None else {
+            ndn: [float(v) for v in values] for ndn, values in wbar.items()},
+        "duals": duals,
+    }
+
+
+def write_dual_spoke_state(opt, ckpt_dir, cylinder, ordinal, generation,
+                           class_count=None, wbar=None):
+    """Write this cylinder's PH state, latest-wins. Returns the path.
+
+    Temp-then-rename like every other file here, so a kill mid-write leaves
+    the previous iteration's state intact rather than a truncated file.
+    """
+    state = dual_spoke_state(opt, cylinder, ordinal, generation,
+                             class_count=class_count, wbar=wbar)
+    spokes_dir = os.path.join(ckpt_dir, SPOKES_SUBDIR)
+    os.makedirs(spokes_dir, exist_ok=True)
+    path = os.path.join(
+        spokes_dir,
+        _spoke_filename(cylinder, ordinal, opt.cylinder_rank),
+    )
+    _atomic_write_bytes(path, lambda f: pickle.dump(state, f))
+    _fsync_dir(spokes_dir)
+    return path
+
+
+def load_dual_spoke_state(opt, ckpt_dir, cylinder, ordinal):
+    """Read this cylinder's PH state, or None if it is not there.
+
+    Missing is normal -- the run being resumed may not have reached this
+    cylinder's first completed iteration -- and present but wrong is an
+    error, as everywhere else here.
+    """
+    path = os.path.join(
+        ckpt_dir, SPOKES_SUBDIR,
+        _spoke_filename(cylinder, ordinal, opt.cylinder_rank),
+    )
+    if not os.path.exists(path):
+        return None
+    with open(path, "rb") as f:
+        state = pickle.load(f)
+
+    if state.get("format_version") != FORMAT_VERSION:
+        raise CheckpointMismatch(
+            f"The cylinder state file '{path}' has format version "
+            f"{state.get('format_version')}, but this mpi-sppy writes "
+            f"version {FORMAT_VERSION}."
+        )
+    if state.get("kind") != "dual-spoke-ph-state":
+        # Spoke files are named for their cylinder class, so this can only
+        # happen if a class changed what it writes between the two runs.
+        raise CheckpointMismatch(
+            f"'{path}' holds {state.get('kind')!r}, not this cylinder's PH "
+            f"state."
+        )
+    if state.get("structural_fingerprint") != structural_fingerprint(opt.options):
+        raise CheckpointMismatch(
+            f"The cylinder state file '{path}' was written by a run "
+            f"configured differently from this one, so its dual weights do "
+            f"not belong to this model."
+        )
+    have = sorted(opt.local_scenarios.keys())
+    want = state["geometry"]["scenario_names"]
+    if have != want:
+        raise CheckpointMismatch(
+            f"Rank {opt.cylinder_rank} of this cylinder owns scenarios "
+            f"{have}, but '{path}' was written with {want} on that rank."
+        )
+    return state
+
+
+def restore_dual_spoke_state(opt, state):
+    """Put W and the nonanticipative values back on this cylinder's models.
+
+    A W entry that no longer resolves is an error rather than a skipped key:
+    a cylinder carrying half the study's duals and half of zero is not a
+    continuation of anything, and it would show up only as a bound that
+    quietly stopped improving.
+    """
+    for sname, s in opt.local_scenarios.items():
+        entry = state["duals"][sname]
+        model = s._mpisppy_model
+        nonants = s._mpisppy_data.nonant_indices
+        saved_w = entry["W"]
+        missing = [ndn_i for ndn_i in nonants if ndn_i not in saved_w]
+        if missing:
+            raise CheckpointMismatch(
+                f"The checkpointed dual weights for scenario '{sname}' are "
+                f"missing {len(missing)} nonanticipative variable(s) this "
+                f"model has (e.g. {missing[:3]}), so they cannot be restored."
+            )
+        by_name = entry["values"]
+        for ndn_i, var in nonants.items():
+            model.W[ndn_i]._value = saved_w[ndn_i]
+            if var.name in by_name:
+                var._value = by_name[var.name]
+
+
+#: How far the restored E[W] may stray from the E[W] recorded with the file,
+#: as a fraction of the size of the weights being summed (E[|W|]). The two are
+#: sums of the same numbers with the same probabilities, so in practice they
+#: agree exactly; the tolerance is only there so that a difference in the
+#: order of accumulation is never a refusal. A file that was edited, or
+#: probabilities that changed, are off by a visible fraction of the weights.
+RESTORED_WBAR_RTOL = 1e-6
+
+
+def require_restored_duals_match_their_file(opt, cylinder, generation,
+                                            recorded):
+    """Refuse restored dual weights that do not reproduce the file's E[W].
+
+    The rest of this cylinder's restore checks that the file describes this
+    model: its format, its fingerprint, this rank's scenario names, that
+    every nonant has a weight, and that every rank restored the same
+    iteration. None of that looks at the numbers, and the numbers become
+    another cylinder's Lagrangian bound, which the hub keeps as best-so-far.
+    This recomputes E[W] per node from the restored models and compares it
+    with the E[W] the writing run computed from the same weights. That
+    catches an edited file and changed scenario probabilities. It compares a
+    sum per variable, so W exchanged between two scenarios of equal
+    probability passes.
+
+    Not a check that E[W] is zero. PH keeps it at zero only when rho is the
+    same in every scenario (see ``phbase.Wbar_by_node``); with a
+    scenario-dependent rho the weights an uninterrupted run publishes do not
+    sum to zero either, and a resume has no business refusing what the run it
+    continues was doing. What a resume must not do is publish weights other
+    than the ones it was checkpointed with.
+
+    Collective: the sum spans the scenarios of a tree node and so the ranks
+    of the cylinder. Every rank computes the same sums and so makes the same
+    refusal.
+    """
+    # Here rather than at module scope: phbase imports this module.
+    from mpisppy.phbase import Wbar_by_node, W_magnitude_by_node
+
+    bars = Wbar_by_node(opt)
+    sizes = W_magnitude_by_node(opt)
+    if recorded is None or set(recorded) != set(bars):
+        raise CheckpointMismatch(
+            f"The dual weights file {cylinder} wrote at its iteration "
+            f"{generation} does not record E[W] for this model's tree nodes "
+            f"({sorted(bars)}), so its weights cannot be checked. Remove the "
+            f"file to start this cylinder from W = 0.")
+
+    worst = None
+    for ndn, Wbars in bars.items():
+        for i, Wbar in enumerate(Wbars):
+            want = float(recorded[ndn][i])
+            size = float(sizes[ndn][i])
+            tolerance = opt.E1_tolerance + RESTORED_WBAR_RTOL * size
+            excess = abs(float(Wbar) - want) / tolerance
+            if worst is None or excess > worst[0]:
+                worst = (excess, float(Wbar), want, size, tolerance, ndn, i)
+
+    if worst is not None and worst[0] > 1.0:
+        _, Wbar, want, size, tolerance, ndn, i = worst
+        raise CheckpointMismatch(
+            f"The dual weights restored for {cylinder} from the checkpoint "
+            f"it wrote at its iteration {generation} do not reproduce the "
+            f"E[W] that file recorded: at '{_nonant_name(opt, ndn, i)}' the "
+            f"probability-weighted sum of the restored weights is "
+            f"{Wbar:.6e}, and the file recorded {want:.6e}, against a "
+            f"tolerance of {tolerance:.3e} -- E1_tolerance "
+            f"({opt.E1_tolerance:.1e}) plus {RESTORED_WBAR_RTOL:.0e} of the "
+            f"size of the weights summed there ({size:.6e}). The file has "
+            f"been changed, or the scenario probabilities have. A Lagrangian "
+            f"bound computed from them would not be the study's, and the hub "
+            f"keeps the best bound it is ever told, so this refuses rather "
+            f"than resumes. Remove the file to start this cylinder from "
+            f"W = 0."
+        )
+
+
+def _nonant_name(opt, ndn, i):
+    """The name of nonant ``i`` of node ``ndn``, for an error message."""
+    for s in opt.local_scenarios.values():
+        for node in s._mpisppy_node_list:
+            if node.name == ndn and i < len(node.nonant_vardata_list):
+                return node.nonant_vardata_list[i].name
+    return f"{ndn}[{i}]"

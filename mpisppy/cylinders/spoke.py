@@ -426,8 +426,9 @@ class InnerBoundNonantSpoke(_BoundNonantSpoke, InnerBoundSpoke):
         spoke's half of the hook the hub fires at the end of every iteration,
         and it is what lets one Checkpointer serve both. The extension
         decides whether the pass is worth a write -- for a spoke that means
-        "has my incumbent improved since the last one" -- so a loop spinning
-        while it waits on the hub costs nothing but the call.
+        "has my incumbent improved, or has my loop cursor moved, since the
+        last one" -- so a loop spinning while it waits on the hub costs
+        nothing but the call.
 
         Call it at the *bottom* of a pass: what a spoke checkpoints is the
         best xhat it has found, so the pass that finds one has to finish
@@ -438,6 +439,31 @@ class InnerBoundNonantSpoke(_BoundNonantSpoke, InnerBoundSpoke):
         """
         if self.opt.extensions is not None:
             self.opt.extobject.maybe_checkpoint()
+
+    def checkpoint_loop_state(self):
+        """This spoke's place in its own loop, or None if it has none.
+
+        Duck-typed, and None is the honest answer for most spokes: only
+        xhatshuffle walks a cursor across the scenarios that a resume could
+        pick up. The others re-evaluate from scratch whenever new nonants
+        arrive, so their loop counters describe nothing worth carrying.
+        """
+        return None
+
+    def restore_loop_state(self, state):
+        """Accept what checkpoint_loop_state() returned. Returns warnings."""
+        return []
+
+    def loop_state_progress(self, state):
+        """The part of a loop state that means this spoke did some work.
+
+        The write decision compares this rather than the whole loop state, so
+        a counter that ticks on every pass of a loop that spins while it waits
+        on the hub does not turn every idle pass into a file write. The whole
+        state is the right answer by default; a spoke whose state mixes
+        progress with bookkeeping overrides it.
+        """
+        return state
 
 
 class OuterBoundNonantSpoke(_BoundNonantSpoke):
