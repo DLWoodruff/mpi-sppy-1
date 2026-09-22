@@ -136,6 +136,14 @@ from mpisppy.extensions.extension import Extension
 import mpisppy.utils.checkpointing as ckpt
 
 
+def _same_objective(a, b):
+    """``a == b``, except that two NaNs are the same objective. The spoke
+    write compares the incumbent's objective with the last one it wrote or
+    failed to write, and NaN != NaN would make an unchanged NaN incumbent a
+    new one on every pass of the loop."""
+    return a == b or (a != a and b != b)
+
+
 class Checkpointer(Extension):
     """Write a resumable checkpoint at each completed PH iteration."""
 
@@ -806,7 +814,7 @@ class Checkpointer(Extension):
             return
 
         obj = getattr(self.opt, "best_solution_obj_val", None)
-        if obj is None or obj == self._last_failed_obj:
+        if obj is None or _same_objective(obj, self._last_failed_obj):
             # Nothing to write yet: the file carries a solution, and the
             # cursor rides along with it rather than on its own. Or the last
             # write of this incumbent failed; wait for a new one.
@@ -821,7 +829,7 @@ class Checkpointer(Extension):
         # over tmpfs: about 8,700 writes a second, per spoke rank, silently,
         # since the toc below only speaks when the objective improved.
         progress = spoke.loop_state_progress(loop_state)
-        if (obj == self._last_written_obj
+        if (_same_objective(obj, self._last_written_obj)
                 and progress == self._last_written_loop_progress):
             return
         try:
@@ -844,7 +852,7 @@ class Checkpointer(Extension):
             return
         if path is None:
             return
-        improved = obj != self._last_written_obj
+        improved = not _same_objective(obj, self._last_written_obj)
         self._last_written_obj = obj
         self._last_written_loop_progress = progress
         if not improved:
