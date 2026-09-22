@@ -40,7 +40,9 @@ import mpisppy.utils.checkpointing as checkpointing
 import mpisppy.tests.examples.farmer as farmer
 from mpisppy.extensions.checkpointer import Checkpointer
 from mpisppy.extensions.extension import Extension
+from mpisppy.cylinders.hub import PHHub
 from mpisppy.opt.ph import PH
+from mpisppy.spin_the_wheel import WheelSpinner
 from mpisppy.tests.utils import get_solver
 from mpisppy.utils.config import Config
 
@@ -509,6 +511,43 @@ class TestResumeABFarmer(unittest.TestCase):
         self.assertFalse(
             resumed.update_best_solution_if_improving(-100000.0),
             msg="a worse incumbent was accepted after a resume")
+
+    def _spin_hub(self, options):
+        """A PH hub with no spokes, so the run has a hub to keep bounds on."""
+        extensions = Checkpointer if "checkpoint_dir" in options else None
+        hub_dict = {
+            "hub_class": PHHub,
+            "hub_kwargs": {"options": {"rel_gap": -1, "abs_gap": -1,
+                                       "max_stalled_iters": None}},
+            "opt_class": PH,
+            "opt_kwargs": {
+                "options": options,
+                "all_scenario_names": SCENARIO_NAMES,
+                "scenario_creator": farmer.scenario_creator,
+                "scenario_creator_kwargs": CREATOR_KWARGS,
+                "scenario_denouement": farmer.scenario_denouement,
+                "extensions": extensions,
+            },
+        }
+        wheel = WheelSpinner(hub_dict, [])
+        wheel.spin()
+        return wheel.spcomm
+
+    def test_outer_bound_from_a_spoke_is_restored(self):
+        """A spoke's bound reaches only spcomm.BestOuterBound, not
+        opt.best_bound_obj_val, so the checkpoint has to take it from there."""
+        hub = self._spin_hub(_options(self.STOP, ckpt_dir=self.ckpt_dir))
+        # Better than the trivial bound, which is all PH computes by itself
+        # on farmer; this stands in for what a Lagrangian spoke would send.
+        spoke_bound = -110000.0
+        self.assertLess(hub.opt.trivial_bound, spoke_bound)
+        hub.BestOuterBound = spoke_bound
+        checkpointing.write_checkpoint(hub.opt, self.ckpt_dir, self.STOP)
+
+        resumed = self._spin_hub(_options(self.REMAINING,
+                                          resume_from=self.ckpt_dir))
+        self.assertTrue(resumed.opt._resumed_from_checkpoint)
+        self.assertEqual(resumed.BestOuterBound, spoke_bound)
 
     def test_writes_one_generation_and_a_manifest(self):
         """Retention is exactly one published generation."""
@@ -1247,6 +1286,13 @@ class TestStructuralFingerprint(unittest.TestCase):
                 ("lagrangian_mipgaps_json", "/tmp/gaps.json"),
                 ("lagrangian_mipgap_ratio", 0.5),
                 ("lagrangian_starting_mipgap", 0.1),
+                # Spokes a custom driver can add or drop between legs; the
+                # spoke files are named so that this is absorbed.
+                ("lagranger", True),
+                ("xhatlooper", True),
+                ("xhatspecific", True),
+                ("slammax", True),
+                ("slammin", True),
         ):
             with self.subTest(key=key):
                 self.assertTrue(
@@ -1254,6 +1300,15 @@ class TestStructuralFingerprint(unittest.TestCase):
                     f"{key} would be folded into the fingerprint, so a resume "
                     f"differing only in {key} is refused")
                 self.assertNotIn(key, self._folded_cfg(**{key: value}))
+
+    def test_spoke_flags_that_change_the_hub_models_stay_structural(self):
+        """Unlike the other spoke flags, each of these also attaches a hub
+        extension that changes the hub's own models -- reduced_costs fixes
+        variables, cross_scenario_cuts adds cuts -- and a resume without it
+        would keep what it did."""
+        for key in ("reduced_costs", "cross_scenario_cuts"):
+            with self.subTest(key=key):
+                self.assertFalse(checkpointing._is_non_structural(key))
 
     def _folded_cfg(self, **overrides):
         """What cfg_vanilla actually hands the fingerprint."""
@@ -2071,6 +2126,10 @@ class TestSpokeIncumbentFile(unittest.TestCase):
             opt, self.ckpt_dir, self.CYLINDER, 2, best_inner_bound=bound)
         return opt, path
 
+    #: What a solver can report for a solution it accepted: no bound at all,
+    #: or (ipopt) an infinite one. NaN is what None becomes in a buffer.
+    NOT_AN_OBJECTIVE = (None, math.inf, -math.inf, math.nan)
+
     def test_a_solution_with_no_objective_is_not_written(self):
         """A solver may accept a solution and report no bound for it.
 
@@ -2080,28 +2139,35 @@ class TestSpokeIncumbentFile(unittest.TestCase):
         QP column. Refuse the file instead; the caller turns this into the
         warning it already prints when a spoke cannot write.
         """
-        opt = _xhat_eval(ckpt_dir=self.ckpt_dir)
-        _set_and_cache_solution(opt, 1.0)
-        for s in opt.local_scenarios.values():
-            s._mpisppy_data.best_solution_inner_bound = None
-        with self.assertRaises(ValueError) as ctx:
-            checkpointing.write_spoke_incumbent(
-                opt, self.ckpt_dir, self.CYLINDER, 2, best_inner_bound=-42.0)
-        self.assertIn("no objective", str(ctx.exception))
-        self.assertFalse(
-            os.path.isdir(os.path.join(self.ckpt_dir, "spokes")),
-            msg="a file that cannot describe a usable incumbent was written")
+        for bad in self.NOT_AN_OBJECTIVE:
+            with self.subTest(objective=bad):
+                opt = _xhat_eval(ckpt_dir=self.ckpt_dir)
+                _set_and_cache_solution(opt, 1.0)
+                for s in opt.local_scenarios.values():
+                    s._mpisppy_data.best_solution_inner_bound = bad
+                with self.assertRaises(ValueError) as ctx:
+                    checkpointing.write_spoke_incumbent(
+                        opt, self.ckpt_dir, self.CYLINDER, 2,
+                        best_inner_bound=-42.0)
+                self.assertIn("no finite objective", str(ctx.exception))
+                self.assertFalse(
+                    os.path.isdir(os.path.join(self.ckpt_dir, "spokes")),
+                    msg="a file that cannot describe a usable incumbent was "
+                        "written")
 
     def test_a_solution_with_no_objective_is_not_restored(self):
         """Files written before the write refused this still exist."""
         opt, _ = self._write_one()
-        state = checkpointing.load_spoke_incumbent(
-            opt, self.ckpt_dir, self.CYLINDER, 2)
-        for entry in state["solutions"].values():
-            entry["inner_bound"] = None
-        with self.assertRaises(checkpointing.CheckpointMismatch) as ctx:
-            checkpointing.restore_spoke_incumbent(opt, state)
-        self.assertIn("no objective", str(ctx.exception))
+        for bad in self.NOT_AN_OBJECTIVE:
+            with self.subTest(objective=bad):
+                state = checkpointing.load_spoke_incumbent(
+                    opt, self.ckpt_dir, self.CYLINDER, 2)
+                for entry in state["solutions"].values():
+                    entry["inner_bound"] = bad
+                with self.assertRaises(
+                        checkpointing.CheckpointMismatch) as ctx:
+                    checkpointing.restore_spoke_incumbent(opt, state)
+                self.assertIn("no finite objective", str(ctx.exception))
 
     def test_written_where_the_design_says(self):
         _, path = self._write_one()

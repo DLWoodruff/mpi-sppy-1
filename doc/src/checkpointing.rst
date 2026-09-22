@@ -172,8 +172,10 @@ may legitimately change:
   a mipgap on day two continues the same problem rather than redefining it;
 * **display, tracking and output destinations**, and the checkpoint options
   themselves;
-* **which cylinders run.** The hub's primal trajectory does not depend on the
-  spokes.
+* **which cylinders run**, except ``--reduced-costs`` and
+  ``--cross-scenario-cuts``, which also change the hub's own models. With
+  ``--ph-primal-hub`` a different set of dual spokes changes where the hub
+  goes, but not what problem it is solving.
 
 Everything else must match -- including options your own model module
 registers. That is deliberate: checking by default is what stops a farmer
@@ -222,7 +224,9 @@ bug.
 
 Bounds and the incumbent are carried forward as valid best-so-far values. A
 resumed run never reports a worse best-so-far than its checkpoint, provided
-the spoke that held the incumbent is still in the run. Each spoke keeps its
+the spoke that held the incumbent is still in the run. A bound that reaches
+the hub after the last checkpoint is written is not in it, so the stopped
+run's final line can show a better bound than the resumed run starts from. Each spoke keeps its
 own file, so dropping one leaves its incumbent behind: resuming
 ``--xhatshuffle`` as ``--xhatxbar`` starts without the answer the first one
 found, and says so.
@@ -253,8 +257,9 @@ cylinders run is on the list above that a resume may change. Resuming without
 ``--lagrangian`` therefore still finds the xhat spoke's incumbent, and two
 spokes of one class still read their own. The one change that cannot be
 absorbed is dropping one of two spokes *of the same class*: the survivor then
-looks like the one that was removed, and the resume says so rather than
-adopting an incumbent that belonged to a different cylinder.
+looks like the one that was removed, and the resume warns that the incumbent
+it adopts may have belonged to the other one. That incumbent is still a
+feasible solution for the same model.
 
 On a deterministic LP or QP solve the primal trajectory can come back
 bit-identical, but that is a bonus rather than the guarantee.

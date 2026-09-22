@@ -27,6 +27,7 @@ alongside as a small pickle of plain data.
 """
 
 import json
+import math
 import os
 import pickle
 import re
@@ -120,12 +121,16 @@ NON_STRUCTURAL_CFG_KEYS = frozenset({
     "rc_debug", "rc_verbose", "tee_EF", "hub_only_solver_logs",
     "inspect_buffers_on_shutdown", "fwph_save_file",
     "write_scenario_lp_mps_files_dir", "config_file",
-    # Which cylinders run. The hub's primal trajectory does not depend on the
-    # spokes, so a checkpoint stays valid across a different spoke set -- and
-    # cylinder support will need this to be allowed.
+    # Which cylinders run. A different spoke set can change where the hub
+    # goes (with --ph-primal-hub the dual spokes feed it W), but it leaves
+    # nothing in the hub's models, so the checkpoint still describes the same
+    # problem. reduced_costs and cross_scenario_cuts are not here: each also
+    # gives the hub an extension that changes the hub's own models (fixing
+    # variables, adding cuts), and a resume without it would keep them.
     "lagrangian", "xhatshuffle", "xhatxbar", "xhatlshaped", "fwph",
-    "subgradient", "ph_primal_hub", "ph_dual", "relaxed_ph", "reduced_costs",
-    "ph_xfeas_spoke",
+    "subgradient", "ph_primal_hub", "ph_dual", "relaxed_ph",
+    "ph_xfeas_spoke", "lagranger", "xhatlooper", "xhatspecific",
+    "slammax", "slammin",
     # How the run was set up, not what problem it is. out-of-the-box prints an
     # equivalent command line and invites the user to reuse it, so leaving
     # these structural refuses a resume of exactly the line it printed.
@@ -664,6 +669,7 @@ def write_checkpoint(opt, ckpt_dir, generation, backend=DILL_RELOAD_BACKEND):
                 getattr(opt, "best_bound_obj_val", None)),
             "best_solution_obj_val": _as_float_or_none(
                 getattr(opt, "best_solution_obj_val", None)),
+            "best_outer_bound": _hub_best_outer_bound(opt),
         }
         _atomic_write_bytes(
             os.path.join(staging_dir, _leaf_filename(rank)),
@@ -862,6 +868,19 @@ def _as_float_or_none(value):
     return None if value is None else float(value)
 
 
+def _hub_best_outer_bound(opt):
+    """The hub's best outer bound from any source, or None if it has none.
+
+    ``opt.best_bound_obj_val`` holds only the bounds the hub computed itself;
+    a bound sent by a spoke, such as a Lagrangian bound, lives on
+    ``opt.spcomm.BestOuterBound`` and nowhere else.
+    """
+    bound = getattr(getattr(opt, "spcomm", None), "BestOuterBound", None)
+    if bound is None or not math.isfinite(bound):
+        return None
+    return float(bound)
+
+
 def _publish_manifest(ckpt_dir, manifest):
     blob = json.dumps(manifest, indent=2, sort_keys=True).encode("utf-8")
     _atomic_write_bytes(os.path.join(ckpt_dir, MANIFEST_NAME),
@@ -1010,19 +1029,20 @@ def spoke_incumbent_state(opt, cylinder, ordinal, best_inner_bound=None,
         # solve overwrites while the values beside it stay put.
         objective = _as_float_or_none(
             getattr(s._mpisppy_data, "best_solution_inner_bound", None))
-        if objective is None:
+        if objective is None or not math.isfinite(objective):
             # Refuse the whole file rather than write a solution with no
             # objective. send_best_xhat packs this number into a float64
             # buffer, where None is stored as NaN without anything raising,
             # and FWPH reads that slot as the recourse cost of a QP column.
             # A solver is entitled to accept a solution and report no bound
-            # for it, so this is reachable without anything being wrong;
-            # what must not happen is passing the gap on silently.
+            # for it (ipopt reports an infinite one), so this is reachable
+            # without anything being wrong; what must not happen is passing
+            # the gap on silently.
             raise ValueError(
                 f"scenario '{sname}' has a cached best solution but no "
-                f"objective recorded with it, so this incumbent cannot be "
-                f"checkpointed: the objective travels with the values and "
-                f"a missing one becomes NaN downstream")
+                f"finite objective recorded with it ({objective}), so this "
+                f"incumbent cannot be checkpointed: the objective travels "
+                f"with the values and is read downstream as a real number")
         solutions[sname] = {
             "inner_bound": objective,
             "values": {var.name: value for var, value in cache.items()},
@@ -1035,8 +1055,8 @@ def spoke_incumbent_state(opt, cylinder, ordinal, best_inner_bound=None,
         # How many cylinders of this class the writing wheel carried. The
         # ordinal only means the same thing while that is unchanged: drop one
         # of two same-class spokes and the survivor's ordinal becomes the
-        # removed one's. Recorded so the resume can say so rather than adopt
-        # an incumbent that belonged to a different cylinder.
+        # removed one's. Recorded so the resume can say so when it adopts an
+        # incumbent that may have belonged to a different cylinder.
         "class_count": None if class_count is None else int(class_count),
         "rank": int(opt.cylinder_rank),
         "geometry": geometry(opt),
@@ -1155,15 +1175,17 @@ def restore_spoke_incumbent(opt, state):
                 f"{len(missing)} variable(s) this model does not have "
                 f"(e.g. {sorted(missing)[:3]}), so it cannot be restored."
             )
-        if entry["inner_bound"] is None:
+        if entry["inner_bound"] is None or \
+                not math.isfinite(entry["inner_bound"]):
             # Written before the write path refused this, or hand-edited.
-            # Adopting it would put NaN into the BEST_XHAT buffer, so the
-            # incumbent is unusable however it got here.
+            # Adopting it would put NaN or inf into the BEST_XHAT buffer, so
+            # the incumbent is unusable however it got here.
             raise CheckpointMismatch(
                 f"the checkpointed incumbent for scenario '{sname}' has no "
-                f"objective recorded with it, so it cannot be restored: the "
-                f"objective is published beside the values and a missing one "
-                f"becomes NaN downstream."
+                f"finite objective recorded with it "
+                f"({entry['inner_bound']}), so it cannot be restored: the "
+                f"objective is published beside the values and is read "
+                f"downstream as a real number."
             )
         s._mpisppy_data.best_solution_cache = cache
         # Both, and to the same number. The first is the one that goes back
