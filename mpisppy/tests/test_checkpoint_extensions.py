@@ -197,7 +197,10 @@ class TestNormRhoUpdaterResume(_ABMixin, unittest.TestCase):
     uninterrupted run's -- for the rest of the run.
     """
 
-    EXTRA_OPTIONS = {"norm_rho_options": {"verbose": False}}
+    #: The default factor of 100 never changes rho on farmer, on either leg,
+    #: and a restore that did nothing then passed. At 1.0 rho moves.
+    EXTRA_OPTIONS = {"norm_rho_options": {"verbose": False,
+                                          "primal_dual_difference_factor": 1.0}}
 
     def ext_classes(self):
         from mpisppy.extensions.norm_rho_updater import NormRhoUpdater
@@ -206,6 +209,16 @@ class TestNormRhoUpdaterResume(_ABMixin, unittest.TestCase):
     def test_resume_is_bit_identical(self):
         reference, _, resumed = self.run_ab()
         self.assert_bit_identical(reference, resumed)
+
+    def test_rho_really_changes_after_the_stop(self):
+        """Otherwise the comparison above cannot see the restore."""
+        _, stopped, resumed = self.run_ab()
+        before = {k: v for k, v in _primal_snapshot(stopped).items()
+                  if "|rho|" in k}
+        after = {k: v for k, v in _primal_snapshot(resumed).items()
+                 if "|rho|" in k}
+        self.assertNotEqual(before, after,
+                            msg="no rho changed after the resume")
 
     def test_the_previous_xbar_is_actually_restored(self):
         """Named directly, so a passing comparison cannot be a coincidence."""
@@ -271,8 +284,12 @@ class TestSepRhoResume(_ABMixin, unittest.TestCase):
     the run continues, and continues identically.
     """
 
-    EXTRA_OPTIONS = {"dynamic_rho_primal_crit": False,
-                     "dynamic_rho_dual_crit": False}
+    #: With both criteria off, rho is never recomputed after iteration 0, so
+    #: this class exercises the W history alone. The subclass below turns them
+    #: on.
+    PRIMAL_CRIT = False
+    DUAL_CRIT = False
+    THRESH = 0.5
 
     def ext_classes(self):
         from mpisppy.extensions.sep_rho import SepRho
@@ -285,9 +302,12 @@ class TestSepRhoResume(_ABMixin, unittest.TestCase):
         cfg.add_to_config("sep_rho_multiplier", description="", domain=float,
                           default=1.0)
         cfg.add_to_config("dynamic_rho_primal_crit", description="",
-                          domain=bool, default=False)
-        cfg.add_to_config("dynamic_rho_dual_crit", description="", domain=bool,
-                          default=False)
+                          domain=bool, default=self.PRIMAL_CRIT)
+        cfg.add_to_config("dynamic_rho_dual_crit", description="",
+                          domain=bool, default=self.DUAL_CRIT)
+        for thresh in ("dynamic_rho_primal_thresh", "dynamic_rho_dual_thresh"):
+            cfg.add_to_config(thresh, description="", domain=float,
+                              default=self.THRESH)
         options = _options(max_iters, **ckpt_kwargs)
         options["sep_rho_options"] = {"cfg": cfg}
         return _make_ph(options, self.ext_classes())
@@ -309,6 +329,49 @@ class TestSepRhoResume(_ABMixin, unittest.TestCase):
             self.assertIn(wanted, carried.local_Ws,
                           msg=f"local_Ws[{wanted}] was not carried; the next "
                               f"W_diff would raise KeyError")
+
+
+@unittest.skipIf(not solver_available, "no solver is available")
+class TestSepRhoResumeWithRhoUpdates(TestSepRhoResume):
+    """The same, with rho recomputed after the stop.
+
+    The first recompute after a resume used to read the cost coefficients off
+    the resumed objective -- which by then holds W and the quadratic prox --
+    and died with "nonant_cost_coefficient found nonlinear variables".
+    """
+
+    PRIMAL_CRIT = True
+    DUAL_CRIT = True
+    N = 8
+    STOP = 3
+
+
+@unittest.skipIf(not solver_available, "no solver is available")
+class TestSepRhoResumeWithDualCriterion(TestSepRhoResumeWithRhoUpdates):
+    """The criterion that reads the convergence history.
+
+    The dual criterion waits for four entries in its cache, so a resume that
+    started the caches empty skipped the rho updates of the first resumed
+    iterations and then carried a different rho for the rest of the run. With
+    a threshold every difference passes, it updates whenever it has the
+    history, which is what makes the carried history visible.
+    """
+
+    PRIMAL_CRIT = False
+    DUAL_CRIT = True
+    THRESH = 100.0
+
+    def test_rho_really_is_recomputed_after_the_stop(self):
+        """Otherwise this class guards nothing its parent does not."""
+        _, stopped, resumed = self.run_ab()
+        before = {k: v for k, v in _primal_snapshot(stopped).items()
+                  if "|rho|" in k}
+        after = {k: v for k, v in _primal_snapshot(resumed).items()
+                 if "|rho|" in k}
+        self.assertTrue(before)
+        self.assertNotEqual(before, after,
+                            msg="no rho changed after the resume, so the "
+                                "resumed leg never recomputed it")
 
 
 @unittest.skipIf(not solver_available, "no solver is available")
@@ -905,14 +968,19 @@ class TestSlammerResume(_ABMixin, unittest.TestCase):
 
 @unittest.skipIf(not solver_available, "no solver is available")
 class TestPrimalDualConvergerResume(_ABMixin, unittest.TestCase):
-    """A converger measures against the previous iterate, so it holds state.
+    """A converger decides when the run *stops*, so the test is where.
 
-    Getting this wrong is not just a divergence: the converger decides when
-    the run *stops*. Its dual residual is rho * ||xbar_t - xbar_{t-1}||, and a
-    resumed run whose `prev_xbars` came from its own constructor is comparing
-    xbar_t against itself -- a residual of zero, and a run that can declare
-    convergence an iteration early.
+    Its dual residual is rho * ||xbar_t - xbar_{t-1}||, and prev_xbars is its
+    one piece of history. It needs no checkpoint entry: a resumed run builds
+    it after the checkpointed models are spliced in, so it reads the xbars of
+    the last checkpointed iteration, which is what prev_xbars held. So it is
+    declared stateless, and what has to hold is that the resumed run stops
+    at the iteration the uninterrupted one does, without warning.
     """
+
+    #: Far enough that the reference converges on its own, before N.
+    N = 60
+    STOP = 5
 
     def ext_classes(self):
         return []
@@ -921,22 +989,30 @@ class TestPrimalDualConvergerResume(_ABMixin, unittest.TestCase):
         from mpisppy.convergers.primal_dual_converger import (
             PrimalDualConverger)
         options = _options(max_iters, **ckpt_kwargs)
-        # A threshold nothing will reach, so both legs run every iteration and
-        # the comparison is of the state rather than of where each stopped.
-        options["primal_dual_converger_options"] = {"tol": -1.0,
+        options["primal_dual_converger_options"] = {"tol": 1.0,
                                                     "verbose": False}
         return _make_ph(options, self.ext_classes(),
                         ph_converger=PrimalDualConverger)
 
-    def test_the_previous_xbars_are_restored(self):
-        _, stopped, resumed = self.run_ab()
-        with open(os.path.join(self.ckpt_dir, "manifest.json")) as f:
-            generation = json.load(f)["generation"]
-        carried = _read_leaf(self.ckpt_dir, generation)["extension_state"]
-        self.assertEqual(carried["converger"]["class"], "PrimalDualConverger")
-        self.assertEqual(carried["converger"]["state"]["prev_xbars"],
-                         stopped.convobject.prev_xbars)
-        self.assertTrue(resumed.convobject.prev_xbars)
+    def test_the_resumed_run_stops_where_the_uninterrupted_one_does(self):
+        """Stopped one iteration short of where the reference converges.
+
+        Anywhere earlier, a wrong prev_xbars only changes the decision at the
+        first resumed iteration, which is nowhere near converging on either
+        leg, and the test passes regardless.
+        """
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            reference = self._ph(self.N)
+            reference.ph_main()
+            self.assertLess(reference._PHIter, self.N,
+                            msg="the reference never converged, so this "
+                                "checks nothing about the converger")
+            self.STOP = reference._PHIter - 1
+            self.assertGreater(self.STOP, 1)
+            _, _, resumed = self.run_ab()
+        self.assertEqual(resumed._PHIter, reference._PHIter)
+        self.assertNotIn("converger does not carry state", out.getvalue())
 
     def test_resume_is_bit_identical(self):
         reference, _, resumed = self.run_ab()
@@ -1203,24 +1279,51 @@ class TestShippedExtensionsAnswerTheQuestion(unittest.TestCase):
         "WOscillationMonitor", "XhatFeasibilityCutExtension",
     }
 
-    def _all_extension_classes(self):
+    #: Where shipped extensions and convergers live. Not only
+    #: mpisppy.extensions: the W and xbar file extensions are in utils, and
+    #: were unanswered while this looked only in extensions.
+    PACKAGES = ("mpisppy.extensions", "mpisppy.utils", "mpisppy.convergers")
+
+    def _all_classes(self, base, excluded):
         import importlib
         import inspect
         import pkgutil
-        import mpisppy.extensions as package
         found = {}
-        for mod_info in pkgutil.iter_modules(package.__path__):
-            try:
-                mod = importlib.import_module(
-                    f"mpisppy.extensions.{mod_info.name}")
-            except ImportError:
-                continue        # an optional dependency this env lacks
-            for name, cls in inspect.getmembers(mod, inspect.isclass):
-                if (issubclass(cls, Extension)
-                        and cls not in (Extension, MultiExtension)
-                        and cls.__module__ == mod.__name__):
-                    found[name] = cls
+        for package_name in self.PACKAGES:
+            package = importlib.import_module(package_name)
+            for mod_info in pkgutil.walk_packages(package.__path__,
+                                                  f"{package_name}."):
+                try:
+                    mod = importlib.import_module(mod_info.name)
+                except ImportError:
+                    continue    # an optional dependency this env lacks
+                except Exception:
+                    # utils holds a few scripts that refuse to be imported
+                    # without their command line; none defines an extension.
+                    # The extensions package itself has to import.
+                    if package_name == "mpisppy.extensions":
+                        raise
+                    continue
+                for name, cls in inspect.getmembers(mod, inspect.isclass):
+                    if (issubclass(cls, base) and cls not in excluded
+                            and cls.__module__ == mod.__name__):
+                        found[name] = cls
         return found
+
+    def _all_extension_classes(self):
+        return self._all_classes(Extension, (Extension, MultiExtension))
+
+    def test_every_shipped_converger_answers(self):
+        from mpisppy.convergers.converger import Converger
+        found = self._all_classes(Converger, (Converger,))
+        self.assertIn("PrimalDualConverger", found)
+        unanswered = {
+            name for name, cls in found.items()
+            if cls.checkpoint_state is Converger.checkpoint_state
+            and not cls.__dict__.get("checkpoint_stateless", False)}
+        self.assertEqual(unanswered, set(),
+                         msg="a converger answers neither question, so every "
+                             "resume with it warns that it starts fresh")
 
     def test_the_unanswered_set_is_exactly_what_is_recorded(self):
         unanswered = {

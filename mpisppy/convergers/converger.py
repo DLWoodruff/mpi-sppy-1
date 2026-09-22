@@ -27,6 +27,13 @@ class Converger:
         Args:
             opt (SPBase): The SPBase object for the current model
     '''
+    #: True on a converger that has nothing to carry across a checkpoint,
+    #: so a resume does not warn that it starts fresh. The same declaration
+    #: as ``Extension.checkpoint_stateless``, and deliberately not inherited
+    #: for the same reason: the check reads the class's own ``__dict__``, so a
+    #: subclass that adds state to a stateless parent is warned about.
+    checkpoint_stateless = False
+
     def __init__(self, opt):
         self.conv = None  # intended to be the value used for comparison
 
@@ -54,8 +61,9 @@ class Converger:
             current iterate against an earlier one keeps that earlier one on
             the converger object, where no model carries it and a resume
             would otherwise start it empty. A converger that recomputes
-            everything from the current iterate has no state and should
-            return None.
+            everything from the current iterate has no state: leave this
+            returning None and set ``checkpoint_stateless = True`` on the
+            class, or every resume warns that it starts fresh.
 
             Convergers decide when the run *stops*, so getting this wrong is
             not just a divergence: a resumed run can terminate at a different

@@ -573,10 +573,12 @@ and writing nothing.
 **Extension and converger state is part of a checkpoint.** Extensions that
 accumulate their own state across iterations carry it across a stop: the rho
 updaters (``--norm-rho``, ``--mult-rho``, ``--sep-rho``, ``--sensi-rho``,
-``--grad-rho``), ``fixer``, ``slammer``, the W tracker (``--wtracker``), and
-the primal-dual converger. So a
-resumed run using one of them follows the same trajectory an uninterrupted run
-would, rather than merely continuing correctly from the right models.
+``--grad-rho``), ``fixer``, ``slammer`` and the W tracker (``--wtracker``). So
+a resumed run using one of them follows the same trajectory an uninterrupted
+run would, rather than merely continuing correctly from the right models. The
+shipped convergers need nothing carried: each either recomputes what it
+compares from the current iterate or, like the primal-dual converger, rebuilds
+it correctly from the resumed models.
 
 The rho-setting extensions do not *recompute* rho at the resume itself: the
 checkpointed rho -- including whatever adaptation had happened by the write --
@@ -607,7 +609,9 @@ Two things this does not cover:
   works and continues from the right models; it will not retrace an
   uninterrupted run.
 * **A converger with no such implementation still starts fresh**, and the resume
-  says so in the log. That matters more than it sounds: a converger decides when
+  says so in the log. The same two answers are available to a converger:
+  ``checkpoint_state()``/``restore_state(state)``, or
+  ``checkpoint_stateless = True``. That matters more than it sounds: a converger decides when
   the run stops, so one that accumulates history can terminate a resumed run at a
   different iteration than an uninterrupted one.
 
