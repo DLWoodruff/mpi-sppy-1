@@ -12,6 +12,8 @@ import os
 import math
 
 import mpisppy.cylinders.spoke as spoke
+import mpisppy.utils.checkpointing as ckpt
+from mpisppy import global_toc
 from mpisppy.cylinders.spwindow import Field
 from mpisppy.utils.xhat_eval import Xhat_Eval
 
@@ -58,11 +60,63 @@ class XhatInnerBoundBase(spoke.InnerBoundNonantSpoke):
 
         self.opt._save_nonants() # make the cache
 
+        # Extension state last, after post_iter0 -- the same ordering the hub
+        # needs at the end of Iter0, and for the same reason: post_iter0 is
+        # where an extension rebuilds its bookkeeping from the models, so
+        # restoring before it is restoring into something about to be
+        # overwritten. The Checkpointer read the file back in pre_iter0 and
+        # has been holding this since.
+        self._restore_extension_state_if_resuming()
+
         # Optional: try an xhat loaded from a file before the normal
         # xhatter main loop. See doc/src/xhat_from_file.rst.
         self._try_file_xhat()
 
         return xhatter
+
+    def _restore_extension_state_if_resuming(self):
+        """Hand this spoke's extensions the state a resume read for them."""
+        ext = getattr(self.opt, "extobject", None)
+        if ext is None:
+            return
+        candidates = list(getattr(ext, "extdict", {}).values()) + [ext]
+        state = None
+        for candidate in candidates:
+            state = getattr(candidate, "restored_extension_state", None)
+            if state is not None:
+                break
+        # Agreed, and reached whether or not this rank has state to hand
+        # over: an extension puts its state back on the models this rank
+        # owns, so one that cannot is a refusal one rank makes alone, and
+        # the spoke's loop that follows is collective. What there is to
+        # restore was agreed when the file was read (agree_spoke_restore),
+        # so the ranks arrive here with the same answer.
+        messages = ckpt.run_agreed(
+            self.opt,
+            lambda: [] if state is None
+            else ckpt.restore_extension_state(self.opt, state),
+            "hand their extensions the checkpointed state, so none of them "
+            "resumes")
+        for message in messages:
+            global_toc(f"WARNING: {message}", self.cylinder_rank == 0)
+
+    def _checkpointed_loop_state(self):
+        """The loop state a resume read for this spoke, or None.
+
+        The Checkpointer reads the spoke's file in ``pre_iter0``, which is
+        before the loop -- and its cursor -- exists, so it holds what it read
+        until the loop asks for it here. A spoke that is not resuming, or has
+        no Checkpointer attached, gets None.
+        """
+        ext = getattr(self.opt, "extobject", None)
+        if ext is None:
+            return None
+        candidates = list(getattr(ext, "extdict", {}).values()) + [ext]
+        for candidate in candidates:
+            state = getattr(candidate, "restored_loop_state", None)
+            if state is not None:
+                return state
+        return None
 
     def _try_file_xhat(self):
         """Evaluate a file-supplied xhat once, before the main loop.
