@@ -48,7 +48,22 @@ If you want a positional arg, you have to DIY:
 """
 
 import argparse
+import math
+
 import pyomo.common.config as pyofig
+
+
+def _finite_nonnegative_float(value):
+    """A float in [0, inf).  pyofig.NonNegativeFloat admits inf; this does not.
+
+    Used for options that are subtracted from a computed quantity, where inf
+    silently turns a finite result into -inf.
+    """
+    value = float(value)
+    if not (math.isfinite(value) and value >= 0.0):
+        raise ValueError(
+            f"Expected a finite non-negative float, but received {value}")
+    return value
 
 # class to inherit from ConfigDict with a name field
 class Config(pyofig.ConfigDict):
@@ -199,6 +214,15 @@ class Config(pyofig.ConfigDict):
             # PySP). See doc/designs/chance_constraint_design.md.
             _bad_options("--cc-indicator-var (chance constraint) is currently "
                          "supported only with --EF")
+
+        # --checkpoint-before-seconds asks for a write, and --checkpoint-dir is
+        # the only thing that says where. Silently ignoring it would leave a
+        # run that was configured for a deadline with no checkpoint at the
+        # deadline, which is the failure the option exists to prevent.
+        if (self.get("checkpoint_before_seconds", None) is not None
+                and self.get("checkpoint_dir", None) is None):
+            _bad_options("--checkpoint-before-seconds requires "
+                         "--checkpoint-dir (there is nowhere to write)")
 
         # Slamming options other than the directives file are meaningless
         # without it; require the file so that a run with no slamming options
@@ -812,6 +836,20 @@ class Config(pyofig.ConfigDict):
                            domain=int,
                            default=1)
 
+        self.add_to_config("checkpoint_before_seconds",
+                           description="also write a checkpoint at the end of "
+                           "the first iteration after which one more as long "
+                           "as the last would pass S seconds from the start "
+                           "of the run, for a run that "
+                           "will be stopped by a wall clock rather than by an "
+                           "iteration limit; the estimate is the duration of "
+                           "the most recent iteration, nothing is added for "
+                           "the write itself (its cost is reported in the log "
+                           "by every write), and it fires at most once "
+                           "(default None)",
+                           domain=float,
+                           default=None)
+
         self.add_to_config("stop_at_iteration_number",
                            description="absolute iteration number at which to "
                            "stop, counted across every run linked by "
@@ -1101,6 +1139,44 @@ class Config(pyofig.ConfigDict):
                                        "requires convex recourse)",
                            domain=bool,
                            default=False)
+
+
+    def certified_outer_bound_args(self):
+
+        self.add_to_config('certified_outer_bound',
+                              description="have a certified_outer_bound spoke "
+                                          "(certified Lagrangian outer bound for "
+                                          "convex continuous subproblems; its "
+                                          "tightness depends on tight variable "
+                                          "bounds; see spokes.rst)",
+                              domain=bool,
+                              default=False)
+
+        self.add_to_config('certified_outer_bound_rank_ratio',
+                              description="MPI ranks for the certified_outer_bound "
+                                          "spoke relative to the hub (flexible rank "
+                                          "assignments; default 1.0 = equal)",
+                              domain=float,
+                              default=1.0)
+
+        # No add_mipgap_specs: the spoke refuses discrete variables, so there is
+        # no mip gap. Offering the flags would suggest otherwise.
+        # The spoke's solver defaults to ipopt when this is left unset (applied
+        # in cfg_vanilla.certified_outer_bound_spoke; add_solver_specs itself
+        # defaults every solver name to None).
+        self.add_solver_specs("certified_outer_bound")
+
+        # A dedicated domain, not NonNegativeFloat: the cushion is SUBTRACTED,
+        # so a negative value raises the reported bound above the theorem's
+        # quantity, and NonNegativeFloat accepts inf, which drives the reported
+        # bound to -inf. Neither result is an outer bound.
+        self.add_to_config('certified_outer_bound_cushion',
+                           description="relative cushion subtracted from the "
+                                       "certified bound: report q - eps*(1+|q|). "
+                                       "Last-bit hygiene against floating point, "
+                                       "not a proof-carrying margin; 0 disables",
+                           domain=_finite_nonnegative_float,
+                           default=1e-9)
 
 
     def reduced_costs_args(self):
